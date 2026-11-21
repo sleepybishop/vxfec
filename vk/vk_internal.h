@@ -232,6 +232,17 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
                                               vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks, vxfec_vk_buf *out_buf,
                                               bool upload_d, bool download_out);
 
+bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *work_d_buf, size_t d_bytes,
+                                            vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes, uint32_t row_offset,
+                                            uint32_t K, uint32_t sym_T, uint32_t dst_stride);
+bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *work_d_buf, size_t d_bytes,
+                                             const uint8_t *sys_bitmap, uint32_t K, uint32_t sym_T, vxfec_vk_buf *target_vram,
+                                             size_t target_offset, size_t total_bytes, uint32_t row_offset, uint32_t dst_stride,
+                                             const uint32_t *staged_rows, uint32_t num_staged_rows, bool *out_ext_acquired);
+bool vxfec_vk__record_vram_repair_scatter_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *out_buf, uint32_t out_stride,
+                                              vxfec_vk_buf *target_vram, size_t target_offset, size_t total_bytes, uint32_t sym_T,
+                                              const uint32_t *missing_esis, uint32_t num_missing, bool release_target_ext);
+
 uint32_t vxfec_vk__choose_gf256_tile_e(uint32_t num_out);
 
 /* pack a dense rows x num_out GF(256) matrix Y into an 8/16-output nibble DirectTab256 */

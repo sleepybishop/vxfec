@@ -136,14 +136,16 @@ NIC1="$(ssh "${HOST1}" "ip -o -4 route get ${IP0} | awk '{for(i=1;i<=NF;i++) if(
 : "${NIC1:?Failed to resolve routable interface on ${HOST1} toward ${IP0}}"
 
 echo "[04_run_tier3_rdma] Running 2-node libibverbs IBV_QPT_UC + DMA-BUF superframe saturation..."
-for spec in "rateless 0" "rateless 10" "mds 10"; do
-    read -r codec bpct <<<"${spec}"
+for spec in "rateless 0 0" "rateless 10 0" "rateless-gf2 10 0" "mds 10 0" "rateless-gf2 10 1"; do
+    read -r codec bpct pipe <<<"${spec}"
+    PIPE_ARG=()
+    [[ "${pipe}" == "1" ]] && PIPE_ARG=(--pipeline)
     ssh "${HOST1}" "cd '${REMOTE_DIR}' && ./bench_wire_net --mode rx --bind ${IP1} --port 31500" &
     RX_PID=$!
     WORK_PIDS+=("${RX_PID}")
     sleep 1
     STEP_ERR=0
-    ssh "${HOST0}" "cd '${REMOTE_DIR}' && ./bench_wire_net --mode tx --peers ${IP1} --port 31500 --ibv --codec ${codec} --z 128 --k 200 --p 48 --sym-t 4096 --iters 5 --blackout-pct ${bpct} --csv '${REMOTE_DIR}/rdma_wire_ibv.csv'" | tee -a "${OUT_DIR}/rdma_wire_ibv.log" || STEP_ERR=1
+    ssh "${HOST0}" "cd '${REMOTE_DIR}' && ./bench_wire_net --mode tx --peers ${IP1} --port 31500 --ibv --codec ${codec} --z 128 --k 200 --p 48 --sym-t 4096 --iters 5 --blackout-pct ${bpct} ${PIPE_ARG[*]} --csv '${REMOTE_DIR}/rdma_wire_ibv.csv'" | tee -a "${OUT_DIR}/rdma_wire_ibv.log" || STEP_ERR=1
     wait "${RX_PID}" || STEP_ERR=1
     [[ "${STEP_ERR}" == "0" ]] || exit 1
 done

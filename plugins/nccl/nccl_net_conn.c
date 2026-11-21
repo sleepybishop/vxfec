@@ -1122,9 +1122,11 @@ ncclResult_t vxf_close_send(void *sendComm)
     for (int i = 0; i < NCCL_NET_MAX_REQUESTS; i++) {
         if (sc->user_tx_pool[i].in_use) {
             if (ibv_quiesced || !sc->user_tx_pool[i].ibv_zc_pending) {
+                vxf_free_ureq_zc_jobs(&sc->user_tx_pool[i]);
                 free(sc->user_tx_pool[i].bounce_buf);
                 vxf_mr_release(sc->user_tx_pool[i].mr);
             }
+            sc->user_tx_pool[i].zc_gpu_head = NULL;
             sc->user_tx_pool[i].bounce_buf = NULL;
             sc->user_tx_pool[i].mr = NULL;
             sc->user_tx_pool[i].in_use = false;
@@ -1182,6 +1184,8 @@ ncclResult_t vxf_close_recv(void *recvComm)
 
     for (int i = 0; i < NCCL_NET_MAX_REQUESTS; i++) {
         if (rc->rx_pool[i].in_use) {
+            free(rc->rx_pool[i].early_rdma_syms);
+            rc->rx_pool[i].early_rdma_syms = NULL;
             free(rc->rx_pool[i].heap_gen_bits);
             rc->rx_pool[i].heap_gen_bits = NULL;
             vxf_mr_release(rc->rx_pool[i].mr);

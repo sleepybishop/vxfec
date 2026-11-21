@@ -1089,11 +1089,17 @@ static int run_multinode_main(const ncclNet_v8_t *net, get_stats_fn get_stats, r
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "512 KiB | 2.0% Burst=6 (MDS)",
                                 "rs8", sz_512k, 20000, 6, true, iters, csv_fp) &&
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec,
-                                "512 KiB | 2.0% Burst=6 (Rateless)", "rq", sz_512k, 20000, 6, true, iters, csv_fp) &&
+                                "512 KiB | 2.0% Burst=6 (RQ-GF256)", "rq-gf256", sz_512k, 20000, 6, true, iters, csv_fp) &&
+             run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "512 KiB | 2.0% Burst=6 (RQ-GF2)",
+                                "rq-gf2", sz_512k, 20000, 6, true, iters, csv_fp) &&
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "8.0 MiB | 2.0% Burst=6 (GBN)",
                                 "gbn", sz_8m, 20000, 6, true, it_lg, csv_fp) &&
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "8.0 MiB | 2.0% Burst=6 (SACK)",
                                 "sack", sz_8m, 20000, 6, true, it_lg, csv_fp) &&
+             run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec,
+                                "8.0 MiB | 2.0% Burst=6 (RQ-GF256)", "rq-gf256", sz_8m, 20000, 6, true, it_lg, csv_fp) &&
+             run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "8.0 MiB | 2.0% Burst=6 (RQ-GF2)",
+                                "rq-gf2", sz_8m, 20000, 6, true, it_lg, csv_fp) &&
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "8.0 MiB | 2.0% Burst=6 (vxfec)",
                                 "auto", sz_8m, 20000, 6, true, it_lg, csv_fp) &&
              run_2node_scenario(net, ctrl_fd, rank, get_stats, reset_stats, set_fault, set_codec, "64 MiB  | 2.0% Burst=6 (SACK)",
@@ -1306,7 +1312,9 @@ int main(int argc, char **argv)
                       sz_small, 20000, 6, true, 0, 0, iters_small) ||
         !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "512 KiB | 2.0% Burst=6 (MDS)", "rs8", sz_small,
                       20000, 6, true, 0, 0, iters_small) ||
-        !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "512 KiB | 2.0% Burst=6 (Rateless)", "rq",
+        !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "512 KiB | 2.0% Burst=6 (RQ-GF256)", "rq-gf256",
+                      sz_small, 20000, 6, true, 0, 0, iters_small) ||
+        !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "512 KiB | 2.0% Burst=6 (RQ-GF2)", "rq-gf2",
                       sz_small, 20000, 6, true, 0, 0, iters_small) ||
         !run_incast_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "3->1 Incast 128K | ECN+2% (GBN)", "gbn",
                              sz_small / NUM_RANKS, 20000, 6, 400000, 2400, iters_small) ||
@@ -1317,6 +1325,10 @@ int main(int argc, char **argv)
         !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "2.0 MiB | 2.0% Burst=8 (GBN)", "gbn", sz_large,
                       20000, 8, true, 0, 0, iters_large) ||
         !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "2.0 MiB | 2.0% Burst=8 (SACK)", "sack",
+                      sz_large, 20000, 8, true, 0, 0, iters_large) ||
+        !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "2.0 MiB | 2.0% Burst=8 (RQ-GF256)", "rq-gf256",
+                      sz_large, 20000, 8, true, 0, 0, iters_large) ||
+        !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "2.0 MiB | 2.0% Burst=8 (RQ-GF2)", "rq-gf2",
                       sz_large, 20000, 8, true, 0, 0, iters_large) ||
         !run_scenario(net, get_stats, reset_stats, set_fault, set_cong, set_codec, "2.0 MiB | 2.0% Burst=8 (vxfec)", "auto",
                       sz_large, 20000, 8, true, 0, 0, iters_large) ||

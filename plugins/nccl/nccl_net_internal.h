@@ -90,7 +90,10 @@
 #define VXFEC_RX_WIRE_SLOTS 128u
 #define VXFEC_RX_HASH_SLOTS 256u
 #define VXFEC_ABORT_RING 64u
+#define VXFEC_CTS_RING 32u
 #define VXFEC_LISTEN_TOMBSTONES 256u
+
+_Static_assert(NCCL_NET_MAX_REQUESTS <= 64, "NCCL_NET_MAX_REQUESTS must fit in 6-bit RDMA imm_data rslot");
 
 enum {
     PKT_HELLO = 1,
@@ -103,6 +106,8 @@ enum {
     PKT_GBN_NACK = 8,
     PKT_ERR = 9,
     PKT_WIN_ACK = 10,
+    PKT_RDMA_CTS = 11,
+    PKT_RDMA_GEN = 12,
 };
 
 enum {
@@ -112,6 +117,7 @@ enum {
     WIRE_FLAG_NOFEC_GBN = 0x04u,
     WIRE_FLAG_SACK_ONLY = 0x08u,
     WIRE_CODEC_MASK = 0x0fu,
+    WIRE_FLAG_RDMA_VRAM = 0x20u,
     WIRE_FLAG_GEN_EXT = 0x40u,
     WIRE_FLAG_NEED_ACK = 0x80u,
 };
@@ -171,6 +177,24 @@ typedef struct {
     uint32_t ir_count;
     uint32_t dwell_us;
 } vxfec_ctrl_pkt_t;
+
+typedef struct {
+    vxfec_ctrl_pkt_t hdr;
+    uint64_t remote_iova;
+    uint32_t remote_rkey;
+    uint32_t max_bytes;
+} vxfec_rdma_cts_pkt_t;
+
+typedef struct {
+    bool valid;
+    uint32_t tag;
+    uint32_t tag_seq;
+    uint64_t remote_iova;
+    uint32_t remote_rkey;
+    uint32_t max_bytes;
+    uint8_t rslot;
+    uint8_t token;
+} vxfec_cts_entry_t;
 
 typedef struct {
     uint32_t magic;
@@ -237,6 +261,7 @@ typedef struct {
     vxfec_vk_buf *vk_buf;
     vxfec_ibv_mr_t *ibv_mrs[VXFEC_MAX_DEVS];
     vxfec_ibv_dev_ref_t *ibv_refs[VXFEC_MAX_DEVS];
+    bool ibv_can_rwrite[VXFEC_MAX_DEVS];
 } vxfec_mr_t;
 
 typedef struct {
@@ -256,8 +281,10 @@ typedef struct {
 typedef struct {
     uint64_t deliver_ns;
     uint32_t port_idx;
+    uint32_t rdma_imm;
     uint16_t len;
     bool is_ecn_ce;
+    bool is_rdma_imm;
     uint8_t data[sizeof(vxfec_wire_hdr_ext_t) + VXFEC_MAX_SYM_T];
 } vxfec_delay_data_t;
 
@@ -333,6 +360,10 @@ typedef struct vxfec_gpu_job {
     vxfec_rq_sched *rq_sched;
     vxfec_vk_buf *in_buf;
     vxfec_vk_buf *out_buf;
+    vxfec_vk_buf *out_dmabuf;
+    uint32_t out_ibv_lkey;
+    uint64_t out_ibv_iova;
+    bool used_vram_out;
     bool rs8_is_decode;
     uint32_t rs8_K;
     uint32_t rs8_M;
@@ -375,11 +406,18 @@ struct vxfec_tx_user_req {
     uint16_t active_gens;
     ncclResult_t status;
     vxfec_mr_t *mr;
+    size_t mr_offset;
     const uint8_t *src_host;
     const uint8_t *src_ibv_ptr;
     uint32_t src_ibv_lkey;
     bool src_ibv_dmabuf;
+    bool has_rdma_cts;
+    uint64_t rdma_iova;
+    uint32_t rdma_rkey;
+    uint8_t rdma_rslot;
+    uint8_t rdma_token;
     uint8_t *bounce_buf;
+    vxfec_gpu_job_t *zc_gpu_head;
     uint64_t ibv_target_seq[VXFEC_IBV_MAX_QPS];
 };
 
@@ -404,10 +442,17 @@ typedef struct vxfec_tx_req_impl {
     ncclResult_t status;
 
     vxfec_mr_t *mr;
+    size_t mr_offset;
     const uint8_t *src_host;
     const uint8_t *src_ibv_ptr;
     uint32_t src_ibv_lkey;
     bool src_ibv_dmabuf;
+    bool use_rdma_write;
+    bool rdma_gen_hdr_sent;
+    uint64_t rdma_gen_iova;
+    uint32_t rdma_rkey;
+    uint8_t rdma_rslot;
+    uint8_t rdma_token;
     uint8_t *bounce_buf;
     uint8_t *rs_sys_padded;
 
@@ -516,6 +561,8 @@ struct vxfec_send_comm {
     vxfec_tx_slot_t tx_pool[VXFEC_TX_WIRE_SLOTS];
     vxfec_abort_entry_t tx_aborts[VXFEC_ABORT_RING];
     uint32_t tx_abort_cursor;
+    vxfec_cts_entry_t cts_ring[VXFEC_CTS_RING];
+    uint32_t cts_cursor;
 
     bool rq_cache_valid;
     uint32_t rq_cache_K;
@@ -555,6 +602,7 @@ typedef struct {
     bool tail_seen;
     bool stage_failed;
     bool fec_repaired;
+    bool direct_vram;
 
     vxfec_rx_req_t *bound_req;
 
@@ -611,6 +659,12 @@ struct vxfec_rx_req {
     uint16_t bound_sym_T;
     ncclResult_t status;
     vxfec_mr_t *mr;
+    uint8_t rslot_idx;
+    uint8_t cts_token;
+    bool rdma_cts_sent;
+    uint32_t *early_rdma_syms;
+    uint32_t early_rdma_cnt;
+    uint32_t early_rdma_cap;
     uint64_t inline_gen_bits;
     uint64_t *heap_gen_bits;
 };
@@ -657,6 +711,7 @@ struct vxfec_recv_comm {
     int16_t msg_seq_hash[VXFEC_RX_HASH_SLOTS];
     vxfec_rx_slot_t slots[VXFEC_RX_WIRE_SLOTS];
     vxfec_rx_req_t rx_pool[NCCL_NET_MAX_REQUESTS];
+    uint8_t next_cts_token[NCCL_NET_MAX_REQUESTS];
 
 #if VXFEC_ENABLE_SIM
     vxfec_delay_data_t *delay_q;
@@ -813,6 +868,12 @@ static inline bool vxf_sim_should_fail_gpu_rx(void)
     return vxf_sim_should_drop_counter_slow(&vxf_sim_fail_gpu_rx_writes);
 }
 
+static inline bool vxf_sim_gpu_rx_fault_armed(void)
+{
+    return atomic_load_explicit(&vxf_sim_active, memory_order_relaxed) &&
+           atomic_load_explicit(&vxf_sim_fail_gpu_rx_writes, memory_order_relaxed) != 0u;
+}
+
 static inline bool vxf_sim_should_mark_ecn(uint32_t port_idx)
 {
     if (!atomic_load_explicit(&vxf_sim_active, memory_order_relaxed))
@@ -873,6 +934,10 @@ static inline bool vxf_sim_should_fail_gpu_rx(void)
 {
     return false;
 }
+static inline bool vxf_sim_gpu_rx_fault_armed(void)
+{
+    return false;
+}
 static inline bool vxf_sim_should_mark_ecn(uint32_t port_idx)
 {
     (void)port_idx;
@@ -908,10 +973,21 @@ uint32_t vxf_parse_slice_min_env(uint32_t fallback);
 
 vxfec_gpu_job_t *vxf_rq_gpu_job_new(vxfec_vk_ctx *prefer_vk, nanorq_core *rq, const schedule *ops, size_t input_bytes,
                                     size_t output_bytes);
+bool vxf_gpu_job_prepare_ibv_out(vxfec_gpu_job_t *job, int dev_idx, size_t out_bytes);
 bool vxf_rq_gpu_job_submit(vxfec_gpu_job_t *job, nanorq_core *rq, uint32_t stride, const uint32_t *esis, uint32_t count);
+bool vxf_rq_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, nanorq_core *rq, vxfec_vk_buf *src_vram, size_t src_offset,
+                                    size_t valid_bytes, uint32_t sym_T, uint32_t stride, const uint32_t *esis, uint32_t count,
+                                    bool use_ibv_out);
+bool vxf_rq_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, nanorq_core *rq, const uint8_t *sys_bitmap, uint32_t K, uint32_t sym_T,
+                                    vxfec_vk_buf *target_vram, size_t target_offset, size_t total_bytes, uint32_t stride,
+                                    const uint32_t *missing_esis, uint32_t count, uint32_t overhead);
 vxfec_gpu_job_t *vxf_rs8_gpu_job_new(vxfec_vk_ctx *prefer_vk, bool is_decode, uint32_t K, uint32_t rs_m, const uint8_t *erased_k,
                                      const uint8_t *parity_m, uint32_t count, uint32_t sym_T);
 bool vxf_rs8_gpu_job_submit(vxfec_gpu_job_t *job, uint32_t sym_T);
+bool vxf_rs8_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes,
+                                     uint32_t sym_T, bool use_ibv_out);
+bool vxf_rs8_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, const uint8_t *sys_bitmap, vxfec_vk_buf *target_vram,
+                                     size_t target_offset, size_t total_bytes, uint32_t sym_T);
 int vxf_gpu_job_poll(vxfec_gpu_job_t *job);
 void vxf_gpu_job_free(vxfec_gpu_job_t *job);
 
@@ -955,6 +1031,7 @@ uint16_t vxf_tx_path_sym_limit(const vxfec_send_comm_t *comm);
 void vxf_init_send_comm_pacer(vxfec_send_comm_t *sc, uint64_t now_ns);
 void vxf_free_send_comm_rq_cache(vxfec_send_comm_t *sc);
 void vxf_free_tx_req_resources(vxfec_tx_slot_t *req);
+void vxf_free_ureq_zc_jobs(vxfec_tx_user_req_t *ureq);
 void vxf_reset_rx_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *s);
 void vxf_rx_done_range_discard(vxfec_done_range_t **head, uint64_t through);
 void vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns);

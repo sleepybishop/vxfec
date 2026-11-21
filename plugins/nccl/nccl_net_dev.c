@@ -27,6 +27,11 @@ typedef struct {
         size_t in_cap;
         vxfec_vk_buf *out_buf;
         size_t out_cap;
+        vxfec_vk_buf *out_dmabuf;
+        size_t out_dmabuf_cap;
+        int out_dmabuf_fd;
+        vxfec_ibv_mr_t *out_ibv_mrs[VXFEC_MAX_DEVS];
+        vxfec_ibv_dev_ref_t *out_ibv_refs[VXFEC_MAX_DEVS];
         bool in_use;
     } pool[VXFEC_VK_ASYNC_POOL_SLOTS];
 } vxf_vk_slot_t;
@@ -85,6 +90,8 @@ static int register_vk_slot_locked(vxfec_vk_ctx *ctx)
     s->is_discrete = vxfec_vk_is_discrete(ctx);
     s->has_timeline = vxfec_vk_has_timeline(ctx);
     s->max_ssbo_bytes = vxfec_vk_max_storage_buffer_bytes(ctx);
+    for (uint32_t i = 0; i < VXFEC_VK_ASYNC_POOL_SLOTS; i++)
+        s->pool[i].out_dmabuf_fd = -1;
     return (int)idx;
 }
 
@@ -340,8 +347,9 @@ vxfec_gpu_job_t *vxf_rq_gpu_job_new(vxfec_vk_ctx *prefer_vk, nanorq_core *rq, co
     if (vidx >= 0) {
         vxf_vk_slot_t *vs = &g_vk_devs[vidx];
         size_t min_bytes = vs->is_discrete ? VXFEC_RQ_GPU_MIN_DISCRETE_BYTES : VXFEC_RQ_GPU_MIN_OTHER_BYTES;
-        bool caps_ok = vs->has_timeline && (g_vk_force_all || vs->is_hw_gpu) && (g_vk_force_all || input_bytes >= min_bytes) &&
-                       input_bytes <= vs->max_ssbo_bytes && output_bytes <= vs->max_ssbo_bytes;
+        bool caps_ok = vs->has_timeline && (g_vk_force_all || vs->is_hw_gpu) &&
+                       (g_vk_force_all || prefer_vk != NULL || input_bytes >= min_bytes) && input_bytes <= vs->max_ssbo_bytes &&
+                       output_bytes <= vs->max_ssbo_bytes;
         if (caps_ok && g_gpu_active_jobs < VXFEC_RQ_GPU_MAX_JOBS && vxfec_vk_async_can_submit(vs->ctx)) {
             g_gpu_active_jobs++;
             job->vk_idx = vidx;
@@ -373,6 +381,96 @@ vxfec_gpu_job_t *vxf_rq_gpu_job_new(vxfec_vk_ctx *prefer_vk, nanorq_core *rq, co
     return job;
 }
 
+bool vxf_gpu_job_prepare_ibv_out(vxfec_gpu_job_t *job, int dev_idx, size_t out_bytes)
+{
+    if (!job || job->pool_idx < 0 || job->pool_idx >= (int)VXFEC_VK_ASYNC_POOL_SLOTS || dev_idx < 0 ||
+        (uint32_t)dev_idx >= VXFEC_MAX_DEVS || out_bytes == 0u)
+        return false;
+
+    pthread_mutex_lock(&g_init_mtx);
+    vxfec_ibv_dev_ref_t *iref = ((uint32_t)dev_idx < vxf_num_devs) ? vxf_devs[dev_idx].ibv_ref : NULL;
+    if (iref)
+        vxf_ibv_ref_retain(iref);
+    pthread_mutex_unlock(&g_init_mtx);
+    if (!iref || !iref->ctx) {
+        vxf_ibv_ref_release(iref);
+        return false;
+    }
+
+    bool ok = false;
+    pthread_mutex_lock(&g_vk_mtx);
+    if (job->vk_idx >= 0 && (uint32_t)job->vk_idx < g_num_vk_devs) {
+        vxf_vk_slot_t *vs = &g_vk_devs[job->vk_idx];
+        uint32_t pidx = (uint32_t)job->pool_idx;
+        if (vs->ctx && vxfec_vk_has_dmabuf_export(vs->ctx)) {
+            if (!vs->pool[pidx].out_dmabuf || out_bytes > vs->pool[pidx].out_dmabuf_cap) {
+                for (uint32_t d = 0; d < VXFEC_MAX_DEVS; d++) {
+                    if (vs->pool[pidx].out_ibv_mrs[d]) {
+                        vxfec_ibv_mr_dereg(vs->pool[pidx].out_ibv_mrs[d]);
+                        vs->pool[pidx].out_ibv_mrs[d] = NULL;
+                    }
+                    if (vs->pool[pidx].out_ibv_refs[d]) {
+                        vxf_ibv_ref_release(vs->pool[pidx].out_ibv_refs[d]);
+                        vs->pool[pidx].out_ibv_refs[d] = NULL;
+                    }
+                }
+                if (vs->pool[pidx].out_dmabuf_fd >= 0) {
+                    close(vs->pool[pidx].out_dmabuf_fd);
+                    vs->pool[pidx].out_dmabuf_fd = -1;
+                }
+                vxfec_vk_buf_free(vs->ctx, vs->pool[pidx].out_dmabuf);
+                vs->pool[pidx].out_dmabuf = NULL;
+                vs->pool[pidx].out_dmabuf_cap = 0u;
+
+                size_t ncap = (out_bytes < 256u * 1024u) ? (256u * 1024u) : ((out_bytes + 65535u) & ~(size_t)65535u);
+                int fd = -1;
+                vxfec_vk_buf *nb = vxfec_vk_buf_new_exportable(vs->ctx, ncap, true, &fd);
+                if (nb) {
+                    if (vxfec_vk_buf_release_external(vs->ctx, nb)) {
+                        vs->pool[pidx].out_dmabuf = nb;
+                        vs->pool[pidx].out_dmabuf_cap = ncap;
+                        vs->pool[pidx].out_dmabuf_fd = fd;
+                    } else {
+                        close(fd);
+                        vxfec_vk_buf_free(vs->ctx, nb);
+                    }
+                }
+            }
+
+            if (vs->pool[pidx].out_dmabuf && vs->pool[pidx].out_dmabuf_fd >= 0) {
+                if (!vs->pool[pidx].out_ibv_mrs[dev_idx] || vs->pool[pidx].out_ibv_refs[dev_idx] != iref) {
+                    if (vs->pool[pidx].out_ibv_mrs[dev_idx]) {
+                        vxfec_ibv_mr_dereg(vs->pool[pidx].out_ibv_mrs[dev_idx]);
+                        vs->pool[pidx].out_ibv_mrs[dev_idx] = NULL;
+                    }
+                    if (vs->pool[pidx].out_ibv_refs[dev_idx]) {
+                        vxf_ibv_ref_release(vs->pool[pidx].out_ibv_refs[dev_idx]);
+                        vs->pool[pidx].out_ibv_refs[dev_idx] = NULL;
+                    }
+                    uint64_t iova = 0x700000000000ULL + ((uint64_t)job->vk_idx * VXFEC_VK_ASYNC_POOL_SLOTS + pidx) * 0x40000000ULL;
+                    vxfec_ibv_mr_t *imr = vxfec_ibv_mr_reg_dmabuf(iref->ctx, 0u, vs->pool[pidx].out_dmabuf_cap, iova,
+                                                                  vs->pool[pidx].out_dmabuf_fd, false);
+                    if (imr) {
+                        vs->pool[pidx].out_ibv_mrs[dev_idx] = imr;
+                        vs->pool[pidx].out_ibv_refs[dev_idx] = iref;
+                        vxf_ibv_ref_retain(iref);
+                    }
+                }
+                vxfec_ibv_mr_t *imr = vs->pool[pidx].out_ibv_mrs[dev_idx];
+                if (imr && vxfec_ibv_mr_lkey(imr) != 0u) {
+                    job->out_dmabuf = vs->pool[pidx].out_dmabuf;
+                    job->out_ibv_lkey = vxfec_ibv_mr_lkey(imr);
+                    job->out_ibv_iova = vxfec_ibv_mr_iova(imr);
+                    ok = true;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_vk_mtx);
+    vxf_ibv_ref_release(iref);
+    return ok;
+}
+
 bool vxf_rq_gpu_job_submit(vxfec_gpu_job_t *job, nanorq_core *rq, uint32_t stride, const uint32_t *esis, uint32_t count)
 {
     if (!job)
@@ -386,15 +484,56 @@ bool vxf_rq_gpu_job_submit(vxfec_gpu_job_t *job, nanorq_core *rq, uint32_t strid
     return job->ticket != 0u;
 }
 
+bool vxf_rq_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, nanorq_core *rq, vxfec_vk_buf *src_vram, size_t src_offset,
+                                    size_t valid_bytes, uint32_t sym_T, uint32_t stride, const uint32_t *esis, uint32_t count,
+                                    bool use_ibv_out)
+{
+    if (!job || !src_vram)
+        return false;
+    bool zc_out = use_ibv_out && job->out_dmabuf != NULL && job->out_ibv_lkey != 0u;
+    vxfec_vk_buf *target_out = zc_out ? job->out_dmabuf : job->out_buf;
+    pthread_mutex_lock(&g_vk_mtx);
+    vxfec_vk_ctx *vk = (job->vk_idx >= 0 && (uint32_t)job->vk_idx < g_num_vk_devs) ? g_vk_devs[job->vk_idx].ctx : NULL;
+    job->ticket = vk ? vxfec_rq_encode_submit_vram(vk, rq, job->rq_sched, src_vram, src_offset, valid_bytes, sym_T, job->in_buf,
+                                                   stride, esis, count, target_out, !zc_out)
+                     : 0u;
+    if (job->ticket != 0u)
+        job->used_vram_out = zc_out;
+    pthread_mutex_unlock(&g_vk_mtx);
+    return job->ticket != 0u;
+}
+
+bool vxf_rq_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, nanorq_core *rq, const uint8_t *sys_bitmap, uint32_t K, uint32_t sym_T,
+                                    vxfec_vk_buf *target_vram, size_t target_offset, size_t total_bytes, uint32_t stride,
+                                    const uint32_t *missing_esis, uint32_t count, uint32_t overhead)
+{
+    if (!job || !target_vram)
+        return false;
+    pthread_mutex_lock(&g_vk_mtx);
+    vxfec_vk_ctx *vk = (job->vk_idx >= 0 && (uint32_t)job->vk_idx < g_num_vk_devs) ? g_vk_devs[job->vk_idx].ctx : NULL;
+    job->ticket = vk ? vxfec_rq_repair_submit_vram(vk, rq, job->rq_sched, sys_bitmap, K, sym_T, target_vram, target_offset,
+                                                   total_bytes, job->in_buf, stride, missing_esis, count, overhead, job->out_buf)
+                     : 0u;
+    pthread_mutex_unlock(&g_vk_mtx);
+    return job->ticket != 0u;
+}
+
 /* non-blocking RS8 job creation: zero VkBuffer allocations and zero vkWaitForFences stalls */
 vxfec_gpu_job_t *vxf_rs8_gpu_job_new(vxfec_vk_ctx *prefer_vk, bool is_decode, uint32_t K, uint32_t rs_m, const uint8_t *erased_k,
                                      const uint8_t *parity_m, uint32_t count, uint32_t sym_T)
 {
     ensure_vk_caps_probed();
-    if (g_vk_mode == 0 || g_num_vk_devs == 0u || K < 32u || count == 0u || count > 255u || (sym_T & 3u) != 0u)
+    uint32_t min_k = (prefer_vk || g_vk_force_all) ? 16u : 32u;
+    if (g_vk_mode == 0 || g_num_vk_devs == 0u || K < min_k || count == 0u || count > 255u || (sym_T & 3u) != 0u)
         return NULL;
-    if (!g_vk_force_all && (sym_T < 256u || ((uint64_t)K * (uint64_t)count * (uint64_t)sym_T) < (64ULL * 1024ULL * 1024ULL)))
-        return NULL;
+    if (!g_vk_force_all) {
+        if (prefer_vk) {
+            if (sym_T < 64u)
+                return NULL;
+        } else if (sym_T < 256u || ((uint64_t)K * (uint64_t)count * (uint64_t)sym_T) < (64ULL * 1024ULL * 1024ULL)) {
+            return NULL;
+        }
+    }
 
     size_t in_bytes = (size_t)K * sym_T;
     size_t out_bytes = (size_t)count * sym_T;
@@ -461,6 +600,39 @@ bool vxf_rs8_gpu_job_submit(vxfec_gpu_job_t *job, uint32_t sym_T)
     job->ticket =
         vk ? vxfec_rs8_submit_raw(vk, job->rs8_is_decode, job->rs8_K, job->rs8_M, job->rs8_is_decode ? job->rs8_erased_k : NULL,
                                   job->rs8_parity_m, job->rs8_count, job->in_buf, sym_T, 1u, job->out_buf, true, true)
+           : 0u;
+    pthread_mutex_unlock(&g_vk_mtx);
+    return job->ticket != 0u;
+}
+
+bool vxf_rs8_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes,
+                                     uint32_t sym_T, bool use_ibv_out)
+{
+    if (!job || job->rs8_is_decode || !src_vram)
+        return false;
+    bool zc_out = use_ibv_out && job->out_dmabuf != NULL && job->out_ibv_lkey != 0u;
+    vxfec_vk_buf *target_out = zc_out ? job->out_dmabuf : job->out_buf;
+    pthread_mutex_lock(&g_vk_mtx);
+    vxfec_vk_ctx *vk = (job->vk_idx >= 0 && (uint32_t)job->vk_idx < g_num_vk_devs) ? g_vk_devs[job->vk_idx].ctx : NULL;
+    job->ticket = vk ? vxfec_rs8_encode_submit_vram(vk, job->rs8_K, job->rs8_M, job->rs8_parity_m, job->rs8_count, src_vram,
+                                                    src_offset, valid_bytes, job->in_buf, sym_T, target_out, !zc_out)
+                     : 0u;
+    if (job->ticket != 0u)
+        job->used_vram_out = zc_out;
+    pthread_mutex_unlock(&g_vk_mtx);
+    return job->ticket != 0u;
+}
+
+bool vxf_rs8_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, const uint8_t *sys_bitmap, vxfec_vk_buf *target_vram,
+                                     size_t target_offset, size_t total_bytes, uint32_t sym_T)
+{
+    if (!job || !job->rs8_is_decode || !target_vram)
+        return false;
+    pthread_mutex_lock(&g_vk_mtx);
+    vxfec_vk_ctx *vk = (job->vk_idx >= 0 && (uint32_t)job->vk_idx < g_num_vk_devs) ? g_vk_devs[job->vk_idx].ctx : NULL;
+    job->ticket =
+        vk ? vxfec_rs8_repair_submit_vram(vk, job->rs8_K, job->rs8_M, sys_bitmap, job->rs8_erased_k, job->rs8_parity_m,
+                                          job->rs8_count, target_vram, target_offset, total_bytes, job->in_buf, sym_T, job->out_buf)
            : 0u;
     pthread_mutex_unlock(&g_vk_mtx);
     return job->ticket != 0u;
@@ -875,7 +1047,13 @@ ncclResult_t vxf_reg_mr_dmabuf(void *comm, void *data, size_t size, int type, ui
             had_ibv_dev = true;
             if (size > 0u) {
                 mr->ibv_mrs[d] =
-                    vxfec_ibv_mr_reg_dmabuf(vxf_devs[d].ibv_ref->ctx, offset, size, (uint64_t)(uintptr_t)data, fd, false);
+                    vxfec_ibv_mr_reg_dmabuf(vxf_devs[d].ibv_ref->ctx, offset, size, (uint64_t)(uintptr_t)data, fd, true);
+                if (mr->ibv_mrs[d]) {
+                    mr->ibv_can_rwrite[d] = true;
+                } else {
+                    mr->ibv_mrs[d] =
+                        vxfec_ibv_mr_reg_dmabuf(vxf_devs[d].ibv_ref->ctx, offset, size, (uint64_t)(uintptr_t)data, fd, false);
+                }
                 if (mr->ibv_mrs[d]) {
                     mr->ibv_refs[d] = vxf_devs[d].ibv_ref;
                     vxf_ibv_ref_retain(mr->ibv_refs[d]);
@@ -970,6 +1148,15 @@ void vxf_dev_shutdown(void)
             if (!vs->ctx)
                 continue;
             for (uint32_t i = 0; i < VXFEC_VK_ASYNC_POOL_SLOTS; i++) {
+                for (uint32_t k = 0; k < VXFEC_MAX_DEVS; k++) {
+                    if (vs->pool[i].out_ibv_mrs[k])
+                        vxfec_ibv_mr_dereg(vs->pool[i].out_ibv_mrs[k]);
+                    if (vs->pool[i].out_ibv_refs[k])
+                        vxf_ibv_ref_release(vs->pool[i].out_ibv_refs[k]);
+                }
+                if (vs->pool[i].out_dmabuf_fd >= 0)
+                    close(vs->pool[i].out_dmabuf_fd);
+                vxfec_vk_buf_free(vs->ctx, vs->pool[i].out_dmabuf);
                 vxfec_vk_buf_free(vs->ctx, vs->pool[i].in_buf);
                 vxfec_vk_buf_free(vs->ctx, vs->pool[i].out_buf);
             }

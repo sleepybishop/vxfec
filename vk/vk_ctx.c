@@ -2029,6 +2029,276 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
     return vxfec_vk__submit_async_slot(ctx, slot, cmd);
 }
 
+bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *work_d_buf, size_t d_bytes,
+                                            vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes, uint32_t row_offset,
+                                            uint32_t K, uint32_t sym_T, uint32_t dst_stride)
+{
+    if (!ctx || !cmd || !work_d_buf || !src_vram || K == 0 || sym_T == 0 || dst_stride < sym_T || (dst_stride & 3u) != 0u ||
+        (d_bytes & 3u) != 0u || d_bytes > work_d_buf->bytes || valid_bytes > (size_t)K * sym_T || src_offset > src_vram->bytes ||
+        valid_bytes > src_vram->bytes - src_offset || ((size_t)(row_offset + K) * dst_stride) > d_bytes)
+        return false;
+
+    if (!vxfec_vk__ensure_owned_cmd(ctx, cmd, work_d_buf, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT))
+        return false;
+
+    bool contig = (row_offset == 0u && dst_stride == sym_T);
+    bool did_fill = false;
+    if (!contig) {
+        vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset, d_bytes, 0u);
+        did_fill = true;
+    } else if (valid_bytes < d_bytes) {
+        size_t fill_beg = valid_bytes & ~(size_t)3u;
+        vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset + fill_beg, d_bytes - fill_beg, 0u);
+        did_fill = true;
+    }
+
+    if (did_fill && valid_bytes > 0u) {
+        VkMemoryBarrier fill_mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0, NULL);
+    }
+
+    if (valid_bytes > 0u) {
+        bool ext_src = (src_vram->ext_kind != VXFEC_VK_EXT_NONE && !src_vram->owned_by_vk);
+        if (ext_src)
+            vxfec_vk__record_ext_acquire_cmd(ctx, cmd, src_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+        if (dst_stride == sym_T) {
+            VkBufferCopy cpy = {
+                .srcOffset = src_vram->view_offset + src_offset,
+                .dstOffset = work_d_buf->view_offset + (size_t)row_offset * dst_stride,
+                .size = valid_bytes,
+            };
+            vkCmdCopyBuffer(cmd, src_vram->dev_buf, work_d_buf->dev_buf, 1, &cpy);
+        } else {
+            uint32_t n_rows = (uint32_t)((valid_bytes + sym_T - 1u) / sym_T);
+            VkBufferCopy *copies = (VkBufferCopy *)malloc((size_t)n_rows * sizeof(*copies));
+            if (!copies)
+                return false;
+            for (uint32_t r = 0; r < n_rows; r++) {
+                size_t off = (size_t)r * sym_T;
+                size_t rem = valid_bytes - off;
+                copies[r] = (VkBufferCopy){
+                    .srcOffset = src_vram->view_offset + src_offset + off,
+                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + r) * dst_stride,
+                    .size = (rem > sym_T) ? sym_T : rem,
+                };
+            }
+            vkCmdCopyBuffer(cmd, src_vram->dev_buf, work_d_buf->dev_buf, n_rows, copies);
+            free(copies);
+        }
+
+        if (ext_src)
+            vxfec_vk__record_ext_release_cmd(ctx, cmd, src_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, 0);
+    }
+
+    VkMemoryBarrier xfer_to_comp = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_to_comp, 0, NULL, 0,
+                         NULL);
+    return true;
+}
+
+bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *work_d_buf, size_t d_bytes,
+                                             const uint8_t *sys_bitmap, uint32_t K, uint32_t sym_T, vxfec_vk_buf *target_vram,
+                                             size_t target_offset, size_t total_bytes, uint32_t row_offset, uint32_t dst_stride,
+                                             const uint32_t *staged_rows, uint32_t num_staged_rows, bool *out_ext_acquired)
+{
+    if (out_ext_acquired)
+        *out_ext_acquired = false;
+    if (!ctx || !cmd || !work_d_buf || !sys_bitmap || !target_vram || K == 0 || sym_T == 0 || dst_stride < sym_T ||
+        (dst_stride & 3u) != 0u || (d_bytes & 3u) != 0u || d_bytes > work_d_buf->bytes || total_bytes > (size_t)K * sym_T ||
+        target_offset > target_vram->bytes || total_bytes > target_vram->bytes - target_offset)
+        return false;
+
+    if (!vxfec_vk__ensure_owned_cmd(ctx, cmd, work_d_buf, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT))
+        return false;
+
+    if (!work_d_buf->zero_copy) {
+        vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset, d_bytes, 0u);
+        VkMemoryBarrier fill_mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0, NULL);
+
+        if (num_staged_rows > 0u && staged_rows) {
+            VkBufferCopy *sc = (VkBufferCopy *)malloc((size_t)num_staged_rows * sizeof(*sc));
+            if (!sc)
+                return false;
+            for (uint32_t i = 0; i < num_staged_rows; i++) {
+                size_t roff = (size_t)staged_rows[i] * dst_stride;
+                sc[i] = (VkBufferCopy){
+                    .srcOffset = roff,
+                    .dstOffset = work_d_buf->view_offset + roff,
+                    .size = sym_T,
+                };
+            }
+            vkCmdCopyBuffer(cmd, work_d_buf->stage_buf, work_d_buf->dev_buf, num_staged_rows, sc);
+            free(sc);
+        }
+    } else {
+        uint32_t total_rows = (uint32_t)(d_bytes / dst_stride);
+        uint8_t *is_staged = total_rows ? (uint8_t *)calloc(total_rows, 1u) : NULL;
+        if (total_rows > 0u && !is_staged)
+            return false;
+        if (num_staged_rows > 0u && staged_rows) {
+            for (uint32_t i = 0; i < num_staged_rows; i++) {
+                uint32_t sr = staged_rows[i];
+                if (sr < total_rows) {
+                    is_staged[sr] = 1u;
+                    if (dst_stride > sym_T && work_d_buf->stage_ptr)
+                        memset((uint8_t *)work_d_buf->stage_ptr + (size_t)sr * dst_stride + sym_T, 0, dst_stride - sym_T);
+                }
+            }
+        }
+        bool did_zc_fill = false;
+        uint32_t r = 0u;
+        while (r < total_rows) {
+            if (is_staged[r]) {
+                r++;
+                continue;
+            }
+            uint32_t run_beg = r;
+            while (r < total_rows && !is_staged[r])
+                r++;
+            vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset + (size_t)run_beg * dst_stride,
+                            (size_t)(r - run_beg) * dst_stride, 0u);
+            did_zc_fill = true;
+        }
+        size_t row_bytes = (size_t)total_rows * dst_stride;
+        if (row_bytes < d_bytes) {
+            vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset + row_bytes, d_bytes - row_bytes, 0u);
+            did_zc_fill = true;
+        }
+        free(is_staged);
+        if (did_zc_fill) {
+            VkMemoryBarrier fill_mb = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0,
+                                 NULL);
+        }
+    }
+
+    bool ext_tgt = (target_vram->ext_kind != VXFEC_VK_EXT_NONE && !target_vram->owned_by_vk);
+    if (ext_tgt) {
+        vxfec_vk__record_ext_acquire_cmd(ctx, cmd, target_vram, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (out_ext_acquired)
+            *out_ext_acquired = true;
+    }
+
+    VkBufferCopy *vc = (VkBufferCopy *)malloc((size_t)K * sizeof(*vc));
+    if (!vc)
+        return false;
+    uint32_t n_vc = 0u;
+    uint32_t e = 0u;
+    while (e < K) {
+        if (!(sys_bitmap[e >> 3u] & (1u << (e & 7u)))) {
+            e++;
+            continue;
+        }
+        size_t off = (size_t)e * sym_T;
+        if (off >= total_bytes)
+            break;
+        if (dst_stride == sym_T) {
+            uint32_t run_beg = e;
+            while (e < K && (sys_bitmap[e >> 3u] & (1u << (e & 7u))) && ((size_t)e * sym_T) < total_bytes)
+                e++;
+            size_t run_end_b = (size_t)e * sym_T;
+            if (run_end_b > total_bytes)
+                run_end_b = total_bytes;
+            if (run_end_b > off) {
+                vc[n_vc++] = (VkBufferCopy){
+                    .srcOffset = target_vram->view_offset + target_offset + off,
+                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + run_beg) * dst_stride,
+                    .size = run_end_b - off,
+                };
+            }
+        } else {
+            size_t rem = total_bytes - off;
+            size_t clen = (rem > sym_T) ? sym_T : rem;
+            if (clen > 0u) {
+                vc[n_vc++] = (VkBufferCopy){
+                    .srcOffset = target_vram->view_offset + target_offset + off,
+                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + e) * dst_stride,
+                    .size = clen,
+                };
+            }
+            e++;
+        }
+    }
+    if (n_vc > 0u)
+        vkCmdCopyBuffer(cmd, target_vram->dev_buf, work_d_buf->dev_buf, n_vc, vc);
+    free(vc);
+
+    VkMemoryBarrier xfer_to_comp = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_to_comp, 0, NULL, 0,
+                         NULL);
+    return true;
+}
+
+bool vxfec_vk__record_vram_repair_scatter_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, vxfec_vk_buf *out_buf, uint32_t out_stride,
+                                              vxfec_vk_buf *target_vram, size_t target_offset, size_t total_bytes, uint32_t sym_T,
+                                              const uint32_t *missing_esis, uint32_t num_missing, bool release_target_ext)
+{
+    if (!ctx || !cmd || !out_buf || !target_vram || !missing_esis || num_missing == 0u)
+        return false;
+
+    VkBufferCopy *sc = (VkBufferCopy *)malloc((size_t)num_missing * sizeof(*sc));
+    if (!sc)
+        return false;
+    uint32_t n_sc = 0u;
+    for (uint32_t i = 0; i < num_missing; i++) {
+        size_t off = (size_t)missing_esis[i] * sym_T;
+        if (off >= total_bytes)
+            continue;
+        size_t rem = total_bytes - off;
+        size_t clen = (rem > sym_T) ? sym_T : rem;
+        if (clen > 0u) {
+            sc[n_sc++] = (VkBufferCopy){
+                .srcOffset = out_buf->view_offset + (size_t)i * out_stride,
+                .dstOffset = target_vram->view_offset + target_offset + off,
+                .size = clen,
+            };
+        }
+    }
+    if (n_sc > 0u)
+        vkCmdCopyBuffer(cmd, out_buf->dev_buf, target_vram->dev_buf, n_sc, sc);
+    free(sc);
+
+    if (release_target_ext) {
+        vxfec_vk__record_ext_release_cmd(ctx, cmd, target_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    } else {
+        VkMemoryBarrier mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
+        };
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
+                             1, &mb, 0, NULL, 0, NULL);
+    }
+    return true;
+}
+
 uint32_t vxfec_vk__choose_gf256_tile_e(uint32_t num_out)
 {
     return (num_out <= 8u) ? 8u : 16u;

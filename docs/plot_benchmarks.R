@@ -50,16 +50,16 @@ draw_panel_gpu <- function(df) {
   pushViewport(viewport(x = 0, y = 0, width = 1, height = 1, just = c("left", "bottom")))
 
   grid.text(
-    "A. Resident-VRAM Uniform-Mask Burst Recovery",
+    "A. Resident-VRAM Burst Recovery & Pure-GF(2) Speedup",
     x = unit(14, "pt"), y = unit(1, "npc") - unit(13, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 12.2, col = "#0f172a")
   )
   grid.text(
-    "1.16-5.34 Tbps Protected Payload / Decode Time (RX 7900 XTX, 1.0-1.5 GiB GDDR6)",
+    "1.18-5.34 Tbps Decode; H=0 Pure-GF(2) Resident Encode: 1.43-7.03 Tbps (4.2-18.3x vs GF8)",
     x = unit(14, "pt"), y = unit(1, "npc") - unit(30, "pt"),
     just = c("left", "top"),
-    gp = gpar(fontfamily = font_fam, fontsize = 9.0, col = "#475569")
+    gp = gpar(fontfamily = font_fam, fontsize = 8.7, col = "#475569")
   )
 
   left_pt <- 62
@@ -223,19 +223,19 @@ draw_panel_pipe <- function(df) {
   pushViewport(viewport(x = 0, y = 0, width = 1, height = 1, just = c("left", "bottom")))
 
   grid.text(
-    "B. Wire-Ring Superframe Pipeline (Resident VRAM)",
+    "B. GPU-Resident TX Encode & 2.24 GiB Superframe Pipeline",
     x = unit(10, "pt"), y = unit(1, "npc") - unit(13, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 12.2, col = "#0f172a")
   )
   grid.text(
-    "Avg Rate w/ 8 Poisoned Masks, Full-VRAM Verify & Copy Contention (Excludes NIC DMA)",
+    "H=0 Pure-GF(2) (RQ-GF2) vs. RFC 6330 & Cauchy RS8 in Resident GDDR6 VRAM",
     x = unit(10, "pt"), y = unit(1, "npc") - unit(30, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontsize = 9.0, col = "#475569")
   )
 
-  left_pt <- 204
+  left_pt <- 208
   right_pt <- 18
   top_pt <- 58
   bot_pt <- 60
@@ -249,11 +249,11 @@ draw_panel_pipe <- function(df) {
   ))
 
   n <- nrow(df)
-  xmax <- 2.92
+  xmax <- 6.45
   sx <- function(v) v / xmax
   sy <- function(i) (i - 0.5) / n
 
-  for (xv in seq(0, 2.5, by = 0.5)) {
+  for (xv in seq(0, 5.0, by = 1.0)) {
     xn <- sx(xv)
     grid.lines(x = c(xn, xn), y = c(0, 1), gp = gpar(col = "#e2e8f0", lwd = 1))
     grid.text(
@@ -266,19 +266,19 @@ draw_panel_pipe <- function(df) {
   x1 <- sx(1.0)
   grid.lines(x = c(x1, x1), y = c(0, 1.03), gp = gpar(col = "#64748b", lty = "dotted", lwd = 1.4))
   grid.text(
-    "1.0 Tbps Avg Rate",
+    "1.0 Tbps SLA",
     x = unit(x1, "npc") + unit(3, "pt"), y = unit(1.03, "npc"),
     just = c("left", "bottom"),
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 8.0, col = "#64748b")
   )
 
-  bar_h <- 0.58 / n
+  bar_h <- 0.64 / n
   for (i in seq_len(n)) {
     yc <- sy(i)
     w <- sx(df$y_val[i])
-    is_rq <- df$series[i] == "Rateless"
-    bcol <- if (is_rq) "#0f766e" else "#2563eb"
-    tcol <- if (is_rq) "#0f766e" else "#1e40af"
+    sr <- df$series[i]
+    bcol <- if (sr == "RQ-GF2") "#059669" else if (sr == "Rateless") "#0f766e" else "#2563eb"
+    tcol <- if (sr == "RQ-GF2") "#047857" else if (sr == "Rateless") "#0f766e" else "#1e40af"
 
     grid.rect(
       x = unit(0, "npc"), y = unit(yc, "npc"),
@@ -289,31 +289,36 @@ draw_panel_pipe <- function(df) {
     grid.text(
       df$scenario[i],
       x = unit(-7, "pt"), y = unit(yc, "npc"), just = c("right", "center"),
-      gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 8.5, col = "#1e293b")
+      gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 8.1, col = "#1e293b")
     )
     grid.text(
       df$label[i],
       x = unit(w, "npc") + unit(5, "pt"), y = unit(yc, "npc"), just = c("left", "center"),
-      gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 8.2, col = tcol)
+      gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 8.0, col = tcol)
     )
   }
 
   grid.text(
-    "Average Protected Payload Processing Rate (Tbps)",
+    "Resident-VRAM Superframe Encode / Decode Rate (Tbps)",
     x = unit(0.5, "npc"), y = unit(-23, "pt"), just = c("center", "top"),
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 9.4, col = "#1e293b")
   )
 
   ly <- unit(-42, "pt")
-  grid.rect(x = unit(0.08, "npc"), y = ly, width = unit(9.5, "pt"), height = unit(9.5, "pt"),
-            just = c("left", "center"), gp = gpar(fill = "#0f766e", col = NA))
-  grid.text("Rateless (RFC 6330)", x = unit(0.08, "npc") + unit(13, "pt"), y = ly,
-            just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.5, col = "#1e293b"))
+  grid.rect(x = unit(-0.32, "npc"), y = ly, width = unit(9.0, "pt"), height = unit(9.0, "pt"),
+            just = c("left", "center"), gp = gpar(fill = "#059669", col = NA))
+  grid.text("RQ-GF2 (H=0 Pure-GF2)", x = unit(-0.32, "npc") + unit(12, "pt"), y = ly,
+            just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.2, col = "#1e293b"))
 
-  grid.rect(x = unit(0.54, "npc"), y = ly, width = unit(9.5, "pt"), height = unit(9.5, "pt"),
+  grid.rect(x = unit(0.18, "npc"), y = ly, width = unit(9.0, "pt"), height = unit(9.0, "pt"),
+            just = c("left", "center"), gp = gpar(fill = "#0f766e", col = NA))
+  grid.text("Rateless (RFC 6330)", x = unit(0.18, "npc") + unit(12, "pt"), y = ly,
+            just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.2, col = "#1e293b"))
+
+  grid.rect(x = unit(0.62, "npc"), y = ly, width = unit(9.0, "pt"), height = unit(9.0, "pt"),
             just = c("left", "center"), gp = gpar(fill = "#2563eb", col = NA))
-  grid.text("MDS (Cauchy RS8 GF8)", x = unit(0.54, "npc") + unit(13, "pt"), y = ly,
-            just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.5, col = "#1e293b"))
+  grid.text("MDS (Cauchy RS8)", x = unit(0.62, "npc") + unit(12, "pt"), y = ly,
+            just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.2, col = "#1e293b"))
 
   popViewport()
   popViewport()
@@ -445,13 +450,13 @@ draw_panel_cloud_wire <- function(df) {
   pushViewport(viewport(x = 0, y = 0, width = 1, height = 1, just = c("left", "bottom")))
 
   grid.text(
-    "E. 200G TIER_1 Titanium gVNIC & Wire -> VRAM Throughput",
+    "E. >200 Gbps GPU-to-GPU Pipelined & GCP 200G TIER_1 Wire",
     x = unit(10, "pt"), y = unit(1, "npc") - unit(11, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 12.2, col = "#0f172a")
   )
   grid.text(
-    "GCP 4x 100G gVNIC 8896B Jumbo (2x n2-standard-96 TIER_1), 32G & Local (Gbps)",
+    "3-Stage GPU->GPU Pipeline (RX 7900 XTX) & GCP 4x 100G gVNIC Jumbo (Gbps)",
     x = unit(10, "pt"), y = unit(1, "npc") - unit(28, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontsize = 9.0, col = "#475569")
@@ -485,7 +490,7 @@ draw_panel_cloud_wire <- function(df) {
   ))
 
   n <- nrow(df)
-  xmax <- 370.0
+  xmax <- 425.0
   sx <- function(v) v / xmax
   sy <- function(i) (i - 0.5) / n
 
@@ -548,7 +553,7 @@ draw_panel_cloud_wire <- function(df) {
 
   grid.rect(x = unit(0.60, "npc"), y = ly, width = unit(9, "pt"), height = unit(9, "pt"),
             just = c("left", "center"), gp = gpar(fill = "#2563eb", col = NA))
-  grid.text("Local 4-Rail + RX 7900 XTX", x = unit(0.60, "npc") + unit(12.5, "pt"), y = ly,
+  grid.text("3-Stage GPU->GPU Pipe (RX 7900 XTX)", x = unit(0.60, "npc") + unit(12.5, "pt"), y = ly,
             just = c("left", "center"), gp = gpar(fontfamily = font_fam, fontsize = 8.2, col = "#1e293b"))
 
   popViewport()
@@ -576,7 +581,7 @@ pushViewport(viewport(layout.pos.row = 2, layout.pos.col = 1:2))
 draw_grouped_cct_panel(
   subset(raw, panel == "nccl"),
   "C. Single-Host 0-RTT Loopback Collective Completion Time (CCT)",
-  "bench_nccl p99 (N=100) & Live 2-Process ROCm/RCCL Avg CCT vs. User-Space UDP Cumul.-NACK GBN & SACK",
+  "bench_nccl p99 & Live RCCL Avg CCT (2M Burst=8 Rateless: RQ-GF2 12.3 ms vs. RQ-GF256 24.1 ms p99, -49% tail, +20% BW)",
   xmax = 9.2,
   x_ticks = 0:8,
   series_order = c("User-Space UDP Go-Back-N", "RFC 2018 SACK (No FEC)", "vxfec (MDS + HARQ + ECN)"),

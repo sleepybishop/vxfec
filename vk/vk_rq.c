@@ -1287,3 +1287,123 @@ uint64_t vxfec_rq_run_and_mix_submit(vxfec_vk_ctx *ctx, nanorq_core *rq, const v
         ((vxfec_rq_sched *)gs)->ops_uploaded = true;
     return ticket;
 }
+
+uint64_t vxfec_rq_encode_submit_vram(vxfec_vk_ctx *ctx, nanorq_core *rq, const vxfec_rq_sched *gs, vxfec_vk_buf *src_vram,
+                                     size_t src_offset, size_t valid_bytes, uint32_t sym_T, vxfec_vk_buf *work_d_buf,
+                                     uint32_t stride, const uint32_t *esis, uint32_t num_esis, vxfec_vk_buf *out_buf,
+                                     bool download_out)
+{
+    if (!ctx || !ctx->has_timeline_sem || !ctx->timeline_sem || !rq || !gs || !src_vram || !work_d_buf || !out_buf || !esis ||
+        sym_T == 0 || stride < sym_T || (stride & 3u) != 0 || num_esis == 0)
+        return 0;
+
+    uint32_t rows = nanorq_core_get_pc_rows(rq);
+    uint32_t sh = nanorq_core_get_pc_genc_offset(rq);
+    size_t d_bytes = (size_t)rows * stride;
+
+    uint32_t slot = 0;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!vxfec_vk__acquire_async_slot(ctx, &slot, &cmd))
+        return 0;
+
+    if (!vxfec_vk__record_vram_encode_input_cmd(ctx, cmd, work_d_buf, d_bytes, src_vram, src_offset, valid_bytes, sh, rq->P.K,
+                                                sym_T, stride)) {
+        ctx->pending_owned_cnt = 0;
+        (void)vkEndCommandBuffer(cmd);
+        return 0;
+    }
+
+    bool ext_out = (!download_out && out_buf->ext_kind != VXFEC_VK_EXT_NONE && !out_buf->owned_by_vk);
+    if (ext_out) {
+        vxfec_vk__record_ext_acquire_cmd(ctx, cmd, out_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        out_buf->owned_by_vk = true;
+    }
+
+    bool copied_ops = false;
+    bool rec_ok = record_run_and_mix_cmd(ctx, cmd, ctx->async_ds_run[slot], ctx->async_ds_mix[slot], &ctx->async_tab_bufs[slot],
+                                         &ctx->async_tab_caps[slot], false, rq, gs, work_d_buf, stride, 1u, esis, num_esis, out_buf,
+                                         false, download_out, false, &copied_ops);
+    if (ext_out)
+        out_buf->owned_by_vk = false;
+    if (!rec_ok) {
+        ctx->pending_owned_cnt = 0;
+        (void)vkEndCommandBuffer(cmd);
+        return 0;
+    }
+    if (ext_out)
+        vxfec_vk__record_ext_release_cmd(ctx, cmd, out_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+    uint64_t ticket = vxfec_vk__submit_async_slot(ctx, slot, cmd);
+    if (ticket != 0 && copied_ops)
+        ((vxfec_rq_sched *)gs)->ops_uploaded = true;
+    return ticket;
+}
+
+uint64_t vxfec_rq_repair_submit_vram(vxfec_vk_ctx *ctx, nanorq_core *rq, const vxfec_rq_sched *gs, const uint8_t *sys_bitmap,
+                                     uint32_t K, uint32_t sym_T, vxfec_vk_buf *target_vram, size_t target_offset,
+                                     size_t total_bytes, vxfec_vk_buf *work_d_buf, uint32_t stride, const uint32_t *missing_esis,
+                                     uint32_t num_missing, uint32_t overhead, vxfec_vk_buf *out_buf)
+{
+    if (!ctx || !ctx->has_timeline_sem || !ctx->timeline_sem || !rq || !gs || !sys_bitmap || !target_vram || !work_d_buf ||
+        !out_buf || !missing_esis || K == 0 || sym_T == 0 || stride < sym_T || (stride & 3u) != 0 || num_missing == 0)
+        return 0;
+
+    uint32_t rows = nanorq_core_get_pc_rows(rq);
+    uint32_t sh = nanorq_core_get_pc_genc_offset(rq);
+    size_t d_bytes = (size_t)rows * stride;
+    uint32_t total_staged = num_missing + overhead;
+    uint32_t *staged_rows = (uint32_t *)malloc((size_t)total_staged * sizeof(*staged_rows));
+    if (!staged_rows)
+        return 0;
+    for (uint32_t r = 0; r < num_missing; r++)
+        staged_rows[r] = sh + missing_esis[r];
+    for (uint32_t i = 0; i < overhead; i++)
+        staged_rows[num_missing + i] = sh + rq->P.Kprime + i;
+
+    uint32_t slot = 0;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!vxfec_vk__acquire_async_slot(ctx, &slot, &cmd)) {
+        free(staged_rows);
+        return 0;
+    }
+
+    bool ext_tgt = false;
+    bool ok = vxfec_vk__record_vram_repair_gather_cmd(ctx, cmd, work_d_buf, d_bytes, sys_bitmap, K, sym_T, target_vram,
+                                                      target_offset, total_bytes, sh, stride, staged_rows, total_staged, &ext_tgt);
+    free(staged_rows);
+    if (!ok) {
+        ctx->pending_owned_cnt = 0;
+        (void)vkEndCommandBuffer(cmd);
+        return 0;
+    }
+
+    bool saved_out_owned = out_buf->owned_by_vk;
+    if (out_buf->ext_kind != VXFEC_VK_EXT_NONE && !out_buf->owned_by_vk) {
+        vxfec_vk__record_ext_acquire_cmd(ctx, cmd, out_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        out_buf->owned_by_vk = true;
+    }
+
+    bool copied_ops = false;
+    bool rec_ok = record_run_and_mix_cmd(ctx, cmd, ctx->async_ds_run[slot], ctx->async_ds_mix[slot], &ctx->async_tab_bufs[slot],
+                                         &ctx->async_tab_caps[slot], false, rq, gs, work_d_buf, stride, 1u, missing_esis,
+                                         num_missing, out_buf, false, false, false, &copied_ops);
+    if (rec_ok) {
+        rec_ok = vxfec_vk__record_vram_repair_scatter_cmd(ctx, cmd, out_buf, stride, target_vram, target_offset, total_bytes, sym_T,
+                                                          missing_esis, num_missing, ext_tgt);
+    }
+    if (!saved_out_owned && out_buf->ext_kind != VXFEC_VK_EXT_NONE) {
+        out_buf->owned_by_vk = false;
+        if (rec_ok)
+            vxfec_vk__record_ext_release_cmd(ctx, cmd, out_buf, VK_PIPELINE_STAGE_TRANSFER_BIT, 0);
+    }
+    if (!rec_ok) {
+        ctx->pending_owned_cnt = 0;
+        (void)vkEndCommandBuffer(cmd);
+        return 0;
+    }
+
+    uint64_t ticket = vxfec_vk__submit_async_slot(ctx, slot, cmd);
+    if (ticket != 0 && copied_ops)
+        ((vxfec_rq_sched *)gs)->ops_uploaded = true;
+    return ticket;
+}

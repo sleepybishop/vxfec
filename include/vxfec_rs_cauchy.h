@@ -50,6 +50,14 @@ uint64_t vxfec_rs8_submit_raw(vxfec_vk_ctx *ctx, bool is_decode, uint32_t K, uin
                               const uint8_t *parity_m, uint32_t num_out, vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks,
                               vxfec_vk_buf *out_buf, bool upload_d, bool download_out);
 
+/* GPU-resident VRAM-to-VRAM RS8 encode and in-place VRAM erasure repair (zero host payload bounce) */
+uint64_t vxfec_rs8_encode_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity,
+                                      vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes, vxfec_vk_buf *work_d_buf,
+                                      uint32_t stride, vxfec_vk_buf *out_buf, bool download_out);
+uint64_t vxfec_rs8_repair_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *sys_bitmap, const uint8_t *erased_k,
+                                      const uint8_t *parity_m, uint32_t num_erased, vxfec_vk_buf *target_vram, size_t target_offset,
+                                      size_t total_bytes, vxfec_vk_buf *work_d_buf, uint32_t stride, vxfec_vk_buf *out_buf);
+
 #ifdef __cplusplus
 }
 #endif

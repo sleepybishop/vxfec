@@ -148,8 +148,10 @@ if [[ "${NUM_NODES}" -ge 2 ]]; then
     : "${IFACES1:=${NIC1}}"
 
     echo "[03_run_tier2_a3_h100] Running 2-node multi-NIC gVNIC superframe saturation (${IP0_LIST} -> ${IP1_LIST})..."
-    for spec in "rateless 0" "rateless 10" "mds 10"; do
-        read -r codec bpct <<<"${spec}"
+    for spec in "rateless 0 0" "rateless 10 0" "rateless-gf2 10 0" "mds 10 0" "rateless-gf2 10 1"; do
+        read -r codec bpct pipe <<<"${spec}"
+        PIPE_ARG=()
+        [[ "${pipe}" == "1" ]] && PIPE_ARG=(--pipeline)
         gcloud compute ssh "${NODE1}" --project="${GCP_PROJECT}" --zone="${GCP_ZONE}" \
             --command="cd ~/vxfec && ./bench_wire_net --mode rx --bind ${IP1_LIST} --port 31500 --ports-per-ip 4" &
         RX_PID=$!
@@ -157,7 +159,7 @@ if [[ "${NUM_NODES}" -ge 2 ]]; then
         sleep 1
         STEP_ERR=0
         gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${GCP_ZONE}" \
-            --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IP1_LIST} --port 31500 --ports-per-ip 4 --codec ${codec} --z 128 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bpct} --csv ~/vxfec/a3_wire_multinic.csv" | tee -a "${OUT_DIR}/a3_wire_multinic.log" || STEP_ERR=1
+            --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IP1_LIST} --port 31500 --ports-per-ip 4 --codec ${codec} --z 128 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bpct} ${PIPE_ARG[*]} --csv ~/vxfec/a3_wire_multinic.csv" | tee -a "${OUT_DIR}/a3_wire_multinic.log" || STEP_ERR=1
         wait "${RX_PID}" || STEP_ERR=1
         [[ "${STEP_ERR}" == "0" ]] || exit 1
     done

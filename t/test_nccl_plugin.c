@@ -2307,7 +2307,11 @@ static bool test_rq_gpu_progress(const ncclNet_v8_t *net, unsigned drops, bool s
     memset(&test_rq_vk, 0, sizeof(test_rq_vk));
     test_rq_expected_k = RQ_K;
     test_rq_drop_base = 80u;
+#ifdef NANORQ_HAS_GF2_MODE
+    test_rq_expected_flag = 1u;
+#else
     test_rq_expected_flag = 0u;
+#endif
     test_rq_drop_mask = 0;
     test_rq_repair_packets = 0;
     test_rq_late.len = 0;
@@ -2853,7 +2857,7 @@ static bool test_rq_wire_selection(const ncclNet_v8_t *net, void (*set_codec)(co
 #ifdef NANORQ_HAS_GF2_MODE
         if (!(hello.features & 1u))
             goto out;
-        expected = (mode && allow_gf2) ? 1u : 0u;
+        expected = (allow_gf2 && (!mode || strcmp(mode, "rq-gf2") == 0)) ? 1u : 0u;
 #else
         if (hello.features & 1u)
             goto out;
@@ -4435,9 +4439,20 @@ typedef struct {
     uint32_t rq_cnt;
 } mock_ibv_qp_t;
 
+typedef struct {
+    bool used;
+    uint32_t key;
+    uint64_t base_addr;
+    size_t length;
+    vxfec_vk_buf *vk_buf;
+} mock_ibv_mr_entry_t;
+
+#define MOCK_MAX_MRS 128
+
 static pthread_mutex_t g_mock_ibv_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct ibv_device g_mock_ibv_dev;
 static mock_ibv_qp_t *g_mock_qps[MOCK_MAX_QPS];
+static mock_ibv_mr_entry_t g_mock_mrs[MOCK_MAX_MRS];
 static struct {
     uint32_t next_qpn;
     uint32_t next_key;
@@ -4451,7 +4466,11 @@ static struct {
     uint32_t drop_esi_cnt;
     uint32_t dropped_uc_pkts;
     uint32_t repair_uc_pkts;
+    uint32_t rdma_write_imm_pkts;
+    uint32_t drop_rdma_rem;
+    uint32_t dropped_rdma_pkts;
     uint32_t recv_wqes_consumed;
+    vxfec_vk_ctx *vk_ctx;
     struct ibv_cq *fail_poll_cq;
     bool inject_wc_err;
     bool ipv6_only_gid;
@@ -4460,6 +4479,45 @@ static struct {
     uint8_t port1_speed;
     uint8_t port2_speed;
 } g_mock_ibv;
+
+static const mock_ibv_mr_entry_t *mock_find_mr_locked(uint32_t key)
+{
+    if (key == 0u)
+        return NULL;
+    for (int i = 0; i < MOCK_MAX_MRS; i++) {
+        if (g_mock_mrs[i].used && g_mock_mrs[i].key == key)
+            return &g_mock_mrs[i];
+    }
+    return NULL;
+}
+
+static bool mock_mr_read_locked(uint32_t lkey, uint64_t addr, void *dst, size_t len)
+{
+    if (len == 0u)
+        return true;
+    const mock_ibv_mr_entry_t *e = mock_find_mr_locked(lkey);
+    if (e && e->vk_buf && g_mock_ibv.vk_ctx) {
+        if (addr < e->base_addr || (addr - e->base_addr) > e->length || len > e->length - (size_t)(addr - e->base_addr))
+            return false;
+        return vxfec_vk_buf_read_offset(g_mock_ibv.vk_ctx, e->vk_buf, (size_t)(addr - e->base_addr), dst, len);
+    }
+    memcpy(dst, (const void *)(uintptr_t)addr, len);
+    return true;
+}
+
+static bool mock_mr_write_locked(uint32_t rkey, uint64_t addr, const void *src, size_t len)
+{
+    if (len == 0u)
+        return true;
+    const mock_ibv_mr_entry_t *e = mock_find_mr_locked(rkey);
+    if (e && e->vk_buf && g_mock_ibv.vk_ctx) {
+        if (addr < e->base_addr || (addr - e->base_addr) > e->length || len > e->length - (size_t)(addr - e->base_addr))
+            return false;
+        return vxfec_vk_buf_write_offset(g_mock_ibv.vk_ctx, e->vk_buf, (size_t)(addr - e->base_addr), src, len);
+    }
+    memcpy((void *)(uintptr_t)addr, src, len);
+    return true;
+}
 
 static void mock_cq_push_locked(struct ibv_cq *raw_cq, struct ibv_wc wc)
 {
@@ -4571,17 +4629,73 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
                 if (total_len <= rsge.length) {
                     uint8_t *dst = (uint8_t *)(uintptr_t)rsge.addr;
                     size_t off = 0u;
+                    bool copy_ok = true;
                     for (int s = 0; s < it->num_sge; s++) {
                         if (it->sg_list[s].length > 0u) {
-                            memcpy(dst + off, (const void *)(uintptr_t)it->sg_list[s].addr, it->sg_list[s].length);
+                            if (!mock_mr_read_locked(it->sg_list[s].lkey, it->sg_list[s].addr, dst + off, it->sg_list[s].length)) {
+                                copy_ok = false;
+                                break;
+                            }
                             off += it->sg_list[s].length;
                         }
                     }
                     struct ibv_wc rwc;
                     memset(&rwc, 0, sizeof(rwc));
                     rwc.wr_id = peer->rq_wr_id[ridx];
-                    rwc.status = IBV_WC_SUCCESS;
+                    rwc.status = copy_ok ? IBV_WC_SUCCESS : IBV_WC_LOC_PROT_ERR;
                     rwc.opcode = IBV_WC_RECV;
+                    rwc.byte_len = total_len;
+                    mock_cq_push_locked(peer->qp.recv_cq, rwc);
+                }
+            }
+        } else if (mqp->dest_qpn != 0u && it->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) {
+            if (g_mock_ibv.drop_rdma_rem > 0u) {
+                g_mock_ibv.drop_rdma_rem--;
+                g_mock_ibv.dropped_rdma_pkts++;
+            } else {
+                mock_ibv_qp_t *peer = NULL;
+                for (int i = 0; i < MOCK_MAX_QPS; i++) {
+                    if (g_mock_qps[i] && g_mock_qps[i]->qp.qp_num == mqp->dest_qpn) {
+                        peer = g_mock_qps[i];
+                        break;
+                    }
+                }
+                if (peer && peer->state >= IBV_QPS_RTR && peer->rq_cnt > 0u) {
+                    uint32_t ridx = peer->rq_head;
+                    peer->rq_head = (peer->rq_head + 1u) % MOCK_RQ_RING;
+                    peer->rq_cnt--;
+                    g_mock_ibv.recv_wqes_consumed++;
+                    g_mock_ibv.rdma_write_imm_pkts++;
+
+                    bool copy_ok = true;
+                    if (total_len > 0u) {
+                        uint8_t *tmp = (uint8_t *)malloc(total_len);
+                        if (!tmp) {
+                            copy_ok = false;
+                        } else {
+                            size_t off = 0u;
+                            for (int s = 0; s < it->num_sge; s++) {
+                                if (it->sg_list[s].length > 0u) {
+                                    if (!mock_mr_read_locked(it->sg_list[s].lkey, it->sg_list[s].addr, tmp + off,
+                                                             it->sg_list[s].length)) {
+                                        copy_ok = false;
+                                        break;
+                                    }
+                                    off += it->sg_list[s].length;
+                                }
+                            }
+                            if (copy_ok)
+                                copy_ok = mock_mr_write_locked(it->wr.rdma.rkey, it->wr.rdma.remote_addr, tmp, total_len);
+                            free(tmp);
+                        }
+                    }
+                    struct ibv_wc rwc;
+                    memset(&rwc, 0, sizeof(rwc));
+                    rwc.wr_id = peer->rq_wr_id[ridx];
+                    rwc.status = copy_ok ? IBV_WC_SUCCESS : IBV_WC_REM_ACCESS_ERR;
+                    rwc.opcode = IBV_WC_RECV_RDMA_WITH_IMM;
+                    rwc.wc_flags = IBV_WC_WITH_IMM;
+                    rwc.imm_data = it->imm_data;
                     rwc.byte_len = total_len;
                     mock_cq_push_locked(peer->qp.recv_cq, rwc);
                 }
@@ -4755,10 +4869,34 @@ __attribute__((visibility("default"))) struct ibv_mr *vxfec_test_ibv_reg_mr(stru
 __attribute__((visibility("default"))) struct ibv_mr *vxfec_test_ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
                                                                                    size_t length, uint64_t iova, int fd, int access)
 {
-    (void)offset;
     if (fd < 0)
         return NULL;
-    return vxfec_test_ibv_reg_mr(pd, (void *)(uintptr_t)iova, length, access);
+    struct ibv_mr *mr = vxfec_test_ibv_reg_mr(pd, (void *)(uintptr_t)iova, length, access);
+    if (!mr)
+        return NULL;
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    if (g_mock_ibv.vk_ctx && length > 0u) {
+        int dfd = dup(fd);
+        vxfec_vk_buf *vb = (dfd >= 0) ? vxfec_vk_buf_import_fd_range(g_mock_ibv.vk_ctx, dfd, offset, length, true) : NULL;
+        if (!vb && dfd >= 0)
+            close(dfd);
+        if (vb) {
+            for (int i = 0; i < MOCK_MAX_MRS; i++) {
+                if (!g_mock_mrs[i].used) {
+                    g_mock_mrs[i] = (mock_ibv_mr_entry_t){
+                        .used = true,
+                        .key = mr->lkey,
+                        .base_addr = iova,
+                        .length = length,
+                        .vk_buf = vb,
+                    };
+                    break;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+    return mr;
 }
 
 __attribute__((visibility("default"))) int vxfec_test_ibv_dereg_mr(struct ibv_mr *mr)
@@ -4766,6 +4904,14 @@ __attribute__((visibility("default"))) int vxfec_test_ibv_dereg_mr(struct ibv_mr
     if (!mr)
         return 0;
     pthread_mutex_lock(&g_mock_ibv_mtx);
+    for (int i = 0; i < MOCK_MAX_MRS; i++) {
+        if (g_mock_mrs[i].used && g_mock_mrs[i].key == mr->lkey) {
+            if (g_mock_mrs[i].vk_buf && g_mock_ibv.vk_ctx)
+                vxfec_vk_buf_free(g_mock_ibv.vk_ctx, g_mock_mrs[i].vk_buf);
+            memset(&g_mock_mrs[i], 0, sizeof(g_mock_mrs[i]));
+            break;
+        }
+    }
     if (g_mock_ibv.active_mrs > 0u)
         g_mock_ibv.active_mrs--;
     pthread_mutex_unlock(&g_mock_ibv_mtx);
@@ -5654,7 +5800,157 @@ out:
         close(ctrl_fd);
     free(tx);
     free(rx);
+
+    /* 5) GPU VRAM DMA-BUF -> PKT_RDMA_CTS -> RDMA_WRITE_WITH_IMM + GPU-resident out_dmabuf parity + in-place VRAM decode */
+    if (ok) {
+        vxfec_vk_ctx *vk = vxfec_vk_ctx_new();
+        if (vk && vxfec_vk_has_dmabuf(vk) && vxfec_vk_has_dmabuf_export(vk) && vxfec_vk_has_timeline(vk)) {
+            pthread_mutex_lock(&g_mock_ibv_mtx);
+            g_mock_ibv.vk_ctx = vk;
+            g_mock_ibv.rdma_write_imm_pkts = 0u;
+            g_mock_ibv.drop_rdma_rem = 0u;
+            g_mock_ibv.dropped_rdma_pkts = 0u;
+            pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+            setenv("VXFEC_NCCL_VULKAN", "2", 1);
+            setenv("VXFEC_NCCL_BACKEND", "ibv", 1);
+            setenv("VXFEC_NCCL_PORTS", "4", 1);
+            if (net->init(dummy_nccl_logger) != ncclSuccess) {
+                ok = false;
+            } else {
+                const size_t gsz = 262144u;
+                int tfd = -1, rfd = -1;
+                vxfec_vk_buf *tvb = vxfec_vk_buf_new_exportable(vk, gsz, true, &tfd);
+                vxfec_vk_buf *rvb = vxfec_vk_buf_new_exportable(vk, gsz, true, &rfd);
+                uint8_t *h_src = (uint8_t *)malloc(gsz);
+                uint8_t *h_dst = (uint8_t *)calloc(1, gsz);
+                uint8_t *h_poison = (uint8_t *)malloc(gsz);
+                void *glc = NULL, *gsc = NULL, *grc = NULL, *gtmr = NULL, *grmr = NULL;
+                uint8_t gh[NCCL_NET_HANDLE_MAXSIZE] = {0};
+
+                if (!tvb || !rvb || tfd < 0 || rfd < 0 || !h_src || !h_dst || !h_poison ||
+                    net->listen(0, gh, &glc) != ncclSuccess || !glc) {
+                    ok = false;
+                } else {
+                    memset(h_poison, 0xa5, gsz);
+                    for (int spin = 0; spin < 50000 && (!gsc || !grc); spin++) {
+                        if (!gsc && net->connect(0, gh, &gsc, NULL) != ncclSuccess) {
+                            ok = false;
+                            break;
+                        }
+                        if (!grc && net->accept(glc, &grc, NULL) != ncclSuccess) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    void *tx_iova = (void *)(uintptr_t)0x610000000000ULL;
+                    void *rx_iova = (void *)(uintptr_t)0x620000000000ULL;
+                    if (!ok || !gsc || !grc || net->regMrDmaBuf(gsc, tx_iova, gsz, NCCL_PTR_CUDA, 0u, tfd, &gtmr) != ncclSuccess ||
+                        net->regMrDmaBuf(grc, rx_iova, gsz, NCCL_PTR_CUDA, 0u, rfd, &grmr) != ncclSuccess) {
+                        ok = false;
+                    } else {
+                        /* 5a: Lossless RDMA_WRITE_WITH_IMM directly into RX GPU VRAM (0-copy), 5b: RS8 VRAM repair, 5c: RQ VRAM */
+                        for (int sub = 0; sub < 3 && ok; sub++) {
+                            const char *cmode = (sub == 0) ? NULL : ((sub == 1) ? "rs8" : "rq-gf2");
+                            uint32_t want_drops = (sub == 0) ? 0u : ((sub == 1) ? 4u : 6u);
+                            set_codec(cmode);
+                            reset_stats();
+                            for (size_t i = 0; i < gsz; i++)
+                                h_src[i] = (uint8_t)((i * 73u + (size_t)sub * 41u + 19u) & 0xffu);
+                            if (!vxfec_vk_buf_write_offset(vk, tvb, 0u, h_src, gsz) || !vxfec_vk_buf_release_external(vk, tvb) ||
+                                !vxfec_vk_buf_write_offset(vk, rvb, 0u, h_poison, gsz) || !vxfec_vk_buf_release_external(vk, rvb)) {
+                                ok = false;
+                                break;
+                            }
+                            pthread_mutex_lock(&g_mock_ibv_mtx);
+                            uint32_t pre_rdma = g_mock_ibv.rdma_write_imm_pkts;
+                            g_mock_ibv.drop_rdma_rem = want_drops;
+                            g_mock_ibv.dropped_rdma_pkts = 0u;
+                            pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+                            void *gsreq = NULL, *grreq = NULL, *grptr = rx_iova;
+                            int gcap = (int)gsz, gtag = 860 + sub, gsd = 0, grd = 0, ggot = 0;
+                            if (net->irecv(grc, 1, &grptr, &gcap, &gtag, &grmr, &grreq) != ncclSuccess || !grreq) {
+                                ok = false;
+                                break;
+                            }
+                            /* let TX drain PKT_RDMA_CTS before spawning or during isend */
+                            if (net->isend(gsc, tx_iova, (int)gsz, gtag, gtmr, &gsreq) != ncclSuccess || !gsreq) {
+                                ok = false;
+                                break;
+                            }
+                            for (int spin = 0; spin < 200000 && (!gsd || !grd); spin++) {
+                                if (!gsd && net->test(gsreq, &gsd, NULL) != ncclSuccess) {
+                                    ok = false;
+                                    break;
+                                }
+                                if (!grd && net->test(grreq, &grd, &ggot) != ncclSuccess) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            pthread_mutex_lock(&g_mock_ibv_mtx);
+                            uint32_t post_rdma = g_mock_ibv.rdma_write_imm_pkts - pre_rdma;
+                            uint32_t got_drops = g_mock_ibv.dropped_rdma_pkts;
+                            g_mock_ibv.drop_rdma_rem = 0u;
+                            pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+                            vxfec_nccl_stats_t gst;
+                            get_stats_ex(&gst, sizeof(gst));
+                            memset(h_dst, 0, gsz);
+                            if (!ok || !gsd || !grd || ggot != (int)gsz || post_rdma == 0u || got_drops != want_drops ||
+                                !vxfec_vk_buf_read_offset(vk, rvb, 0u, h_dst, gsz) || memcmp(h_src, h_dst, gsz) != 0) {
+                                fprintf(stderr,
+                                        "FAIL: GPUDirect RDMA VRAM subtest %d failed (sd=%d rd=%d got=%d rdma=%u drops=%u/%u)\n",
+                                        sub, gsd, grd, ggot, post_rdma, got_drops, want_drops);
+                                ok = false;
+                                break;
+                            }
+                            if (sub > 0 && (gst.vk_offload_calls < 2u || gst.rx_fec_decodes == 0u)) {
+                                fprintf(stderr,
+                                        "FAIL: GPUDirect RDMA VRAM subtest %d missed GPU encode/decode (vk_calls=%lu fec=%lu)\n",
+                                        sub, (unsigned long)gst.vk_offload_calls, (unsigned long)gst.rx_fec_decodes);
+                                ok = false;
+                                break;
+                            }
+                        }
+                        set_codec(NULL);
+                    }
+                }
+                if (gtmr)
+                    net->deregMr(gsc, gtmr);
+                if (grmr)
+                    net->deregMr(grc, grmr);
+                if (gsc)
+                    net->closeSend(gsc);
+                if (grc)
+                    net->closeRecv(grc);
+                if (glc)
+                    net->closeListen(glc);
+                if (tfd >= 0)
+                    close(tfd);
+                if (rfd >= 0)
+                    close(rfd);
+                vxfec_vk_buf_free(vk, tvb);
+                vxfec_vk_buf_free(vk, rvb);
+                free(h_poison);
+                free(h_dst);
+                free(h_src);
+            }
+            if (ok) {
+                printf("PASS: GPUDirect RDMA_WRITE_WITH_IMM -> DMA-BUF VRAM + zero-copy out_dmabuf parity + in-place VRAM "
+                       "RS8/RQ-GF2 decode\n");
+            }
+        } else if (vk) {
+            vxfec_vk_ctx_free(vk);
+        }
+    }
+
     dlclose(dl);
+    if (g_mock_ibv.vk_ctx) {
+        vxfec_vk_ctx_free(g_mock_ibv.vk_ctx);
+        g_mock_ibv.vk_ctx = NULL;
+    }
     return ok ? 0 : 1;
 }
 #endif
@@ -6436,7 +6732,8 @@ int main(int argc, char **argv)
     if (!test_multi_tag_ooo_irecv(net) || !test_phase3_wire_and_hol_regressions(net))
         goto fail;
 
-    if (!test_rq_wire_selection(net, set_codec, NULL, true, false) ||
+    if (!test_rq_wire_selection(net, set_codec, NULL, false, false) || !test_rq_wire_selection(net, set_codec, NULL, true, false) ||
+        !test_rq_wire_selection(net, set_codec, "rq-gf256", true, false) ||
         !test_rq_wire_selection(net, set_codec, "rq-gf2", false, false) ||
         !test_rq_wire_selection(net, set_codec, "rq-gf2", true, false) ||
         !test_rq_wire_selection(net, set_codec, NULL, true, true) ||

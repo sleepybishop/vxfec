@@ -138,8 +138,10 @@ gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${GCP_ZONE}" --
 "
 
 echo "[02_run_tier1_g2_l4] Running 2-node intra-zone gVNIC (8896B Jumbo) superframe saturation (${IP0} -> ${IP1})..."
-for spec in "rateless 0" "rateless 10" "mds 10" "rateless 20"; do
-    read -r codec bpct <<<"${spec}"
+for spec in "rateless 0 0" "rateless 10 0" "rateless-gf2 10 0" "mds 10 0" "rateless-gf2 10 1" "rateless 20 0"; do
+    read -r codec bpct pipe <<<"${spec}"
+    PIPE_ARG=()
+    [[ "${pipe}" == "1" ]] && PIPE_ARG=(--pipeline)
     gcloud compute ssh "${NODE1}" --project="${GCP_PROJECT}" --zone="${GCP_ZONE}" \
         --command="cd ~/vxfec && ./bench_wire_net --mode rx --bind ${IP1} --port 31500 --ports-per-ip 8" &
     RX_PID=$!
@@ -147,7 +149,7 @@ for spec in "rateless 0" "rateless 10" "mds 10" "rateless 20"; do
     sleep 1
     STEP_ERR=0
     gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${GCP_ZONE}" \
-        --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IP1} --port 31500 --ports-per-ip 8 --codec ${codec} --z 64 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bpct} --csv ~/vxfec/g2_wire_intrazone.csv" | tee -a "${OUT_DIR}/g2_wire_intrazone.log" || STEP_ERR=1
+        --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IP1} --port 31500 --ports-per-ip 8 --codec ${codec} --z 64 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bpct} ${PIPE_ARG[*]} --csv ~/vxfec/g2_wire_intrazone.csv" | tee -a "${OUT_DIR}/g2_wire_intrazone.log" || STEP_ERR=1
     wait "${RX_PID}" || STEP_ERR=1
     [[ "${STEP_ERR}" == "0" ]] || exit 1
 done

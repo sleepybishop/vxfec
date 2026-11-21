@@ -4,12 +4,12 @@
 
 Building the repository produces:
 
-- **`libnccl-vxfec.so`** — a drop-in NCCL / RCCL Net v8 plugin (`vxfec-ecmp-harq`) supporting multi-NIC UDP and `libibverbs` (`IBV_QPT_UC`) RDMA, with `DMA-BUF` GPU memory registration.
-- **`libvxfec.a` / `libvxfec_vk.a`** — embeddable C11 + Vulkan 1.2 compute libraries for standalone GPU erasure coding and 2D burst-interleaved superframe recovery.
+- **`libnccl-vxfec.so`** — a drop-in NCCL / RCCL Net v8 plugin (`vxfec-ecmp-harq`) supporting multi-NIC UDP and `libibverbs` (`IBV_QPT_UC`) RDMA, with `DMA-BUF` GPU memory registration, direct `RDMA_WRITE_WITH_IMM` into RX VRAM, and GPU-resident parity encode / in-place repair.
+- **`libvxfec.a` / `libvxfec_vk.a`** — embeddable C11 + Vulkan 1.2 compute libraries for standalone GPU-resident erasure coding and 2D burst-interleaved superframe recovery.
 
 ![vxfec Benchmarks](docs/vxfec_benchmarks.png)
 
-*On the CPU-only intra-zone link with 2% burst loss, SACK reached 63.0 Gbps on a 64 MiB AllReduce (16 channels) versus 58.7 Gbps for `auto` FEC (68.2 vs. 60.2 Gbps at 32 channels). On the cross-zone and WAN runs, vxfec had lower tail completion times than SACK.*
+*In resident GDDR6 VRAM on RX 7900 XTX, `H=0` pure-`GF(2)` (`RQ-GF2`) encodes 2.24 GiB superframe parity at 4.12 Tbps (5.1x faster than `RFC 6330` `GF(256)` at 0.82 Tbps) and drives 202.9–204.1 Gbps multi-rail wire / 178.0–178.7 Gbps end-to-end GPU-to-GPU payload throughput under a 10% blackout. On the CPU-only intra-zone GCP link with 2% burst loss, SACK reached 63.0 Gbps at 16 channels on a 64 MiB AllReduce while `auto` FEC reached 68.2 vs. 60.2 Gbps at 32 channels and cut cross-zone and WAN tail completion times.*
 
 ## Quick Start
 
@@ -69,8 +69,9 @@ For applications embedding GPU erasure coding or 2D burst-interleaved streaming 
 ./bench_vulkan
 ./bench_pipeline
 
-# Multi-rail wire -> VRAM superframe benchmark (loopback self-test, or 2-node --mode rx / --mode tx)
+# Multi-rail wire -> VRAM superframe benchmark (loopback self-test, 3-stage GPU->GPU pipeline, or 2-node --mode rx / --mode tx)
 ./bench_wire_net --self-test
+./bench_wire_net --pipeline --codec rateless-gf2
 
 # Standalone plugin AllReduce benchmark (reports NCCL AlgBW, BusBW & aggregate wire goodput)
 ./bench_nccl

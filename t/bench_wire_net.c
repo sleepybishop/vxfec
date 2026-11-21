@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -30,6 +31,9 @@
 #define WIRE_NET_IBV_QPS 4u
 #define WIRE_NET_BATCH 64u
 #define WIRE_NET_FLAG_TAIL 0x0001u
+#define WIRE_MODE_NORMAL 0u
+#define WIRE_MODE_WIRE_ONLY 1u
+#define WIRE_MODE_PIPELINE 2u
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -81,6 +85,7 @@ typedef struct {
     uint64_t rx_bytes;
     uint64_t wire_ns;
     uint64_t wall_ns;
+    uint64_t e2e_ns;
 } wire_bidir_iter_t;
 
 static uint64_t now_ns(void)
@@ -229,10 +234,14 @@ static void pin_worker_cpu(uint32_t rail_idx, bool is_rx)
 {
     long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpus >= 4) {
+        uint32_t base = 0u;
+        const char *off_env = getenv("VXFEC_WIRE_CPU_OFFSET");
+        if (off_env && *off_env)
+            base = (uint32_t)strtoul(off_env, NULL, 10);
         cpu_set_t set;
         CPU_ZERO(&set);
-        uint32_t off = is_rx ? ((uint32_t)ncpus / 2u) : 0u;
-        CPU_SET((int)((rail_idx + off) % (uint32_t)ncpus), &set);
+        uint32_t cpu = (base + rail_idx * 2u + (is_rx ? 1u : 0u)) % (uint32_t)ncpus;
+        CPU_SET((int)cpu, &set);
         (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
     }
 }
@@ -247,6 +256,7 @@ static void *udp_tx_worker_fn(void *arg)
     memset(msgs, 0, sizeof(msgs));
 
     uint64_t rng = 0x123456789abcdef0ULL ^ ((uint64_t)w->rail_idx << 32) ^ (uint64_t)w->iter;
+    uint32_t batch_lim = (w->T >= 32768u) ? 16u : WIRE_NET_BATCH;
     uint32_t batch_n = 0;
     uint64_t sent_total = 0;
     uint64_t first_ns = 0, last_ns = 0;
@@ -282,7 +292,7 @@ static void *udp_tx_worker_fn(void *arg)
         msgs[batch_n].msg_hdr.msg_iovlen = 2;
         batch_n++;
 
-        if (batch_n == WIRE_NET_BATCH) {
+        if (batch_n == batch_lim) {
             if (first_ns == 0)
                 first_ns = now_ns();
             uint32_t off = 0;
@@ -667,8 +677,8 @@ static bool run_loopback_self_test_codec(vxfec_vk_ctx *ctx, int codec, uint32_t 
 
     printf("  [PASS] %-12s | Z=%2u K=%3u P=%2u T=%4u B | RX=%" PRIu64 "/%" PRIu64
            " | Wire=%6.2f Gbps | GPU Rec=%7.2f Gbps (%u masks, ext_host=%d)\n",
-           (codec == VXFEC_WIRE_MDS) ? "MDS (RS8)" : "Rateless(RQ)", Z, K, P, T, (uint64_t)atomic_load(&rx_count), total_frames,
-           wire_gbps, rec_gbps, st.unique_masks, (int)rx_ext_host);
+           (codec == VXFEC_WIRE_MDS) ? "MDS (RS8)" : ((codec == VXFEC_WIRE_RATELESS_GF2) ? "Rateless-GF2" : "Rateless(RQ)"), Z, K,
+           P, T, (uint64_t)atomic_load(&rx_count), total_frames, wire_gbps, rec_gbps, st.unique_masks, (int)rx_ext_host);
     ok = true;
 
 cleanup:
@@ -823,8 +833,10 @@ typedef struct {
     uint8_t *host;
     uint8_t *verify;
     const uint64_t *bits;
+    uint32_t codec;
     uint32_t Z;
     uint32_t K;
+    uint32_t P;
     size_t wpb;
     size_t sys_bytes;
     size_t wire_bytes;
@@ -848,12 +860,18 @@ static void recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *
     bool verify_ok = false;
     bool fatal_err = false;
 
+    uint32_t min_req = K;
+    if (job->codec == (uint32_t)VXFEC_WIRE_RATELESS_GF2)
+        min_req = K + ((job->P > 16u) ? 16u : job->P);
+    else if (job->codec == (uint32_t)VXFEC_WIRE_RATELESS)
+        min_req = K + ((job->P > 2u) ? 2u : job->P);
+
     bool enough_frames = true;
     for (uint32_t z = 0; z < Z; z++) {
         uint32_t cnt = 0;
         for (size_t w = 0; w < wpb; w++)
             cnt += (uint32_t)__builtin_popcountll(rx_bits[(size_t)z * wpb + w]);
-        if (cnt < K) {
+        if (cnt < min_req) {
             enough_frames = false;
             break;
         }
@@ -1064,9 +1082,9 @@ static bool receive_pipelined_frames(int ctrl_fd, vxfec_ibv_ep_t *ep, const wire
 
 static uint32_t wire_handshake_magic(const wire_cli_cfg_t *cfg)
 {
-    if (cfg->pipeline)
-        return WIRE_NET_PIPELINE_MAGIC;
-    return cfg->gdr ? WIRE_NET_GDR_MAGIC : WIRE_NET_MAGIC;
+    if (cfg->gdr)
+        return cfg->pipeline ? WIRE_NET_PIPELINE_MAGIC : WIRE_NET_GDR_MAGIC;
+    return WIRE_NET_MAGIC;
 }
 
 static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out_retain_vk)
@@ -1136,14 +1154,16 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     size_t wire_bytes = (size_t)Z * (K + P) * T;
     size_t wpb = ((size_t)(K + P) + 63u) / 64u;
     size_t aligned_wire = (wire_bytes + page_sz - 1u) & ~(page_sz - 1u);
+    bool is_wire_only = (tx_hs.wire_only == WIRE_MODE_WIRE_ONLY);
+    bool gdr_pipeline = cfg->gdr && cfg->pipeline;
 
-    vxfec_wire_ring *rx_ring = tx_hs.wire_only ? NULL : vxfec_wire_ring_new_ex(ctx, (int)tx_hs.codec, Z, K, P, T, 0u, false, true);
+    vxfec_wire_ring *rx_ring = is_wire_only ? NULL : vxfec_wire_ring_new_ex(ctx, (int)tx_hs.codec, Z, K, P, T, 0u, false, true);
     uint8_t *rx_host = NULL;
     if (!cfg->gdr && posix_memalign((void **)&rx_host, page_sz, aligned_wire) != 0)
         rx_host = NULL;
     uint8_t *rx_verify = (uint8_t *)malloc(sys_bytes);
     _Atomic uint64_t *rx_bits_atomic = (_Atomic uint64_t *)calloc((size_t)Z * wpb, sizeof(_Atomic uint64_t));
-    uint64_t *rx_bits = (uint64_t *)calloc((size_t)Z * wpb * (cfg->pipeline ? 2u : 1u), sizeof(uint64_t));
+    uint64_t *rx_bits = (uint64_t *)calloc((size_t)Z * wpb * (gdr_pipeline ? 2u : 1u), sizeof(uint64_t));
     wire_delivery_stats_t stats = {0};
     if (cfg->gdr)
         stats.latencies_ns = (uint64_t *)calloc(tx_hs.iters, sizeof(*stats.latencies_ns));
@@ -1164,7 +1184,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     vxfec_ibv_ep_t *ibv_ep = NULL;
     wire_ctrl_handshake_t rx_hs = tx_hs;
 
-    if ((!cfg->gdr && !rx_host) || !rx_verify || !rx_bits_atomic || !rx_bits || (!tx_hs.wire_only && !rx_ring) ||
+    if ((!cfg->gdr && !rx_host) || !rx_verify || !rx_bits_atomic || !rx_bits || (!is_wire_only && !rx_ring) ||
         (cfg->gdr && !stats.latencies_ns)) {
         fprintf(stderr, "Failed to allocate RX superframe buffers/ring\n");
         goto cleanup;
@@ -1219,7 +1239,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         rx_hs.remote_iova = vxfec_ibv_mr_iova(ibv_mr);
         rx_hs.remote_rkey = vxfec_ibv_mr_rkey(ibv_mr);
         rx_hs.gdr_dmabuf = gdr_dmabuf ? 1u : 0u;
-    } else if (tx_hs.wire_only) {
+    } else if (is_wire_only) {
         rx_ext_host = true;
     } else {
         if (vxfec_vk_has_ext_host_mem(ctx)) {
@@ -1261,7 +1281,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     }
 
     wire_rdma_region_t second_region = {0};
-    if (cfg->pipeline) {
+    if (gdr_pipeline) {
         second_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &second_fd);
         if (second_vram)
             second_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, aligned_wire, (uint64_t)page_sz + aligned_wire, second_fd, true);
@@ -1274,7 +1294,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         second_region.rkey = vxfec_ibv_mr_rkey(second_mr);
     }
 
-    if (!write_all(ctrl_fd, &rx_hs, sizeof(rx_hs)) || (cfg->pipeline && !write_all(ctrl_fd, &second_region, sizeof(second_region))))
+    if (!write_all(ctrl_fd, &rx_hs, sizeof(rx_hs)) || (gdr_pipeline && !write_all(ctrl_fd, &second_region, sizeof(second_region))))
         goto cleanup;
 
     wire_rx_recovery_t job = {
@@ -1284,16 +1304,18 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         .host = rx_host,
         .verify = rx_verify,
         .bits = rx_bits,
+        .codec = tx_hs.codec,
         .Z = Z,
         .K = K,
+        .P = P,
         .wpb = wpb,
         .sys_bytes = sys_bytes,
         .wire_bytes = wire_bytes,
         .gdr = gdr_dmabuf,
         .ext_host = rx_ext_host,
-        .wire_only = tx_hs.wire_only,
+        .wire_only = is_wire_only,
     };
-    if (cfg->pipeline) {
+    if (gdr_pipeline) {
         rx_aborted = !receive_pipelined_frames(ctrl_fd, ibv_ep, &tx_hs, job, second_vram, rx_bits, &stats);
         goto cleanup;
     }
@@ -1310,7 +1332,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         for (size_t i = 0; i < (size_t)Z * wpb; i++)
             atomic_store_explicit(&rx_bits_atomic[i], 0ULL, memory_order_relaxed);
         memset(rx_bits, 0, (size_t)Z * wpb * sizeof(uint64_t));
-        if (!tx_hs.wire_only) {
+        if (!is_wire_only) {
             /* poison systematic buffer before each iteration so stale bytes cannot pass verification */
             if (gdr_dmabuf) {
                 if (!prepare_gdr_buffer(ctx, rx_vram, rx_verify, sys_bytes)) {
@@ -1484,23 +1506,26 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         return 1;
     }
 
+    size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
     uint32_t Z = cfg->Z, K = cfg->K, P = cfg->P, T = cfg->T;
     size_t sys_bytes = (size_t)Z * K * T;
     size_t wire_bytes = (size_t)Z * (K + P) * T;
-    uint64_t total_frames = (uint64_t)(K + P) * Z;
-
-    size_t dmabuf_bytes = 0u;
-    size_t page_sz = 0u;
-    if (cfg->gdr) {
-        page_sz = (size_t)sysconf(_SC_PAGESIZE);
-        if (wire_bytes > SIZE_MAX - page_sz) {
-            fprintf(stderr, "TX superframe is too large for page-aligned DMA-BUF registration\n");
-            close(ctrl_fd);
-            return 1;
-        }
-        dmabuf_bytes = (wire_bytes + page_sz - 1u) & ~(page_sz - 1u);
+    if (wire_bytes > SIZE_MAX - page_sz) {
+        fprintf(stderr, "TX superframe is too large for page-aligned registration\n");
+        close(ctrl_fd);
+        return 1;
     }
-    uint8_t *tx_host = (uint8_t *)malloc(cfg->gdr ? sys_bytes : wire_bytes);
+    size_t aligned_wire = (wire_bytes + page_sz - 1u) & ~(page_sz - 1u);
+    uint64_t total_frames = (uint64_t)(K + P) * Z;
+    bool gdr_pipeline = cfg->gdr && cfg->pipeline;
+    bool stage3_pipeline = !cfg->gdr && cfg->pipeline && !cfg->wire_only;
+
+    uint8_t *tx_host = NULL;
+    if (cfg->gdr) {
+        tx_host = (uint8_t *)malloc(sys_bytes);
+    } else if (posix_memalign((void **)&tx_host, page_sz, aligned_wire) != 0) {
+        tx_host = NULL;
+    }
     if (!tx_host) {
         close(ctrl_fd);
         return 1;
@@ -1509,29 +1534,91 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     fill_deterministic_superframe(tx_host, sys_bytes);
     vxfec_wire_ring *tx_ring = NULL;
     vxfec_vk_buf *tx_vram = NULL;
-    int dmabuf_fd = -1;
+    vxfec_vk_buf *tx_vram_pipe = NULL;
     vxfec_ibv_ctx_t *ibv_ctx = NULL;
     vxfec_ibv_mr_t *ibv_mr = NULL;
     vxfec_ibv_ep_t *ibv_ep = NULL;
+    int tx_dmabuf_fd = -1;
+    bool tx_gdr_dmabuf = false;
+    bool tx_ext_host = false;
     int tx_fds[WIRE_NET_MAX_RAILS];
     int bidir_fd = -1;
     uint32_t open_tx_fds = 0;
     bool bench_ok = false;
 
+    if (cfg->use_ibv) {
+        ibv_ctx = vxfec_ibv_ctx_open(0);
+        if (!ibv_ctx) {
+            fprintf(stderr, "TX requested --ibv but no active RDMA device found\n");
+            goto tx_cleanup;
+        }
+    }
+
     if (cfg->wire_only) {
         fill_deterministic_superframe(tx_host + sys_bytes, wire_bytes - sys_bytes);
     } else {
         tx_ring = vxfec_wire_ring_new_ex(ctx, cfg->codec, Z, K, P, T, 0u, true, false);
-        tx_vram =
-            cfg->gdr ? vxfec_vk_buf_new_exportable(ctx, dmabuf_bytes, true, &dmabuf_fd) : vxfec_vk_buf_new(ctx, wire_bytes, false);
-        if (cfg->gdr && !tx_vram) {
-            fprintf(stderr, "TX --gdr failed to allocate/export a GPU DMA-BUF\n");
+        if (!tx_ring) {
+            fprintf(stderr, "TX superframe ring init failed\n");
             goto tx_cleanup;
         }
-        if (!tx_ring || !tx_vram || !vxfec_vk_buf_write_offset(ctx, tx_vram, 0, tx_host, sys_bytes) ||
-            !vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) ||
-            (cfg->gdr ? !vxfec_vk_buf_release_external(ctx, tx_vram)
-                      : !vxfec_vk_buf_read_offset(ctx, tx_vram, 0, tx_host, wire_bytes))) {
+        if (cfg->gdr) {
+            tx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &tx_dmabuf_fd);
+            if (!tx_vram || tx_dmabuf_fd < 0) {
+                fprintf(stderr, "TX --gdr failed to allocate/export a GPU DMA-BUF\n");
+                goto tx_cleanup;
+            }
+            ibv_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0u, aligned_wire, page_sz, tx_dmabuf_fd, false);
+            if (!ibv_mr) {
+                fprintf(stderr, "TX --gdr failed to register the GPU DMA-BUF with ibverbs\n");
+                goto tx_cleanup;
+            }
+            tx_gdr_dmabuf = true;
+        } else if (cfg->use_ibv && vxfec_vk_has_dmabuf_export(ctx)) {
+            tx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &tx_dmabuf_fd);
+            if (tx_vram && tx_dmabuf_fd >= 0) {
+                ibv_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0u, aligned_wire, (uint64_t)(uintptr_t)tx_host, tx_dmabuf_fd, false);
+                if (ibv_mr) {
+                    tx_gdr_dmabuf = true;
+                } else {
+                    close(tx_dmabuf_fd);
+                    tx_dmabuf_fd = -1;
+                    vxfec_vk_buf_free(ctx, tx_vram);
+                    tx_vram = NULL;
+                }
+            } else if (tx_vram) {
+                vxfec_vk_buf_free(ctx, tx_vram);
+                tx_vram = NULL;
+            }
+        } else if (!cfg->use_ibv && !stage3_pipeline && vxfec_vk_has_ext_host_mem(ctx)) {
+            tx_vram = vxfec_vk_buf_import_host_ptr(ctx, tx_host, aligned_wire);
+            if (tx_vram)
+                tx_ext_host = true;
+        }
+        if (!tx_vram)
+            tx_vram = vxfec_vk_buf_new(ctx, wire_bytes, false);
+        if (stage3_pipeline) {
+            tx_vram_pipe = vxfec_vk_buf_new(ctx, wire_bytes, false);
+            if (!tx_vram_pipe || !vxfec_vk_buf_write_offset(ctx, tx_vram_pipe, 0, tx_host, sys_bytes)) {
+                fprintf(stderr, "TX pipeline buffer init failed\n");
+                goto tx_cleanup;
+            }
+        }
+        bool init_ok = tx_vram != NULL;
+        if (init_ok) {
+            if (tx_ext_host) {
+                init_ok = vxfec_vk_buf_acquire_external(ctx, tx_vram) && vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) &&
+                          vxfec_vk_buf_release_external(ctx, tx_vram);
+            } else if (tx_gdr_dmabuf) {
+                init_ok = vxfec_vk_buf_write_offset(ctx, tx_vram, 0, tx_host, sys_bytes) &&
+                          vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) && vxfec_vk_buf_release_external(ctx, tx_vram);
+            } else {
+                init_ok = vxfec_vk_buf_write_offset(ctx, tx_vram, 0, tx_host, sys_bytes) &&
+                          vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) &&
+                          vxfec_vk_buf_read_offset(ctx, tx_vram, 0, tx_host, wire_bytes);
+            }
+        }
+        if (!init_ok) {
             fprintf(stderr, "TX superframe GPU encode failed\n");
             goto tx_cleanup;
         }
@@ -1552,20 +1639,11 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     hs.rails = n_peers * cfg->ports_per_ip;
     hs.iters = cfg->iters;
     hs.use_ibv = cfg->use_ibv ? 1u : 0u;
-    hs.wire_only = cfg->wire_only ? 1u : 0u;
+    hs.wire_only = cfg->wire_only ? WIRE_MODE_WIRE_ONLY : (stage3_pipeline ? WIRE_MODE_PIPELINE : WIRE_MODE_NORMAL);
 
     if (cfg->use_ibv) {
-        ibv_ctx = vxfec_ibv_ctx_open(0);
-        if (!ibv_ctx) {
-            fprintf(stderr, "TX requested --ibv but no active RDMA device found\n");
-            goto tx_cleanup;
-        }
-        ibv_mr = cfg->gdr ? vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, dmabuf_bytes, page_sz, dmabuf_fd, false)
-                          : vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
-        if (cfg->gdr && !ibv_mr) {
-            fprintf(stderr, "TX --gdr failed to register the GPU DMA-BUF with ibverbs\n");
-            goto tx_cleanup;
-        }
+        if (!ibv_mr)
+            ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
         ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, WIRE_NET_IBV_QPS, 256u, true, false, &hs.ibv_info);
         if (!ibv_mr || !ibv_ep) {
             fprintf(stderr, "TX failed to create ibverbs MR/EP\n");
@@ -1583,7 +1661,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         goto tx_cleanup;
     }
     wire_rdma_region_t regions[2] = {{.iova = rx_hs.remote_iova, .rkey = rx_hs.remote_rkey}, {0}};
-    if (cfg->pipeline && (!read_all(ctrl_fd, &regions[1], sizeof(regions[1])) || regions[1].iova == 0u)) {
+    if (gdr_pipeline && (!read_all(ctrl_fd, &regions[1], sizeof(regions[1])) || regions[1].iova == 0u)) {
         fprintf(stderr, "TX --pipeline requires a second registered RX GPU buffer\n");
         goto tx_cleanup;
     }
@@ -1640,23 +1718,25 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
     printf("===========================================================================================================\n");
     const char *transport = "Multi-NIC UDP";
-    if (cfg->pipeline)
+    if (gdr_pipeline)
         transport = "IBV UC GPU-to-GPU DMA-BUF, two RX buffers";
-    else if (cfg->gdr)
+    else if (cfg->gdr || (cfg->use_ibv && tx_gdr_dmabuf && rx_hs.gdr_dmabuf))
         transport = "IBV UC GPU-to-GPU DMA-BUF";
     else if (cfg->use_ibv)
         transport = rx_hs.gdr_dmabuf ? "IBV UC host-to-GPU DMA-BUF" : "IBV Zero-Bounce UC";
-    printf("vxfec Multi-Rail Wire -> VRAM Superframe Benchmark (%s%s, Z=%u K=%u P=%u T=%u B, %.1f MiB)\n", transport,
-           cfg->wire_only ? ", wire-only" : "", Z, K, P, T, (double)sys_bytes / (1024.0 * 1024.0));
+    printf("vxfec Multi-Rail Wire -> VRAM Superframe Benchmark (%s%s%s, Z=%u K=%u P=%u T=%u B, %.1f MiB)\n", transport,
+           cfg->wire_only ? ", wire-only" : "", stage3_pipeline ? ", 3-Stage Pipelined" : "", Z, K, P, T,
+           (double)sys_bytes / (1024.0 * 1024.0));
     printf("===========================================================================================================\n");
 
     struct wire_tx_sample {
         uint64_t planned_frames;
         uint64_t started_ns;
         uint64_t wire_ns;
+        uint64_t enc_ns;
     } samples[2];
-    /* In pipeline mode, send the next frame before waiting for the previous recovery result. */
-    const uint32_t result_lag = cfg->pipeline ? 1u : 0u;
+    /* In --gdr --pipeline mode, send the next frame before waiting for the previous recovery result. */
+    const uint32_t result_lag = gdr_pipeline ? 1u : 0u;
     bool tx_aborted = false;
     for (uint32_t send_it = 1; send_it <= cfg->iters + result_lag; send_it++) {
         if (send_it <= cfg->iters) {
@@ -1678,6 +1758,18 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 break;
             }
             uint64_t tx_wire_ns = 1ULL;
+            uint64_t tx_enc_ns = 0ULL;
+            uint64_t pipe_enc_tkt = 0ULL;
+            uint64_t pipe_enc_t0 = 0ULL;
+            if (stage3_pipeline && tx_vram_pipe) {
+                pipe_enc_t0 = now_ns();
+                pipe_enc_tkt = vxfec_wire_encode_submit(tx_ring, tx_vram_pipe);
+                if (!pipe_enc_tkt) {
+                    fprintf(stderr, "ERROR: async GPU superframe encode submit failed at iter %u\n", it);
+                    tx_aborted = true;
+                    break;
+                }
+            }
 
             if (cfg->use_ibv) {
                 uint64_t tx_wire_t0 = now_ns();
@@ -1686,6 +1778,11 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 uint64_t src_iova = vxfec_ibv_mr_iova(ibv_mr);
                 const wire_rdma_region_t *region = &regions[(it - 1u) % (result_lag + 1u)];
                 for (uint64_t seq = 0; seq < total_frames; seq++) {
+                    if (pipe_enc_tkt != 0ULL && tx_enc_ns == 0ULL && (seq & 63ULL) == 0ULL) {
+                        int pst = vxfec_vk_poll_status(ctx, pipe_enc_tkt);
+                        if (pst > 0)
+                            tx_enc_ns = now_ns() - pipe_enc_t0;
+                    }
                     if (seq >= drop_beg && seq < drop_end)
                         continue;
                     if (cfg->loss_ppm > 0 && (splitmix64(&rng) % 1000000ULL) < cfg->loss_ppm)
@@ -1758,6 +1855,15 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         sched_yield();
                 }
                 atomic_store_explicit(&go_tx, true, memory_order_release);
+                while (pipe_enc_tkt != 0ULL && tx_enc_ns == 0ULL) {
+                    int pst = vxfec_vk_poll_status(ctx, pipe_enc_tkt);
+                    if (pst != 0) {
+                        if (pst > 0)
+                            tx_enc_ns = now_ns() - pipe_enc_t0;
+                        break;
+                    }
+                    sched_yield();
+                }
                 for (uint32_t r = 0; r < started_tx; r++)
                     pthread_join(tx_th[r], NULL);
                 send_tail_beacons(tx_fds, peer_addrs, rails, (uint16_t)it);
@@ -1774,11 +1880,21 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 }
                 tx_wire_ns = (tfn != UINT64_MAX && tln > tfn) ? (tln - tfn) : 1ULL;
             }
+            if (pipe_enc_tkt != 0ULL) {
+                if (!vxfec_vk_wait(ctx, pipe_enc_tkt, 10000000000ULL)) {
+                    fprintf(stderr, "ERROR: async GPU superframe encode wait failed at iter %u\n", it);
+                    tx_aborted = true;
+                    break;
+                }
+                if (tx_enc_ns == 0ULL)
+                    tx_enc_ns = now_ns() - pipe_enc_t0;
+            }
             struct wire_tx_sample *sample = &samples[(it - 1u) % 2u];
             *sample = (struct wire_tx_sample){
                 .planned_frames = planned_frames,
                 .started_ns = iter_wall_t0,
                 .wire_ns = tx_wire_ns ? tx_wire_ns : 1u,
+                .enc_ns = tx_enc_ns,
             };
         }
         if (send_it <= result_lag)
@@ -1787,6 +1903,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         uint32_t it = send_it - result_lag;
         const struct wire_tx_sample *sample = &samples[(it - 1u) % 2u];
         uint64_t planned_frames = sample->planned_frames;
+        uint64_t tx_enc_ns = sample->enc_ns;
         wire_ctrl_result_t res;
         if (!read_all(ctrl_fd, &res, sizeof(res)) || res.iter != it) {
             tx_aborted = true;
@@ -1798,11 +1915,21 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
         double wire_gbps = (8.0 * (double)res.rx_frames * (double)T) / (double)(res.wire_ns ? res.wire_ns : 1ULL);
         uint64_t e2e_ns = res.wire_ns + res.dma_ns + res.recover_wall_ns;
+        if (stage3_pipeline) {
+            /* 3-stage pipeline: max(GPU TX Encode(N+1), Multi-Rail Wire(N), RX DMA+GPU Recover(N-1)) */
+            uint64_t rx_stage_ns = (rx_hs.gdr_dmabuf ? 0ULL : res.dma_ns) + res.recover_wall_ns;
+            uint64_t bottleneck_ns = res.wire_ns;
+            if (tx_enc_ns > bottleneck_ns)
+                bottleneck_ns = tx_enc_ns;
+            if (rx_stage_ns > bottleneck_ns)
+                bottleneck_ns = rx_stage_ns;
+            e2e_ns = bottleneck_ns;
+        }
         double e2e_gbps = cfg->wire_only ? 0.0 : ((8.0 * (double)sys_bytes) / (double)(e2e_ns ? e2e_ns : 1ULL));
         uint64_t rec_ns = res.recover_gpu_ns ? res.recover_gpu_ns : res.recover_wall_ns;
         double gpu_gbps = cfg->wire_only ? 0.0 : ((8.0 * (double)sys_bytes) / (double)(rec_ns ? rec_ns : 1ULL));
 
-        double bidir_wire_gbps = 0.0, bidir_wall_gbps = 0.0;
+        double bidir_wire_gbps = 0.0, bidir_wall_gbps = 0.0, bidir_e2e_gbps = 0.0;
         bool peer_fatal = false;
         if (bidir_fd >= 0) {
             wire_bidir_iter_t my_bi = {
@@ -1812,6 +1939,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 .rx_bytes = res.rx_frames * (uint64_t)T,
                 .wire_ns = res.wire_ns,
                 .wall_ns = iter_wall_ns,
+                .e2e_ns = e2e_ns,
             };
             wire_bidir_iter_t peer_bi = {0};
             if (!write_all(bidir_fd, &my_bi, sizeof(my_bi)) || !read_all(bidir_fd, &peer_bi, sizeof(peer_bi))) {
@@ -1822,12 +1950,17 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             if (res.ok && !res.fatal_err && peer_bi.ok && !peer_fatal) {
                 uint64_t common_wire = (res.wire_ns > peer_bi.wire_ns) ? res.wire_ns : peer_bi.wire_ns;
                 uint64_t common_wall = (iter_wall_ns > peer_bi.wall_ns) ? iter_wall_ns : peer_bi.wall_ns;
+                uint64_t common_e2e = (e2e_ns > peer_bi.e2e_ns) ? e2e_ns : peer_bi.e2e_ns;
                 double tot_bits = 8.0 * (double)(my_bi.rx_bytes + peer_bi.rx_bytes);
                 bidir_wire_gbps = tot_bits / (double)(common_wire ? common_wire : 1ULL);
                 bidir_wall_gbps = tot_bits / (double)(common_wall ? common_wall : 1ULL);
+                if (!cfg->wire_only && common_e2e > 0ULL)
+                    bidir_e2e_gbps = (16.0 * (double)sys_bytes) / (double)common_e2e;
                 if (bidir_wire_gbps > best_bidir_wire_gbps) {
                     best_bidir_wire_gbps = bidir_wire_gbps;
                     best_bidir_wall_gbps = bidir_wall_gbps;
+                    if (bidir_e2e_gbps > best_e2e_gbps)
+                        best_e2e_gbps = bidir_e2e_gbps;
                 }
             }
         }
@@ -1865,6 +1998,21 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                        ") | Wire=%7.2f Gbps | E2E=    n/a | GPU Rec=    n/a | %s\n",
                        it, cfg->iters, res.rx_frames, planned_frames, total_frames, wire_gbps, res.ok ? "PASS" : "SHAPER-DROP");
             }
+        } else if (stage3_pipeline) {
+            double enc_gbps = (tx_enc_ns > 0ULL) ? ((8.0 * (double)sys_bytes) / (double)tx_enc_ns) : 0.0;
+            if (bidir_fd >= 0) {
+                if (cfg->bidir_leader) {
+                    printf("  Iter %2u/%2u | RX=%6" PRIu64 "/%" PRIu64 " | TX Enc=%6.1fG | BiDirWire=%7.2f Gbps | "
+                           "BiDirE2E=%7.2f Gbps | GPU Rec=%6.1fG | %s\n",
+                           it, cfg->iters, res.rx_frames, planned_frames, enc_gbps, bidir_wire_gbps, bidir_e2e_gbps, gpu_gbps,
+                           (res.ok && bidir_wire_gbps > 0.0) ? "PASS" : "SHAPER-DROP");
+                }
+            } else {
+                printf("  Iter %2u/%2u | RX=%6" PRIu64 "/%" PRIu64 " | TX Enc=%6.1f Gbps | Wire=%7.2f Gbps | "
+                       "Pipe E2E=%7.2f Gbps | GPU Rec=%7.2f Gbps | %s\n",
+                       it, cfg->iters, res.rx_frames, planned_frames, enc_gbps, wire_gbps, e2e_gbps, gpu_gbps,
+                       res.ok ? "PASS" : "SHAPER-DROP");
+            }
         } else {
             printf("  Iter %2u/%2u | RX=%6" PRIu64 "/%" PRIu64 " (of %" PRIu64
                    ") | Wire=%7.2f Gbps | E2E=%7.2f Gbps | GPU Rec=%7.2f Gbps | %s\n",
@@ -1888,8 +2036,12 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             }
             const char *cname =
                 (cfg->codec == VXFEC_WIRE_MDS) ? "mds" : ((cfg->codec == VXFEC_WIRE_RATELESS_GF2) ? "rateless-gf2" : "rateless");
-            fprintf(fp, "%s,%s,%u,%u,%u,%u,%u,%u,%.2f,%u,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,",
-                    cfg->pipeline ? "ibv-gdr-pipeline" : (cfg->gdr ? "ibv-gdr" : (cfg->use_ibv ? "ibv" : "udp")), cname,
+            const char *tname =
+                gdr_pipeline
+                    ? "ibv-gdr-pipeline"
+                    : (cfg->gdr ? "ibv-gdr"
+                                : (cfg->use_ibv ? (cfg->pipeline ? "ibv-pipe" : "ibv") : (cfg->pipeline ? "udp-pipe" : "udp")));
+            fprintf(fp, "%s,%s,%u,%u,%u,%u,%u,%u,%.2f,%u,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,", tname, cname,
                     cfg->wire_only ? 1u : 0u, Z, K, P, T, rails, cfg->blackout_pct, cfg->loss_ppm, best_planned_frames,
                     best_rx_frames, (double)sys_bytes / (1024.0 * 1024.0), best_wire_gbps);
             if (bidir_fd >= 0 && best_bidir_wire_gbps > 0.0)
@@ -1924,9 +2076,10 @@ tx_cleanup:
     }
     if (ibv_quiesced && vk_quiesced) {
         vxfec_wire_ring_free(tx_ring);
+        vxfec_vk_buf_free(ctx, tx_vram_pipe);
         vxfec_vk_buf_free(ctx, tx_vram);
-        if (dmabuf_fd >= 0)
-            close(dmabuf_fd);
+        if (tx_dmabuf_fd >= 0)
+            close(tx_dmabuf_fd);
     }
     if (ibv_quiesced)
         free(tx_host);
@@ -2015,19 +2168,22 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage:\n");
             printf("  %s --self-test\n", argv[0]);
+            printf("  %s --pipeline [--codec rateless-gf2|rateless|mds] [--csv out.csv]\n", argv[0]);
             printf("  %s --mode rx [--bind ip1,ip2] [--port 31500] [--ports-per-ip 4] [--gdr [--pipeline]]\n", argv[0]);
-            printf("  %s --mode tx --peers ip1,ip2 [--port 31500] [--ports-per-ip 4] [--codec rateless|mds] "
-                   "[--z 64] [--k 200] [--p 48] [--sym-t bytes] [--blackout-pct 10] [--ibv | --gdr [--pipeline]] [--csv out.csv]\n",
+            printf("  %s --mode tx --peers ip1,ip2 [--port 31500] [--ports-per-ip 4] [--codec rateless-gf2|rateless|mds] "
+                   "[--z 64] [--k 200] [--p 48] [--sym-t bytes] [--blackout-pct 10] [--pipeline] [--ibv | --gdr [--pipeline]] "
+                   "[--csv out.csv]\n",
                    argv[0]);
             printf("  --gdr        Require GPU DMA-BUF RDMA on both peers; use on TX and RX.\n");
-            printf("  --pipeline   With --gdr on both peers, use two RX buffers to overlap transfer and recovery.\n");
+            printf("  --pipeline   With --gdr on both peers, use two RX buffers to overlap transfer and recovery;\n"
+                   "               standalone or on UDP TX, overlap GPU TX encode with multi-rail wire.\n");
             printf("  --sym-t      Symbol size (default 4096 with --gdr, 8192 otherwise).\n");
             return 0;
         }
     }
 
-    if (cfg.pipeline && !cfg.gdr) {
-        fprintf(stderr, "--pipeline requires --gdr on both endpoints\n");
+    if (cfg.pipeline && !cfg.gdr && (cfg.self_test || (cfg.mode && strcmp(cfg.mode, "rx") == 0))) {
+        fprintf(stderr, "--mode rx --pipeline requires --gdr on both endpoints\n");
         return 1;
     }
 
@@ -2059,6 +2215,58 @@ int main(int argc, char **argv)
         }
     }
 
+    if (!cfg.self_test && !cfg.mode && cfg.pipeline) {
+        /* standalone GPU-to-GPU pipelined saturation benchmark over matched-core sub-32K SKB jumbo loopback sockets */
+        bool user_set_ports = false, user_set_z = false;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--ports-per-ip") == 0)
+                user_set_ports = true;
+            else if (strcmp(argv[i], "--z") == 0)
+                user_set_z = true;
+        }
+        if (!sym_t_set)
+            cfg.T = 30720u;
+        if (!user_set_z && !sym_t_set)
+            cfg.Z = 68u;
+        if (!user_set_ports)
+            cfg.ports_per_ip = 4u;
+        cfg.bind_csv = "127.0.0.1";
+        cfg.peers_csv = "127.0.0.1";
+
+        pid_t rx_pid = fork();
+        if (rx_pid < 0) {
+            perror("fork");
+            return 1;
+        }
+        if (rx_pid == 0) {
+            int rvk_st = VXFEC_VK_ERROR;
+            vxfec_vk_ctx *rctx = vxfec_vk_ctx_new_status(&rvk_st);
+            if (!rctx)
+                _exit(rvk_st == VXFEC_VK_UNAVAILABLE ? 0 : 1);
+            bool rretain = false;
+            int rrc = run_rx_server(rctx, &cfg, &rretain);
+            if (!rretain)
+                vxfec_vk_ctx_free(rctx);
+            _exit(rrc);
+        }
+
+        int tvk_st = VXFEC_VK_ERROR;
+        vxfec_vk_ctx *tctx = vxfec_vk_ctx_new_status(&tvk_st);
+        if (!tctx) {
+            kill(rx_pid, SIGTERM);
+            (void)waitpid(rx_pid, NULL, 0);
+            return tvk_st == VXFEC_VK_UNAVAILABLE ? 0 : 1;
+        }
+        bool tretain = false;
+        int trc = run_tx_client(tctx, &cfg, &tretain);
+        if (!tretain)
+            vxfec_vk_ctx_free(tctx);
+        int wstatus = 0;
+        if (waitpid(rx_pid, &wstatus, 0) < 0 || !WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
+            trc = 1;
+        return trc;
+    }
+
     int vk_status = VXFEC_VK_ERROR;
     vxfec_vk_ctx *ctx = vxfec_vk_ctx_new_status(&vk_status);
     if (!ctx) {
@@ -2080,12 +2288,14 @@ int main(int argc, char **argv)
 
     if (cfg.self_test || !cfg.mode) {
         printf("=== vxfec Wire -> VRAM Superframe Loopback Self-Test (%s) ===\n", vxfec_vk_device_name(ctx));
-        bool retain_rq = false, retain_rs = false;
-        bool ok_rq = run_loopback_self_test_codec(ctx, VXFEC_WIRE_RATELESS, 16u, 128u, 36u, 4096u, &retain_rq);
-        bool ok_rs = !retain_rq && run_loopback_self_test_codec(ctx, VXFEC_WIRE_MDS, 16u, 128u, 24u, 4096u, &retain_rs);
-        if (!retain_rq && !retain_rs)
+        bool retain_gf2 = false, retain_rq = false, retain_rs = false;
+        bool ok_gf2 = run_loopback_self_test_codec(ctx, VXFEC_WIRE_RATELESS_GF2, 16u, 128u, 36u, 4096u, &retain_gf2);
+        bool ok_rq = !retain_gf2 && run_loopback_self_test_codec(ctx, VXFEC_WIRE_RATELESS, 16u, 128u, 36u, 4096u, &retain_rq);
+        bool ok_rs =
+            !retain_gf2 && !retain_rq && run_loopback_self_test_codec(ctx, VXFEC_WIRE_MDS, 16u, 128u, 24u, 4096u, &retain_rs);
+        if (!retain_gf2 && !retain_rq && !retain_rs)
             vxfec_vk_ctx_free(ctx);
-        return (ok_rq && ok_rs) ? 0 : 1;
+        return (ok_gf2 && ok_rq && ok_rs) ? 0 : 1;
     }
 
     bool retain_vk = false;

@@ -296,10 +296,10 @@ static void build_uncapped_wire_channel(uint64_t *bits, uint32_t Z, uint32_t K, 
 }
 
 /* codec-isolated fade sweep: re-encode per codec, poison erased slots, and verify 100% of sys_bytes */
-static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_rq, vxfec_wire_ring *wring_mds,
-                                    vxfec_vk_buf *vram_ref, vxfec_vk_buf *vram_work, uint32_t Z, uint32_t K, uint32_t P, size_t wpb,
-                                    uint32_t stride, size_t sys_bytes, size_t wire_bytes, const uint8_t *seed_buf, size_t seed_len,
-                                    const uint8_t *poison_buf, uint8_t *verify_buf)
+static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_gf2, vxfec_wire_ring *wring_rq,
+                                    vxfec_wire_ring *wring_mds, vxfec_vk_buf *vram_ref, vxfec_vk_buf *vram_work, uint32_t Z,
+                                    uint32_t K, uint32_t P, size_t wpb, uint32_t stride, size_t sys_bytes, size_t wire_bytes,
+                                    const uint8_t *seed_buf, size_t seed_len, const uint8_t *poison_buf, uint8_t *verify_buf)
 {
     static const struct {
         uint32_t burst_pct;
@@ -317,12 +317,12 @@ static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_rq
     if (!bits)
         return false;
 
-    vxfec_wire_ring *rings[2] = {wring_rq, wring_mds};
-    uint32_t ok_cnt[2][NUM_CASES] = {{0}};
-    uint64_t ok_ns[2][NUM_CASES] = {{0}};
+    vxfec_wire_ring *rings[3] = {wring_gf2, wring_rq, wring_mds};
+    uint32_t ok_cnt[3][NUM_CASES] = {{0}};
+    uint64_t ok_ns[3][NUM_CASES] = {{0}};
     double loss_avg[NUM_CASES] = {0};
 
-    for (int ci = 0; ci < 2; ci++) {
+    for (int ci = 0; ci < 3; ci++) {
         if (!fill_vram_pattern(ctx, vram_ref, sys_bytes, seed_buf, seed_len) ||
             !vxfec_wire_encode_vram(rings[ci], vram_ref, NULL)) {
             free(bits);
@@ -362,24 +362,31 @@ static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_rq
 
     printf("\n  Uncapped Fade & Superframe-Boundary Sweep (%d poisoned+verified trials/point, wire parity = %.2f%%):\n", TRIALS,
            (100.0 * (double)P) / (double)(K + P));
-    printf("  Fade Profile   | Fade (ms) | Burst+Rand | Realized Loss | Rateless OK (Avg ms) | Strict MDS OK (Avg ms)\n");
-    printf("  ---------------+-----------+------------+---------------+----------------------+-----------------------\n");
+    printf("  Fade Profile   | Fade (ms) | Burst+Rand | Realized Loss | RQ-GF2 OK (Avg ms) | Rateless OK (Avg ms) | Strict MDS OK "
+           "(Avg ms)\n");
+    printf("  ---------------+-----------+------------+---------------+--------------------+----------------------+----------------"
+           "-------\n");
 
     for (size_t c = 0; c < NUM_CASES; c++) {
-        char rq_buf[24], mds_buf[24];
+        char gf2_buf[24], rq_buf[24], mds_buf[24];
         if (ok_cnt[0][c] > 0)
-            snprintf(rq_buf, sizeof(rq_buf), "%u/%d (%5.2f ms)", ok_cnt[0][c], TRIALS, (double)(ok_ns[0][c] / ok_cnt[0][c]) / 1e6);
+            snprintf(gf2_buf, sizeof(gf2_buf), "%u/%d (%5.2f ms)", ok_cnt[0][c], TRIALS,
+                     (double)(ok_ns[0][c] / ok_cnt[0][c]) / 1e6);
+        else
+            snprintf(gf2_buf, sizeof(gf2_buf), "0/%d (   n/a  )", TRIALS);
+        if (ok_cnt[1][c] > 0)
+            snprintf(rq_buf, sizeof(rq_buf), "%u/%d (%5.2f ms)", ok_cnt[1][c], TRIALS, (double)(ok_ns[1][c] / ok_cnt[1][c]) / 1e6);
         else
             snprintf(rq_buf, sizeof(rq_buf), "0/%d (   n/a  )", TRIALS);
-        if (ok_cnt[1][c] > 0)
-            snprintf(mds_buf, sizeof(mds_buf), "%u/%d (%5.2f ms)", ok_cnt[1][c], TRIALS,
-                     (double)(ok_ns[1][c] / ok_cnt[1][c]) / 1e6);
+        if (ok_cnt[2][c] > 0)
+            snprintf(mds_buf, sizeof(mds_buf), "%u/%d (%5.2f ms)", ok_cnt[2][c], TRIALS,
+                     (double)(ok_ns[2][c] / ok_cnt[2][c]) / 1e6);
         else
             snprintf(mds_buf, sizeof(mds_buf), "0/%d (   n/a  )", TRIALS);
 
         double fade_ms = (DEADLINE_MS * (double)cases[c].burst_pct) / 100.0;
-        printf("  %s |  %4.2f ms  | %2u%% + %3.1f%% |     %5.2f%%    | %-20s | %-21s\n", cases[c].pos_lbl, fade_ms,
-               cases[c].burst_pct, (double)cases[c].rand_ppm / 1e4, loss_avg[c], rq_buf, mds_buf);
+        printf("  %s |  %4.2f ms  | %2u%% + %3.1f%% |     %5.2f%%    | %-18s | %-20s | %-21s\n", cases[c].pos_lbl, fade_ms,
+               cases[c].burst_pct, (double)cases[c].rand_ppm / 1e4, loss_avg[c], gf2_buf, rq_buf, mds_buf);
     }
 
     free(bits);
@@ -541,12 +548,12 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
     printf("  Codec    | Pipeline Stage / Contention   | CPU Comp | Tab DMA | Avg Step | Max Lat   | Max<=10 | Useful Rate\n");
     printf("  ---------+-------------------------------+----------+---------+----------+-----------+---------+------------\n");
 
-    const int codecs[2] = {VXFEC_WIRE_RATELESS, VXFEC_WIRE_MDS};
-    const char *cnames[2] = {"Rateless", "MDS     "};
-    vxfec_wire_ring *rings[2] = {NULL, NULL};
+    const int codecs[3] = {VXFEC_WIRE_RATELESS_GF2, VXFEC_WIRE_RATELESS, VXFEC_WIRE_MDS};
+    const char *cnames[3] = {"RQ-GF2  ", "Rateless", "MDS     "};
+    vxfec_wire_ring *rings[3] = {NULL, NULL, NULL};
     bool all_ok = true;
 
-    for (int ci = 0; ci < 2; ci++) {
+    for (int ci = 0; ci < 3; ci++) {
         vxfec_wire_ring *wring = vxfec_wire_ring_new(ctx, codecs[ci], Z, K, P, stride, 0u);
         rings[ci] = wring;
         if (!wring) {
@@ -838,18 +845,19 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
                    (cv_max_ms <= DEADLINE_MS) ? "PASS" : "MISS", cv_tbps);
         }
 
-        if (ci == 0)
+        if (ci + 1 < 3)
             printf(
                 "  ---------+-------------------------------+----------+---------+----------+-----------+---------+------------\n");
     }
 
-    if (all_ok && run_sweep && rings[0] && rings[1]) {
-        if (!run_fade_boundary_sweep(ctx, rings[0], rings[1], wire_ref, wire_vram[0], Z, K, P, wpb, stride, sys_bytes, wire_bytes,
-                                     seed_buf, seed_len, poison_buf, verify_buf)) {
+    if (all_ok && run_sweep && rings[0] && rings[1] && rings[2]) {
+        if (!run_fade_boundary_sweep(ctx, rings[0], rings[1], rings[2], wire_ref, wire_vram[0], Z, K, P, wpb, stride, sys_bytes,
+                                     wire_bytes, seed_buf, seed_len, poison_buf, verify_buf)) {
             all_ok = false;
         }
     }
 
+    vxfec_wire_ring_free(rings[2]);
     vxfec_wire_ring_free(rings[1]);
     vxfec_wire_ring_free(rings[0]);
     for (int f = 0; f < PIPE_ITERS; f++)

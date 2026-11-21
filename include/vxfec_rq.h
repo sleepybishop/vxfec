@@ -66,6 +66,16 @@ uint64_t vxfec_rq_run_and_mix_submit(vxfec_vk_ctx *ctx, nanorq_core *rq, const v
                                      uint32_t stride, uint32_t num_blocks, const uint32_t *esis, uint32_t num_esis,
                                      vxfec_vk_buf *out_buf, bool upload_d, bool download_out);
 
+/* GPU-resident VRAM-to-VRAM RaptorQ encode and in-place VRAM erasure repair */
+uint64_t vxfec_rq_encode_submit_vram(vxfec_vk_ctx *ctx, nanorq_core *rq, const vxfec_rq_sched *gs, vxfec_vk_buf *src_vram,
+                                     size_t src_offset, size_t valid_bytes, uint32_t sym_T, vxfec_vk_buf *work_d_buf,
+                                     uint32_t stride, const uint32_t *esis, uint32_t num_esis, vxfec_vk_buf *out_buf,
+                                     bool download_out);
+uint64_t vxfec_rq_repair_submit_vram(vxfec_vk_ctx *ctx, nanorq_core *rq, const vxfec_rq_sched *gs, const uint8_t *sys_bitmap,
+                                     uint32_t K, uint32_t sym_T, vxfec_vk_buf *target_vram, size_t target_offset,
+                                     size_t total_bytes, vxfec_vk_buf *work_d_buf, uint32_t stride, const uint32_t *missing_esis,
+                                     uint32_t num_missing, uint32_t overhead, vxfec_vk_buf *out_buf);
+
 #ifdef __cplusplus
 }
 #endif

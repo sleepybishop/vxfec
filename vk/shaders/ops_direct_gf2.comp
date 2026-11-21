@@ -1,0 +1,175 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef TILE_E
+#define TILE_E 16
+#endif
+
+#ifdef USE_VEC4
+#define ELEM_T uvec4
+#define ZERO_ELEM uvec4(0u)
+#else
+#define ELEM_T uint
+#define ZERO_ELEM 0u
+#endif
+
+layout(std430, set = 0, binding = 0) readonly buffer DataBuf {
+  ELEM_T d[];
+};
+
+/*
+ * tab[tile_idx] = uvec2(cmd_beg, cmd_end)
+ * tab[k]        = uvec2(row, mask)
+ */
+layout(std430, set = 0, binding = 1) readonly buffer DirectTabBuf {
+  uvec2 tab[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutBuf {
+  ELEM_T out_syms[];
+};
+
+layout(push_constant) uniform DirectPush {
+  uint rows;
+  uint stride_units;
+  uint num_esis;
+  uint tile_offset;
+  uint block_offset;
+} pc;
+
+#define ACCUM_16(m, s)                                                         \
+  if ((m & 0x000fu) != 0u) {                                                   \
+    if ((m & (1u << 0u)) != 0u) a0 ^= s;                                       \
+    if ((m & (1u << 1u)) != 0u) a1 ^= s;                                       \
+    if ((m & (1u << 2u)) != 0u) a2 ^= s;                                       \
+    if ((m & (1u << 3u)) != 0u) a3 ^= s;                                       \
+  }                                                                            \
+  if ((m & 0x00f0u) != 0u) {                                                   \
+    if ((m & (1u << 4u)) != 0u) a4 ^= s;                                       \
+    if ((m & (1u << 5u)) != 0u) a5 ^= s;                                       \
+    if ((m & (1u << 6u)) != 0u) a6 ^= s;                                       \
+    if ((m & (1u << 7u)) != 0u) a7 ^= s;                                       \
+  }                                                                            \
+  if ((m & 0x0f00u) != 0u) {                                                   \
+    if ((m & (1u << 8u)) != 0u) a8 ^= s;                                       \
+    if ((m & (1u << 9u)) != 0u) a9 ^= s;                                       \
+    if ((m & (1u << 10u)) != 0u) a10 ^= s;                                     \
+    if ((m & (1u << 11u)) != 0u) a11 ^= s;                                     \
+  }                                                                            \
+  if ((m & 0xf000u) != 0u) {                                                   \
+    if ((m & (1u << 12u)) != 0u) a12 ^= s;                                     \
+    if ((m & (1u << 13u)) != 0u) a13 ^= s;                                     \
+    if ((m & (1u << 14u)) != 0u) a14 ^= s;                                     \
+    if ((m & (1u << 15u)) != 0u) a15 ^= s;                                     \
+  }
+
+#if TILE_E == 32
+#define ACCUM_HI16(m, s)                                                       \
+  if ((m & 0x000f0000u) != 0u) {                                               \
+    if ((m & (1u << 16u)) != 0u) a16 ^= s;                                     \
+    if ((m & (1u << 17u)) != 0u) a17 ^= s;                                     \
+    if ((m & (1u << 18u)) != 0u) a18 ^= s;                                     \
+    if ((m & (1u << 19u)) != 0u) a19 ^= s;                                     \
+  }                                                                            \
+  if ((m & 0x00f00000u) != 0u) {                                               \
+    if ((m & (1u << 20u)) != 0u) a20 ^= s;                                     \
+    if ((m & (1u << 21u)) != 0u) a21 ^= s;                                     \
+    if ((m & (1u << 22u)) != 0u) a22 ^= s;                                     \
+    if ((m & (1u << 23u)) != 0u) a23 ^= s;                                     \
+  }                                                                            \
+  if ((m & 0x0f000000u) != 0u) {                                               \
+    if ((m & (1u << 24u)) != 0u) a24 ^= s;                                     \
+    if ((m & (1u << 25u)) != 0u) a25 ^= s;                                     \
+    if ((m & (1u << 26u)) != 0u) a26 ^= s;                                     \
+    if ((m & (1u << 27u)) != 0u) a27 ^= s;                                     \
+  }                                                                            \
+  if ((m & 0xf0000000u) != 0u) {                                               \
+    if ((m & (1u << 28u)) != 0u) a28 ^= s;                                     \
+    if ((m & (1u << 29u)) != 0u) a29 ^= s;                                     \
+    if ((m & (1u << 30u)) != 0u) a30 ^= s;                                     \
+    if ((m & (1u << 31u)) != 0u) a31 ^= s;                                     \
+  }
+#define ACCUM_ALL(m, s)                                                        \
+  if ((m & 0xffffu) != 0u) { ACCUM_16(m, s) }                                  \
+  if ((m >> 16u) != 0u) { ACCUM_HI16(m, s) }
+#else
+#define ACCUM_ALL(m, s) ACCUM_16(m, s)
+#endif
+
+void main() {
+  uint unit_idx = gl_GlobalInvocationID.x;
+  uint tile_idx = gl_WorkGroupID.y + pc.tile_offset;
+  uint out_base = tile_idx * uint(TILE_E);
+  uint block_idx = gl_WorkGroupID.z + pc.block_offset;
+
+  if (unit_idx >= pc.stride_units || out_base >= pc.num_esis) {
+    return;
+  }
+
+  uvec2 span = tab[tile_idx];
+  uint block_base = block_idx * pc.rows * pc.stride_units + unit_idx;
+
+  ELEM_T a0 = ZERO_ELEM, a1 = ZERO_ELEM, a2 = ZERO_ELEM, a3 = ZERO_ELEM;
+  ELEM_T a4 = ZERO_ELEM, a5 = ZERO_ELEM, a6 = ZERO_ELEM, a7 = ZERO_ELEM;
+  ELEM_T a8 = ZERO_ELEM, a9 = ZERO_ELEM, a10 = ZERO_ELEM, a11 = ZERO_ELEM;
+  ELEM_T a12 = ZERO_ELEM, a13 = ZERO_ELEM, a14 = ZERO_ELEM, a15 = ZERO_ELEM;
+#if TILE_E == 32
+  ELEM_T a16 = ZERO_ELEM, a17 = ZERO_ELEM, a18 = ZERO_ELEM, a19 = ZERO_ELEM;
+  ELEM_T a20 = ZERO_ELEM, a21 = ZERO_ELEM, a22 = ZERO_ELEM, a23 = ZERO_ELEM;
+  ELEM_T a24 = ZERO_ELEM, a25 = ZERO_ELEM, a26 = ZERO_ELEM, a27 = ZERO_ELEM;
+  ELEM_T a28 = ZERO_ELEM, a29 = ZERO_ELEM, a30 = ZERO_ELEM, a31 = ZERO_ELEM;
+#endif
+
+  uint k = span.x;
+  for (; k + 1u < span.y; k += 2u) {
+    uvec2 c0 = tab[k];
+    uvec2 c1 = tab[k + 1u];
+    ELEM_T s0 = d[block_base + c0.x * pc.stride_units];
+    ELEM_T s1 = d[block_base + c1.x * pc.stride_units];
+    ACCUM_ALL(c0.y, s0)
+    ACCUM_ALL(c1.y, s1)
+  }
+  if (k < span.y) {
+    uvec2 c0 = tab[k];
+    ELEM_T s0 = d[block_base + c0.x * pc.stride_units];
+    ACCUM_ALL(c0.y, s0)
+  }
+
+  uint out_idx = (block_idx * pc.num_esis + out_base) * pc.stride_units + unit_idx;
+  uint rem = pc.num_esis - out_base;
+  out_syms[out_idx] = a0;
+  if (rem > 1u) out_syms[out_idx + pc.stride_units] = a1;
+  if (rem > 2u) out_syms[out_idx + 2u * pc.stride_units] = a2;
+  if (rem > 3u) out_syms[out_idx + 3u * pc.stride_units] = a3;
+  if (rem > 4u) out_syms[out_idx + 4u * pc.stride_units] = a4;
+  if (rem > 5u) out_syms[out_idx + 5u * pc.stride_units] = a5;
+  if (rem > 6u) out_syms[out_idx + 6u * pc.stride_units] = a6;
+  if (rem > 7u) out_syms[out_idx + 7u * pc.stride_units] = a7;
+  if (rem > 8u) out_syms[out_idx + 8u * pc.stride_units] = a8;
+  if (rem > 9u) out_syms[out_idx + 9u * pc.stride_units] = a9;
+  if (rem > 10u) out_syms[out_idx + 10u * pc.stride_units] = a10;
+  if (rem > 11u) out_syms[out_idx + 11u * pc.stride_units] = a11;
+  if (rem > 12u) out_syms[out_idx + 12u * pc.stride_units] = a12;
+  if (rem > 13u) out_syms[out_idx + 13u * pc.stride_units] = a13;
+  if (rem > 14u) out_syms[out_idx + 14u * pc.stride_units] = a14;
+  if (rem > 15u) out_syms[out_idx + 15u * pc.stride_units] = a15;
+#if TILE_E == 32
+  if (rem > 16u) out_syms[out_idx + 16u * pc.stride_units] = a16;
+  if (rem > 17u) out_syms[out_idx + 17u * pc.stride_units] = a17;
+  if (rem > 18u) out_syms[out_idx + 18u * pc.stride_units] = a18;
+  if (rem > 19u) out_syms[out_idx + 19u * pc.stride_units] = a19;
+  if (rem > 20u) out_syms[out_idx + 20u * pc.stride_units] = a20;
+  if (rem > 21u) out_syms[out_idx + 21u * pc.stride_units] = a21;
+  if (rem > 22u) out_syms[out_idx + 22u * pc.stride_units] = a22;
+  if (rem > 23u) out_syms[out_idx + 23u * pc.stride_units] = a23;
+  if (rem > 24u) out_syms[out_idx + 24u * pc.stride_units] = a24;
+  if (rem > 25u) out_syms[out_idx + 25u * pc.stride_units] = a25;
+  if (rem > 26u) out_syms[out_idx + 26u * pc.stride_units] = a26;
+  if (rem > 27u) out_syms[out_idx + 27u * pc.stride_units] = a27;
+  if (rem > 28u) out_syms[out_idx + 28u * pc.stride_units] = a28;
+  if (rem > 29u) out_syms[out_idx + 29u * pc.stride_units] = a29;
+  if (rem > 30u) out_syms[out_idx + 30u * pc.stride_units] = a30;
+  if (rem > 31u) out_syms[out_idx + 31u * pc.stride_units] = a31;
+#endif
+}

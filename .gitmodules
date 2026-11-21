@@ -1,0 +1,4 @@
+[submodule "deps/nanorq"]
+	path = deps/nanorq
+	url = https://github.com/sleepybishop/nanorq.git
+	branch = stable

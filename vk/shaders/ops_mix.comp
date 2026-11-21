@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef USE_VEC4
+#define ELEM_T uvec4
+#define ZERO_ELEM uvec4(0u)
+#else
+#define ELEM_T uint
+#define ZERO_ELEM 0u
+#endif
+
+layout(std430, set = 0, binding = 0) readonly buffer DataBuf {
+  ELEM_T d[];
+};
+
+/* each esi occupies 64 uints: [0] = deg, [1..deg] = resolved physical rows */
+layout(std430, set = 0, binding = 1) readonly buffer MixBuf {
+  uint mix_tab[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutBuf {
+  ELEM_T out_syms[];
+};
+
+layout(push_constant) uniform MixPush {
+  uint rows;
+  uint stride_units;
+  uint num_esis;
+  uint esi_offset;
+  uint block_offset;
+} pc;
+
+void main() {
+  uint unit_idx = gl_GlobalInvocationID.x;
+  uint esi_idx = gl_WorkGroupID.y + pc.esi_offset;
+  uint block_idx = gl_WorkGroupID.z + pc.block_offset;
+
+  if (unit_idx >= pc.stride_units || esi_idx >= pc.num_esis) {
+    return;
+  }
+
+  uint tab_base = esi_idx * 64u;
+  uint deg = mix_tab[tab_base];
+  uint block_base = block_idx * pc.rows * pc.stride_units;
+
+  ELEM_T acc = ZERO_ELEM;
+  for (uint m = 0u; m < deg; m++) {
+    uint row = mix_tab[tab_base + 1u + m];
+    acc ^= d[block_base + row * pc.stride_units + unit_idx];
+  }
+
+  uint out_idx = (block_idx * pc.num_esis + esi_idx) * pc.stride_units + unit_idx;
+  out_syms[out_idx] = acc;
+}

@@ -1,0 +1,294 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef USE_VEC4
+#define ELEM_T uvec4
+#define ZERO_ELEM uvec4(0u)
+#else
+#define ELEM_T uint
+#define ZERO_ELEM 0u
+#endif
+
+struct GpuOp4 {
+  uint j;
+  uint i0;
+  uint i1;
+  uint i2;
+  uint i3;
+  uint u_pack;
+};
+
+layout(std430, set = 0, binding = 0) buffer DataBuf {
+  ELEM_T d[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer OpsBuf {
+  GpuOp4 ops[];
+};
+
+layout(push_constant) uniform PushConsts {
+  uint rows;
+  uint stride_units;
+  uint cp0_op4;
+  uint cp1_op4;
+  uint fwd_op4;
+  uint total_op4;
+  uint block_offset;
+  uint hdpc_beg_op4;
+  uint hdpc_end_op4;
+} pc;
+
+#ifndef PURE_GF2
+const uint k_exp[64] = uint[64](
+    0x08040201u, 0x80402010u, 0xe8743a1du, 0x261387cdu, 0x5a2d984cu, 0xc9ea75b4u, 0x0c06038fu, 0xc0603018u,
+    0x9c4e279du, 0x35944a25u, 0x77b5d46au, 0x239fc1eeu, 0x0a058c46u, 0xa0502814u, 0xd269ba5du, 0xa1de6fb9u,
+    0xc261be5fu, 0xbc5e2f99u, 0x0f89ca65u, 0xf0783c1eu, 0xbbd3e7fdu, 0x7fb1d66bu, 0xa3dfe1feu, 0xe271b65bu,
+    0x8643afd9u, 0x88442211u, 0x68341a0du, 0xce67bdd0u, 0x7c3e1f81u, 0x93c7edf8u, 0xc5ec763bu, 0xcc663397u,
+    0x5c2e1785u, 0xa9da6db8u, 0x42219e4fu, 0x542a1584u, 0x299a4da8u, 0xaa55a452u, 0x72399249u, 0x73b7d5e4u,
+    0x63bfd1e6u, 0x7e3f91c6u, 0xb3d7e5fcu, 0xfff1f67bu, 0x4babdbe3u, 0xc4623196u, 0xdc6e3795u, 0x41ae57a5u,
+    0x64321982u, 0x0e078dc8u, 0xe070381cu, 0xa653a7ddu, 0xb259a251u, 0xeff9f279u, 0x562b9bc3u, 0x098a45acu,
+    0x90482412u, 0xf5f47a3du, 0xebfbf3f7u, 0x160b8bcbu, 0x7db0582cu, 0x83cfe9fau, 0xd86c361bu, 0x018e47adu
+);
+
+shared uint s_log[256];
+shared uint s_exp[512];
+
+void init_gf256_lds(uint lid) {
+  for (uint idx = lid; idx < 255u; idx += 32u) {
+    uint val = (k_exp[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xffu;
+    s_exp[idx] = val;
+    s_exp[idx + 255u] = val;
+    s_log[val] = idx;
+  }
+  if (lid == 0u) {
+    s_log[0] = 511u;
+    s_exp[510] = 0u;
+    s_exp[511] = 0u;
+  }
+  barrier();
+}
+
+void gf256_log4_pair(uint v, out uint l01, out uint l23) {
+  l01 = s_log[v & 0xffu] | (s_log[(v >> 8u) & 0xffu] << 16u);
+  l23 = s_log[(v >> 16u) & 0xffu] | (s_log[v >> 24u] << 16u);
+}
+
+uint gf256_mul4_prelog(uint l01, uint l23, uint lu) {
+  uint r0 = s_exp[min(lu + (l01 & 0xffffu), 511u)];
+  uint r1 = s_exp[min(lu + (l01 >> 16u), 511u)] << 8u;
+  uint r2 = s_exp[min(lu + (l23 & 0xffffu), 511u)] << 16u;
+  uint r3 = s_exp[min(lu + (l23 >> 16u), 511u)] << 24u;
+  return r0 | r1 | r2 | r3;
+}
+
+uint gf256_mul4_lu(uint v, uint lu) {
+  uint r0 = s_exp[min(lu + s_log[v & 0xffu], 511u)];
+  uint r1 = s_exp[min(lu + s_log[(v >> 8u) & 0xffu], 511u)] << 8u;
+  uint r2 = s_exp[min(lu + s_log[(v >> 16u) & 0xffu], 511u)] << 16u;
+  uint r3 = s_exp[min(lu + s_log[v >> 24u], 511u)] << 24u;
+  return r0 | r1 | r2 | r3;
+}
+
+#ifdef USE_VEC4
+void gf256_log_elem(uvec4 src, out uvec4 lo, out uvec4 hi) {
+  gf256_log4_pair(src.x, lo.x, hi.x);
+  gf256_log4_pair(src.y, lo.y, hi.y);
+  gf256_log4_pair(src.z, lo.z, hi.z);
+  gf256_log4_pair(src.w, lo.w, hi.w);
+}
+
+uvec4 gf256_mul_prelog(uvec4 lo, uvec4 hi, uint lu) {
+  return uvec4(gf256_mul4_prelog(lo.x, hi.x, lu),
+               gf256_mul4_prelog(lo.y, hi.y, lu),
+               gf256_mul4_prelog(lo.z, hi.z, lu),
+               gf256_mul4_prelog(lo.w, hi.w, lu));
+}
+
+uvec4 gf256_mul_elem(uvec4 v, uint u) {
+  uint lu = s_log[u];
+  return uvec4(gf256_mul4_lu(v.x, lu), gf256_mul4_lu(v.y, lu),
+               gf256_mul4_lu(v.z, lu), gf256_mul4_lu(v.w, lu));
+}
+#else
+void gf256_log_elem(uint src, out uint lo, out uint hi) {
+  gf256_log4_pair(src, lo, hi);
+}
+
+uint gf256_mul_prelog(uint lo, uint hi, uint lu) {
+  return gf256_mul4_prelog(lo, hi, lu);
+}
+
+uint gf256_mul_elem(uint v, uint u) {
+  return gf256_mul4_lu(v, s_log[u]);
+}
+#endif
+
+void exec_hdpc_accum(uint col_base, uint beg_idx, uint end_idx) {
+  uint cur = beg_idx;
+  while (cur < end_idx) {
+    uint hcnt = ops[cur + 1u].i1;
+    uint chunk_end = ops[cur + 1u].i2;
+
+    ELEM_T h0 = d[col_base + ops[cur].j * pc.stride_units];
+    ELEM_T h1 = (hcnt > 1u) ? d[col_base + ops[cur].i0 * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h2 = (hcnt > 2u) ? d[col_base + ops[cur].i1 * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h3 = (hcnt > 3u) ? d[col_base + ops[cur].i2 * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h4 = (hcnt > 4u) ? d[col_base + ops[cur].i3 * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h5 = (hcnt > 5u) ? d[col_base + ops[cur].u_pack * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h6 = (hcnt > 6u) ? d[col_base + ops[cur + 1u].j * pc.stride_units] : ZERO_ELEM;
+    ELEM_T h7 = (hcnt > 7u) ? d[col_base + ops[cur + 1u].i0 * pc.stride_units] : ZERO_ELEM;
+
+    for (uint k = cur + 2u; k < chunk_end; k++) {
+      GpuOp4 op = ops[k];
+      ELEM_T src = d[col_base + op.j * pc.stride_units];
+      uint m = op.u_pack;
+      ELEM_T lo = ZERO_ELEM, hi = ZERO_ELEM;
+      if ((m & 0x100u) != 0u) {
+        gf256_log_elem(src, lo, hi);
+      }
+      if ((m & 0x0fu) != 0u) {
+        if ((m & 0x01u) != 0u) {
+          uint lc = op.i0 & 0xffu;
+          h0 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x02u) != 0u) {
+          uint lc = (op.i0 >> 8u) & 0xffu;
+          h1 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x04u) != 0u) {
+          uint lc = (op.i0 >> 16u) & 0xffu;
+          h2 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x08u) != 0u) {
+          uint lc = op.i0 >> 24u;
+          h3 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+      }
+      if ((m & 0xf0u) != 0u) {
+        if ((m & 0x10u) != 0u) {
+          uint lc = op.i1 & 0xffu;
+          h4 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x20u) != 0u) {
+          uint lc = (op.i1 >> 8u) & 0xffu;
+          h5 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x40u) != 0u) {
+          uint lc = (op.i1 >> 16u) & 0xffu;
+          h6 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+        if ((m & 0x80u) != 0u) {
+          uint lc = op.i1 >> 24u;
+          h7 ^= (lc == 0u) ? src : gf256_mul_prelog(lo, hi, lc);
+        }
+      }
+    }
+
+    d[col_base + ops[cur].j * pc.stride_units] = h0;
+    if (hcnt > 1u) d[col_base + ops[cur].i0 * pc.stride_units] = h1;
+    if (hcnt > 2u) d[col_base + ops[cur].i1 * pc.stride_units] = h2;
+    if (hcnt > 3u) d[col_base + ops[cur].i2 * pc.stride_units] = h3;
+    if (hcnt > 4u) d[col_base + ops[cur].i3 * pc.stride_units] = h4;
+    if (hcnt > 5u) d[col_base + ops[cur].u_pack * pc.stride_units] = h5;
+    if (hcnt > 6u) d[col_base + ops[cur + 1u].j * pc.stride_units] = h6;
+    if (hcnt > 7u) d[col_base + ops[cur + 1u].i0 * pc.stride_units] = h7;
+    cur = chunk_end;
+  }
+}
+#endif
+
+void main() {
+#ifndef PURE_GF2
+  init_gf256_lds(gl_LocalInvocationID.x);
+#endif
+
+  uint gcol = gl_GlobalInvocationID.x;
+  if (gcol >= pc.stride_units) {
+    return;
+  }
+  uint col_base =
+      (gl_WorkGroupID.y + pc.block_offset) * pc.rows * pc.stride_units + gcol;
+
+#ifdef PURE_GF2
+  for (uint pass = 0u; pass < 4u; pass++) {
+    uint beg = (pass == 1u) ? pc.fwd_op4 : ((pass == 2u) ? pc.cp1_op4 : 0u);
+    uint end = (pass == 0u)
+                   ? pc.cp1_op4
+                   : ((pass == 1u)
+                          ? pc.total_op4
+                          : ((pass == 2u) ? pc.fwd_op4 : pc.cp0_op4));
+    for (uint k = beg; k < end; k++) {
+      GpuOp4 op = ops[k];
+      ELEM_T src = d[col_base + op.j * pc.stride_units];
+      d[col_base + op.i0 * pc.stride_units] ^= src;
+      if (op.i1 != 0xffffffffu) {
+        d[col_base + op.i1 * pc.stride_units] ^= src;
+        if (op.i2 != 0xffffffffu) {
+          d[col_base + op.i2 * pc.stride_units] ^= src;
+          if (op.i3 != 0xffffffffu) {
+            d[col_base + op.i3 * pc.stride_units] ^= src;
+            if (op.u_pack != 0xffffffffu) {
+              d[col_base + op.u_pack * pc.stride_units] ^= src;
+            }
+          }
+        }
+      }
+    }
+  }
+#else
+  uint span_beg[5] = uint[5](0u, pc.hdpc_end_op4, pc.fwd_op4, pc.cp1_op4, 0u);
+  uint span_end[5] = uint[5](pc.hdpc_beg_op4, pc.cp1_op4, pc.total_op4, pc.fwd_op4, pc.cp0_op4);
+  for (uint pass = 0u; pass < 5u; pass++) {
+    if (pass == 1u && pc.hdpc_beg_op4 < pc.hdpc_end_op4) {
+      exec_hdpc_accum(col_base, pc.hdpc_beg_op4, pc.hdpc_end_op4);
+    }
+    uint beg = span_beg[pass];
+    uint end = span_end[pass];
+    for (uint k = beg; k < end; k++) {
+      GpuOp4 op = ops[k];
+      if (op.u_pack == 0u) {
+        uint idx = col_base + op.i0 * pc.stride_units;
+        d[idx] = gf256_mul_elem(d[idx], op.j);
+      } else if (op.u_pack == 0x01010101u) {
+        ELEM_T src = d[col_base + op.j * pc.stride_units];
+        d[col_base + op.i0 * pc.stride_units] ^= src;
+        if (op.i1 != 0xffffffffu) {
+          d[col_base + op.i1 * pc.stride_units] ^= src;
+          if (op.i2 != 0xffffffffu) {
+            d[col_base + op.i2 * pc.stride_units] ^= src;
+            if (op.i3 != 0xffffffffu) {
+              d[col_base + op.i3 * pc.stride_units] ^= src;
+            }
+          }
+        }
+      } else {
+        ELEM_T src = d[col_base + op.j * pc.stride_units];
+        uint u0 = op.u_pack & 0xffu;
+        if (op.i1 == 0xffffffffu) {
+          d[col_base + op.i0 * pc.stride_units] ^=
+              (u0 == 1u) ? src : gf256_mul_elem(src, u0);
+        } else {
+          ELEM_T lo, hi;
+          gf256_log_elem(src, lo, hi);
+          d[col_base + op.i0 * pc.stride_units] ^=
+              (u0 == 1u) ? src : gf256_mul_prelog(lo, hi, s_log[u0]);
+          uint u1 = (op.u_pack >> 8u) & 0xffu;
+          d[col_base + op.i1 * pc.stride_units] ^=
+              (u1 == 1u) ? src : gf256_mul_prelog(lo, hi, s_log[u1]);
+          if (op.i2 != 0xffffffffu) {
+            uint u2 = (op.u_pack >> 16u) & 0xffu;
+            d[col_base + op.i2 * pc.stride_units] ^=
+                (u2 == 1u) ? src : gf256_mul_prelog(lo, hi, s_log[u2]);
+            if (op.i3 != 0xffffffffu) {
+              uint u3 = (op.u_pack >> 24u) & 0xffu;
+              d[col_base + op.i3 * pc.stride_units] ^=
+                  (u3 == 1u) ? src : gf256_mul_prelog(lo, hi, s_log[u3]);
+            }
+          }
+        }
+      }
+    }
+  }
+#endif
+}

@@ -1,0 +1,169 @@
+#version 450
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef TILE_E
+#define TILE_E 8
+#endif
+
+#if TILE_E == 16
+#define HDR_WORDS 3u
+#else
+#define HDR_WORDS 2u
+#endif
+
+layout(std430, set = 0, binding = 0) readonly buffer WireInBuf {
+  uvec4 d[];
+};
+
+/*
+ * Header at hdr_base = hdr_idx * HDR_WORDS:
+ *   tab[hdr_base + 0] = uvec4(cmd_beg, cmd_end, tile_len, actual_block_z)
+ *   tab[hdr_base + 1..] : packed uint16 output wire slots
+ * Commands:
+ *   TILE_E == 8 : tab[k] = uvec4(in_slot, lo0_7, hi0_7, 0)
+ *   TILE_E == 16: tab[k] = uvec4(in_slot, 0, lo0_7, lo8_15), tab[k+1] = uvec4(hi0_7, hi8_15, 0, 0)
+ */
+layout(std430, set = 0, binding = 1) readonly buffer WireTab256Buf {
+  uvec4 tab[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer WireOutBuf {
+  uvec4 out_syms[];
+};
+
+layout(push_constant) uniform WirePush {
+  uint Z;
+  uint stride_vecs;
+  uint flags_tiles;
+  uint tile_offset;
+  uint block_offset;
+} pc;
+
+uint xtime4(uint v) {
+  uint hi = (v >> 7u) & 0x01010101u;
+  uint poly = (hi << 4u) | (hi << 3u) | (hi << 2u) | hi;
+  return ((v & 0x7f7f7f7fu) << 1u) ^ poly;
+}
+
+uvec4 xtime_vec4(uvec4 v) {
+  return uvec4(xtime4(v.x), xtime4(v.y), xtime4(v.z), xtime4(v.w));
+}
+
+#define BUILD_NIB_TAB(t, base_vec) \
+  t[0] = uvec4(0u);                \
+  t[1] = base_vec;                 \
+  t[2] = xtime_vec4(t[1]);         \
+  t[3] = t[2] ^ t[1];              \
+  t[4] = xtime_vec4(t[2]);         \
+  t[5] = t[4] ^ t[1];              \
+  t[6] = t[4] ^ t[2];              \
+  t[7] = t[6] ^ t[1];              \
+  t[8] = xtime_vec4(t[4]);         \
+  t[9] = t[8] ^ t[1];              \
+  t[10] = t[8] ^ t[2];             \
+  t[11] = t[10] ^ t[1];            \
+  t[12] = t[8] ^ t[4];             \
+  t[13] = t[12] ^ t[1];            \
+  t[14] = t[12] ^ t[2];            \
+  t[15] = t[14] ^ t[1];
+
+#define ACCUM_NIB8(w, b0, b1, b2, b3, b4, b5, b6, b7) \
+  if ((w) != 0u) {                                    \
+    b0 ^= t[(w) & 0xfu];                              \
+    b1 ^= t[((w) >> 4u) & 0xfu];                      \
+    b2 ^= t[((w) >> 8u) & 0xfu];                      \
+    b3 ^= t[((w) >> 12u) & 0xfu];                     \
+    b4 ^= t[((w) >> 16u) & 0xfu];                     \
+    b5 ^= t[((w) >> 20u) & 0xfu];                     \
+    b6 ^= t[((w) >> 24u) & 0xfu];                     \
+    b7 ^= t[(w) >> 28u];                              \
+  }
+
+#define WRITE_WIRE_OUT(idx, val, oslot)                                        \
+  if (tile_len > (idx)) {                                                      \
+    out_syms[z_base + (oslot) * slot_stride] = (val);                          \
+  }
+
+void main() {
+  uint vec_idx = gl_GlobalInvocationID.x;
+  uint tile_idx = gl_WorkGroupID.y + pc.tile_offset;
+  uint disp_z = gl_WorkGroupID.z + pc.block_offset;
+  uint hdr_stride = pc.flags_tiles & 0x7fffffffu;
+  bool uniform_tab = ((pc.flags_tiles & 0x80000000u) != 0u);
+
+  if (vec_idx >= pc.stride_vecs || disp_z >= pc.Z || tile_idx >= hdr_stride) {
+    return;
+  }
+
+  uint hdr_idx = uniform_tab ? tile_idx : (disp_z * hdr_stride + tile_idx);
+  uint hdr_base = hdr_idx * HDR_WORDS;
+  uvec4 h0 = tab[hdr_base];
+  uint tile_len = h0.z;
+  if (tile_len == 0u) {
+    return;
+  }
+
+  uint block_idx = uniform_tab ? disp_z : h0.w;
+  uint z_base = block_idx * pc.stride_vecs + vec_idx;
+  uint slot_stride = pc.Z * pc.stride_vecs;
+
+  uvec4 a0 = uvec4(0u), a1 = uvec4(0u), a2 = uvec4(0u), a3 = uvec4(0u);
+  uvec4 a4 = uvec4(0u), a5 = uvec4(0u), a6 = uvec4(0u), a7 = uvec4(0u);
+#if TILE_E == 16
+  uvec4 a8 = uvec4(0u), a9 = uvec4(0u), a10 = uvec4(0u), a11 = uvec4(0u);
+  uvec4 a12 = uvec4(0u), a13 = uvec4(0u), a14 = uvec4(0u), a15 = uvec4(0u);
+
+  for (uint k = h0.x; k < h0.y; k += 2u) {
+    uvec4 cmd0 = tab[k];
+    uvec4 cmd1 = tab[k + 1u];
+    uvec4 src = d[z_base + cmd0.x * slot_stride];
+    uvec4 t[16];
+    BUILD_NIB_TAB(t, src)
+    ACCUM_NIB8(cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
+    ACCUM_NIB8(cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
+
+    if ((cmd1.x | cmd1.y) != 0u) {
+      uvec4 hi_base = xtime_vec4(t[8]);
+      BUILD_NIB_TAB(t, hi_base)
+      ACCUM_NIB8(cmd1.x, a0, a1, a2, a3, a4, a5, a6, a7)
+      ACCUM_NIB8(cmd1.y, a8, a9, a10, a11, a12, a13, a14, a15)
+    }
+  }
+#else
+  for (uint k = h0.x; k < h0.y; k++) {
+    uvec4 cmd = tab[k];
+    uvec4 src = d[z_base + cmd.x * slot_stride];
+    uvec4 t[16];
+    BUILD_NIB_TAB(t, src)
+    ACCUM_NIB8(cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
+
+    if (cmd.z != 0u) {
+      uvec4 hi_base = xtime_vec4(t[8]);
+      BUILD_NIB_TAB(t, hi_base)
+      ACCUM_NIB8(cmd.z, a0, a1, a2, a3, a4, a5, a6, a7)
+    }
+  }
+#endif
+
+  uvec4 os0 = tab[hdr_base + 1u];
+  out_syms[z_base + (os0.x & 0xffffu) * slot_stride] = a0;
+  WRITE_WIRE_OUT(1u, a1, os0.x >> 16u)
+  WRITE_WIRE_OUT(2u, a2, os0.y & 0xffffu)
+  WRITE_WIRE_OUT(3u, a3, os0.y >> 16u)
+  WRITE_WIRE_OUT(4u, a4, os0.z & 0xffffu)
+  WRITE_WIRE_OUT(5u, a5, os0.z >> 16u)
+  WRITE_WIRE_OUT(6u, a6, os0.w & 0xffffu)
+  WRITE_WIRE_OUT(7u, a7, os0.w >> 16u)
+#if TILE_E == 16
+  uvec4 os1 = tab[hdr_base + 2u];
+  WRITE_WIRE_OUT(8u, a8, os1.x & 0xffffu)
+  WRITE_WIRE_OUT(9u, a9, os1.x >> 16u)
+  WRITE_WIRE_OUT(10u, a10, os1.y & 0xffffu)
+  WRITE_WIRE_OUT(11u, a11, os1.y >> 16u)
+  WRITE_WIRE_OUT(12u, a12, os1.z & 0xffffu)
+  WRITE_WIRE_OUT(13u, a13, os1.z >> 16u)
+  WRITE_WIRE_OUT(14u, a14, os1.w & 0xffffu)
+  WRITE_WIRE_OUT(15u, a15, os1.w >> 16u)
+#endif
+}

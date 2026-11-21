@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      VXFEC_VK_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Build, RDMA & Vulkan Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang glslang-tools libibverbs-dev libvulkan-dev mesa-vulkan-drivers python3 vulkan-tools
+
+      - name: Verify GLSL Compute Shaders Compile
+        run: |
+          make shaders
+          git checkout -- vk/vk_spv.c vk/vk_spv.h
+
+      - name: Build and Run Release Tests
+        run: |
+          make -j$(nproc) ARCH_FLAGS="" all
+          nm -D --defined-only libnccl-vxfec.so
+          make -j$(nproc) ARCH_FLAGS="" BUILD_DIR=build-nosim OUT_PREFIX=build-nosim/ CPPFLAGS="-DVXFEC_ENABLE_SIM=0" build-nosim/libnccl-vxfec.so
+          rm -rf build-nosim
+          make ARCH_FLAGS="" check
+
+      - name: Run Address & UndefinedBehavior Sanitizers
+        run: |
+          make -j$(nproc) asan

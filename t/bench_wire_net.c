@@ -589,8 +589,12 @@ static bool run_loopback_self_test_codec(vxfec_vk_ctx *ctx, int codec, uint32_t 
     vxfec_wire_stats st = {0};
     uint64_t rec_t0 = now_ns();
     uint64_t rec_ticket = vxfec_wire_recover_submit(rx_ring, rx_vram, rx_bits, &st);
-    if (!rec_ticket || !vxfec_vk_wait(ctx, rec_ticket, 5000000000ULL))
+    if (!rec_ticket || !vxfec_vk_wait(ctx, rec_ticket, 5000000000ULL)) {
+        fprintf(stderr, "FAIL: %s loopback recovery %s (received %" PRIu64 "/%" PRIu64 " planned frames, %u failed blocks)\n",
+                codec == VXFEC_WIRE_MDS ? "RS8" : "RaptorQ", rec_ticket ? "wait failed" : "submit failed",
+                atomic_load(&rx_count), expected_frames, st.blocks_failed);
         goto cleanup;
+    }
     uint64_t rec_wall_ns = now_ns() - rec_t0;
 
     if (rx_ext_host) {

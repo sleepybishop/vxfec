@@ -26,6 +26,10 @@ jobs:
           make shaders
           git checkout -- vk/vk_spv.c vk/vk_spv.h
 
+      # Let each loopback rail buffer the full burst if its receiver is descheduled.
+      - name: Allow 16 MiB UDP receive buffers
+        run: sudo sysctl -w net.core.rmem_max=16777216
+
       - name: Build and Run Release Tests
         run: |
           make -j$(nproc) ARCH_FLAGS="" all

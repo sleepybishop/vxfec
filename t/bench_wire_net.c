@@ -1544,7 +1544,6 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     vxfec_ibv_mr_t *ibv_mr = NULL;
     vxfec_ibv_ep_t *ibv_ep = NULL;
     int tx_dmabuf_fd = -1;
-    bool tx_gdr_dmabuf = false;
     bool tx_ext_host = false;
     int tx_fds[WIRE_NET_MAX_RAILS];
     int bidir_fd = -1;
@@ -1578,23 +1577,6 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 fprintf(stderr, "TX --gdr failed to register the GPU DMA-BUF with ibverbs\n");
                 goto tx_cleanup;
             }
-            tx_gdr_dmabuf = true;
-        } else if (cfg->use_ibv && vxfec_vk_has_dmabuf_export(ctx)) {
-            tx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &tx_dmabuf_fd);
-            if (tx_vram && tx_dmabuf_fd >= 0) {
-                ibv_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0u, aligned_wire, (uint64_t)(uintptr_t)tx_host, tx_dmabuf_fd, false);
-                if (ibv_mr) {
-                    tx_gdr_dmabuf = true;
-                } else {
-                    close(tx_dmabuf_fd);
-                    tx_dmabuf_fd = -1;
-                    vxfec_vk_buf_free(ctx, tx_vram);
-                    tx_vram = NULL;
-                }
-            } else if (tx_vram) {
-                vxfec_vk_buf_free(ctx, tx_vram);
-                tx_vram = NULL;
-            }
         } else if (!cfg->use_ibv && !stage3_pipeline && vxfec_vk_has_ext_host_mem(ctx)) {
             tx_vram = vxfec_vk_buf_import_host_ptr(ctx, tx_host, aligned_wire);
             if (tx_vram)
@@ -1614,7 +1596,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             if (tx_ext_host) {
                 init_ok = vxfec_vk_buf_acquire_external(ctx, tx_vram) && vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) &&
                           vxfec_vk_buf_release_external(ctx, tx_vram);
-            } else if (tx_gdr_dmabuf) {
+            } else if (cfg->gdr) {
                 init_ok = vxfec_vk_buf_write_offset(ctx, tx_vram, 0, tx_host, sys_bytes) &&
                           vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) && vxfec_vk_buf_release_external(ctx, tx_vram);
             } else {
@@ -1727,7 +1709,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     const char *transport = "Multi-NIC UDP";
     if (gdr_pipeline)
         transport = "IBV UC GPU-to-GPU DMA-BUF, two RX buffers";
-    else if (cfg->gdr || (cfg->use_ibv && tx_gdr_dmabuf && rx_hs.gdr_dmabuf))
+    else if (cfg->gdr)
         transport = "IBV UC GPU-to-GPU DMA-BUF";
     else if (cfg->use_ibv)
         transport = rx_hs.gdr_dmabuf ? "IBV UC host-to-GPU DMA-BUF" : "IBV Zero-Bounce UC";

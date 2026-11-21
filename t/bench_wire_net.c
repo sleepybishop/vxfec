@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -23,7 +24,10 @@
 #include <unistd.h>
 
 #define WIRE_NET_MAGIC 0x5658574Eu /* "VXWN" */
+#define WIRE_NET_GDR_MAGIC 0x56584752u      /* "VXGR": DMA-BUF required on both peers */
+#define WIRE_NET_PIPELINE_MAGIC 0x56584750u /* "VXGP": two RX DMA-BUF regions */
 #define WIRE_NET_MAX_RAILS 128u
+#define WIRE_NET_IBV_QPS 4u
 #define WIRE_NET_BATCH 64u
 #define WIRE_NET_FLAG_TAIL 0x0001u
 
@@ -50,6 +54,12 @@ typedef struct {
     uint32_t gdr_dmabuf;
     vxfec_ibv_wire_info_t ibv_info;
 } wire_ctrl_handshake_t;
+
+typedef struct {
+    uint64_t iova;
+    uint32_t rkey;
+    uint32_t reserved;
+} wire_rdma_region_t;
 
 typedef struct {
     uint32_t iter;
@@ -87,7 +97,7 @@ static uint64_t splitmix64(uint64_t *state)
 }
 
 static uint64_t count_planned_tx_frames(uint64_t total_frames, uint64_t drop_beg, uint64_t drop_end, uint32_t loss_ppm,
-                                        uint32_t rails, uint16_t iter, bool use_ibv)
+                                        uint32_t rails, uint32_t iter, bool use_ibv)
 {
     uint64_t planned = 0u;
     if (use_ibv) {
@@ -102,7 +112,7 @@ static uint64_t count_planned_tx_frames(uint64_t total_frames, uint64_t drop_beg
         return planned;
     }
     for (uint32_t r = 0; r < rails; r++) {
-        uint64_t rng = 0x123456789abcdef0ULL ^ ((uint64_t)r << 32) ^ (uint64_t)iter;
+        uint64_t rng = 0x123456789abcdef0ULL ^ ((uint64_t)r << 32) ^ (uint16_t)iter;
         for (uint64_t seq = r; seq < total_frames; seq += rails) {
             if (seq >= drop_beg && seq < drop_end)
                 continue;
@@ -673,6 +683,8 @@ typedef struct {
     double rate_gbps;
     uint32_t loss_ppm;
     bool use_ibv;
+    bool gdr;
+    bool pipeline;
     bool wire_only;
     bool bidir_leader;
     bool self_test;
@@ -691,6 +703,337 @@ static int open_bidir_sync_socket(const char *spec, bool leader)
     if (inet_pton(AF_INET, host, &peer_ip) != 1)
         return -1;
     return vxfec_bench_tcp_connect_retry(peer_ip, port, 150, 100000000L);
+}
+
+static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t Z, size_t wpb, uint64_t total_frames,
+                              uint64_t expected_frames, bool require_tails, uint64_t *rx_bits, wire_ctrl_result_t *res)
+{
+    uint32_t it = res->iter;
+    uint64_t rx_frames = 0;
+    uint64_t f_ns = 0, l_ns = 0;
+    uint64_t tail_ns = 0;
+    uint32_t tail_qps = 0u;
+    const uint32_t all_qps = (1u << WIRE_NET_IBV_QPS) - 1u;
+    uint64_t wait_start_ns = now_ns();
+    uint64_t last_prog_ns = wait_start_ns;
+    uint32_t empty_polls = 0;
+    vxfec_ibv_rx_wc_t wcs[64];
+    /* With direct VRAM writes, wait for a completion on every QP before Vulkan can acquire the buffer. */
+    while (require_tails ? tail_qps != all_qps : rx_frames < expected_frames) {
+        uint64_t t_pre = now_ns();
+        uint32_t n = vxfec_ibv_ep_poll_rx(ibv_ep, wcs, 64u);
+        if (vxfec_ibv_ep_has_error(ibv_ep)) {
+            fprintf(stderr, "ERROR: fatal IBV RX completion error at iter %u\n", it);
+            return false;
+        }
+        if (n == 0) {
+            if (!require_tails && tail_ns != 0 && (t_pre - tail_ns) > 50000000ULL)
+                break;
+            /* bound idle wait if unplanned UC drops also lost all 4 tail beacons */
+            if ((f_ns != 0 || tail_ns != 0) && (t_pre - last_prog_ns) > 2000000000ULL)
+                break;
+            if (f_ns == 0 && (t_pre - wait_start_ns) > 15000000000ULL) {
+                fprintf(stderr, "ERROR: timed out waiting for IBV RX burst at iter %u\n", it);
+                return false;
+            }
+            if ((++empty_polls & 1023u) == 0u) {
+                uint8_t probe = 0;
+                ssize_t pr = recv(ctrl_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+                if (pr == 0 || (pr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    fprintf(stderr, "ERROR: peer disconnected ctrl channel during IBV RX at iter %u\n", it);
+                    return false;
+                }
+            }
+            continue;
+        }
+        empty_polls = 0;
+        last_prog_ns = t_pre;
+        uint32_t batch_data = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (wcs[i].has_imm) {
+                uint32_t seq = wcs[i].imm_data;
+                if (seq == UINT32_MAX) {
+                    if (tail_ns == 0)
+                        tail_ns = t_pre;
+                    tail_qps |= 1u << vxfec_ibv_slot_qp(wcs[i].slot_id);
+                } else if ((uint64_t)seq < total_frames) {
+                    vxfec_wire_mark_seq(rx_bits, Z, wpb, (uint64_t)seq);
+                    rx_frames++;
+                    batch_data++;
+                }
+            }
+            if (!vxfec_ibv_ep_repost_rx(ibv_ep, wcs[i].slot_id)) {
+                fprintf(stderr, "ERROR: failed to repost IBV RX slot at iter %u\n", it);
+                return false;
+            }
+        }
+        if (batch_data > 0u) {
+            uint64_t t_post = now_ns();
+            if (f_ns == 0)
+                f_ns = t_pre;
+            l_ns = (t_post > f_ns) ? t_post : (f_ns + 1ULL);
+        }
+    }
+    if (require_tails && tail_qps != all_qps) {
+        fprintf(stderr, "ERROR: RX --gdr did not receive a tail completion from every QP at iter %u\n", it);
+        return false;
+    }
+    res->rx_frames = rx_frames;
+    res->wire_ns = (l_ns > f_ns) ? (l_ns - f_ns) : 1ULL;
+    return true;
+}
+
+typedef struct {
+    vxfec_vk_ctx *ctx;
+    vxfec_wire_ring *ring;
+    vxfec_vk_buf *vram;
+    uint8_t *host;
+    uint8_t *verify;
+    const uint64_t *bits;
+    uint32_t Z;
+    uint32_t K;
+    size_t wpb;
+    size_t sys_bytes;
+    size_t wire_bytes;
+    bool gdr;
+    bool ext_host;
+    bool wire_only;
+} wire_rx_recovery_t;
+
+static void recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *res)
+{
+    vxfec_vk_ctx *ctx = job->ctx;
+    vxfec_vk_buf *rx_vram = job->vram;
+    const uint64_t *rx_bits = job->bits;
+    bool gdr_dmabuf = job->gdr;
+    bool rx_ext_host = job->ext_host;
+    uint32_t Z = job->Z, K = job->K;
+    size_t wpb = job->wpb, sys_bytes = job->sys_bytes;
+    uint64_t dma_ns = 0;
+    uint64_t rec_wall_ns = 0;
+    vxfec_wire_stats st = {0};
+    bool verify_ok = false;
+    bool fatal_err = false;
+
+    bool enough_frames = true;
+    for (uint32_t z = 0; z < Z; z++) {
+        uint32_t cnt = 0;
+        for (size_t w = 0; w < wpb; w++)
+            cnt += (uint32_t)__builtin_popcountll(rx_bits[(size_t)z * wpb + w]);
+        if (cnt < K) {
+            enough_frames = false;
+            break;
+        }
+    }
+
+    if (job->wire_only) {
+        /* verify each block received >= K frames for decodability without CPU llvmpipe simulation */
+        verify_ok = enough_frames;
+    } else {
+        uint64_t dma_t0 = now_ns();
+        bool prep_ok = (gdr_dmabuf || rx_ext_host) ? vxfec_vk_buf_acquire_external(ctx, rx_vram)
+                                                   : vxfec_vk_buf_upload(ctx, rx_vram, job->wire_bytes);
+        dma_ns = now_ns() - dma_t0;
+
+        uint64_t rec_t0 = now_ns();
+        bool rec_ok = prep_ok && vxfec_wire_recover_vram(job->ring, rx_vram, rx_bits, &st);
+        rec_wall_ns = now_ns() - rec_t0;
+
+        if (rec_ok) {
+            if (rx_ext_host && !gdr_dmabuf) {
+                (void)vxfec_vk_buf_release_external(ctx, rx_vram);
+                verify_ok = verify_deterministic_superframe(job->host, sys_bytes);
+            } else {
+                if (vxfec_vk_buf_read_offset(ctx, rx_vram, 0, job->verify, sys_bytes))
+                    verify_ok = verify_deterministic_superframe(job->verify, sys_bytes);
+            }
+            if (!verify_ok) {
+                fprintf(stderr, "ERROR: RX payload verification mismatch at iter %u!\n", res->iter);
+                fatal_err = true;
+            }
+        } else {
+            if (rx_ext_host)
+                (void)vxfec_vk_buf_release_external(ctx, rx_vram);
+            if (!prep_ok) {
+                fprintf(stderr, "ERROR: failed to acquire RX GPU buffer at iter %u\n", res->iter);
+                fatal_err = true;
+            } else if (enough_frames) {
+                fprintf(stderr, "ERROR: RX FEC decode failed despite >= K frames/block at iter %u!\n", res->iter);
+                fatal_err = true;
+            }
+        }
+        if (gdr_dmabuf && !vxfec_vk_buf_release_external(ctx, rx_vram)) {
+            fprintf(stderr, "ERROR: failed to release RX GPU buffer at iter %u\n", res->iter);
+            fatal_err = true;
+            verify_ok = false;
+        }
+    }
+
+    res->ok = verify_ok;
+    res->fatal_err = fatal_err;
+    res->dma_ns = dma_ns;
+    res->recover_wall_ns = rec_wall_ns;
+    res->recover_gpu_ns = st.gpu_exec_ns;
+    res->blocks_repaired = st.blocks_repaired;
+    res->unique_masks = st.unique_masks;
+}
+
+static bool prepare_gdr_buffer(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, uint8_t *scratch, size_t sys_bytes)
+{
+    memset(scratch, 0xa5, sys_bytes);
+    return vxfec_vk_buf_write_offset(ctx, vram, 0, scratch, sys_bytes) && vxfec_vk_buf_release_external(ctx, vram);
+}
+
+typedef struct {
+    uint64_t *latencies_ns;
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint32_t passed;
+} wire_delivery_stats_t;
+
+static void record_delivery(wire_delivery_stats_t *stats, const wire_ctrl_result_t *res, uint64_t ready_ns, uint64_t done_ns)
+{
+    if (stats->start_ns == 0u)
+        stats->start_ns = ready_ns;
+    stats->end_ns = done_ns;
+    if (res->ok)
+        stats->latencies_ns[stats->passed++] = done_ns - ready_ns;
+}
+
+static int compare_duration(const void *a, const void *b)
+{
+    uint64_t left = *(const uint64_t *)a;
+    uint64_t right = *(const uint64_t *)b;
+    return (left > right) - (left < right);
+}
+
+static void report_delivery(wire_delivery_stats_t *stats, uint32_t iters, size_t sys_bytes)
+{
+    printf("  RX verified %u/%u superframes", stats->passed, iters);
+    if (stats->passed > 0u) {
+        uint64_t span_ns = stats->end_ns - stats->start_ns;
+        qsort(stats->latencies_ns, stats->passed, sizeof(*stats->latencies_ns), compare_duration);
+        uint32_t p99 = (99u * stats->passed + 99u) / 100u - 1u;
+        double goodput = (8.0 * (double)sys_bytes * stats->passed) / (double)(span_ns ? span_ns : 1u);
+        printf(" | Verified goodput=%.2f Gbps | RX ready-to-verified p99=%.3f ms", goodput, (double)stats->latencies_ns[p99] / 1e6);
+    }
+    putchar('\n');
+}
+
+typedef struct {
+    sem_t work;
+    sem_t done;
+    bool stop;
+    bool reuse;
+    wire_rx_recovery_t job;
+    wire_ctrl_result_t result;
+    uint64_t completed_ns;
+} wire_recovery_worker_t;
+
+static void wait_for_work_signal(sem_t *signal)
+{
+    while (sem_wait(signal) != 0 && errno == EINTR) {
+    }
+}
+
+static void *recover_wire_frames(void *arg)
+{
+    wire_recovery_worker_t *worker = arg;
+    for (;;) {
+        wait_for_work_signal(&worker->work);
+        if (worker->stop)
+            return NULL;
+        recover_rx_frame(&worker->job, &worker->result);
+        worker->completed_ns = now_ns();
+        if (worker->reuse && !worker->result.fatal_err &&
+            !prepare_gdr_buffer(worker->job.ctx, worker->job.vram, worker->job.verify, worker->job.sys_bytes)) {
+            fprintf(stderr, "ERROR: failed to prepare pipelined RX buffer after iter %u\n", worker->result.iter);
+            worker->result.fatal_err = true;
+        }
+        sem_post(&worker->done);
+    }
+}
+
+static bool receive_pipelined_frames(int ctrl_fd, vxfec_ibv_ep_t *ep, const wire_ctrl_handshake_t *hs, wire_rx_recovery_t job,
+                                     vxfec_vk_buf *second_vram, uint64_t *masks, wire_delivery_stats_t *stats)
+{
+    wire_recovery_worker_t worker = {0};
+    if (sem_init(&worker.work, 0, 0) != 0) {
+        perror("RX pipeline work semaphore");
+        return false;
+    }
+    if (sem_init(&worker.done, 0, 0) != 0) {
+        perror("RX pipeline completion semaphore");
+        sem_destroy(&worker.work);
+        return false;
+    }
+    pthread_t thread;
+    int err = pthread_create(&thread, NULL, recover_wire_frames, &worker);
+    if (err != 0) {
+        fprintf(stderr, "ERROR: could not start RX recovery worker: %s\n", strerror(err));
+        sem_destroy(&worker.done);
+        sem_destroy(&worker.work);
+        return false;
+    }
+
+    bool ok = true;
+    uint64_t pending_ready_ns = 0u;
+    size_t mask_words = (size_t)job.Z * job.wpb;
+    uint64_t total_frames = (uint64_t)(hs->K + hs->P) * hs->Z;
+    for (uint32_t it = 1; it <= hs->iters; it++) {
+        uint64_t expected_frames;
+        uint64_t *bits = masks + ((it - 1u) % 2u) * mask_words;
+        memset(bits, 0, mask_words * sizeof(*bits));
+        wire_ctrl_result_t received = {.iter = it};
+        if (!read_all(ctrl_fd, &expected_frames, sizeof(expected_frames))) {
+            ok = false;
+            break;
+        }
+        uint64_t ready_ns = now_ns();
+        /* The ACK grants access to this slot. Its previous recovery and reinitialization already finished. */
+        if (!write_all(ctrl_fd, &it, sizeof(it)) ||
+            !receive_ibv_frame(ep, ctrl_fd, job.Z, job.wpb, total_frames, expected_frames, true, bits, &received)) {
+            ok = false;
+            break;
+        }
+        if (pending_ready_ns != 0u) {
+            /* The sender reads the previous result after posting this frame's writes. */
+            wait_for_work_signal(&worker.done);
+            record_delivery(stats, &worker.result, pending_ready_ns, worker.completed_ns);
+            pending_ready_ns = 0u;
+            if (!write_all(ctrl_fd, &worker.result, sizeof(worker.result)) || worker.result.fatal_err) {
+                ok = false;
+                break;
+            }
+        }
+        worker.job = job;
+        worker.job.vram = (it % 2u == 0u) ? second_vram : job.vram;
+        worker.job.bits = bits;
+        worker.result = received;
+        worker.reuse = it + 2u <= hs->iters;
+        pending_ready_ns = ready_ns;
+        sem_post(&worker.work);
+    }
+    if (pending_ready_ns != 0u) {
+        wait_for_work_signal(&worker.done);
+        record_delivery(stats, &worker.result, pending_ready_ns, worker.completed_ns);
+        if (ok)
+            ok = write_all(ctrl_fd, &worker.result, sizeof(worker.result)) && !worker.result.fatal_err;
+    }
+
+    worker.stop = true;
+    sem_post(&worker.work);
+    pthread_join(thread, NULL);
+    sem_destroy(&worker.done);
+    sem_destroy(&worker.work);
+    return ok;
+}
+
+static uint32_t wire_handshake_magic(const wire_cli_cfg_t *cfg)
+{
+    if (cfg->pipeline)
+        return WIRE_NET_PIPELINE_MAGIC;
+    return cfg->gdr ? WIRE_NET_GDR_MAGIC : WIRE_NET_MAGIC;
 }
 
 static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out_retain_vk)
@@ -736,8 +1079,10 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     (void)setsockopt(ctrl_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     wire_ctrl_handshake_t tx_hs;
-    if (!read_all(ctrl_fd, &tx_hs, sizeof(tx_hs)) || tx_hs.magic != WIRE_NET_MAGIC) {
-        fprintf(stderr, "Invalid handshake from TX peer\n");
+    uint32_t expected_magic = wire_handshake_magic(cfg);
+    if (!read_all(ctrl_fd, &tx_hs, sizeof(tx_hs)) || tx_hs.magic != expected_magic ||
+        (cfg->gdr && (!tx_hs.use_ibv || tx_hs.wire_only))) {
+        fprintf(stderr, "Invalid handshake from TX peer (TX and RX need matching --gdr and --pipeline options)\n");
         close(ctrl_fd);
         close(listen_fd);
         return 1;
@@ -760,26 +1105,33 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
     vxfec_wire_ring *rx_ring = tx_hs.wire_only ? NULL : vxfec_wire_ring_new_ex(ctx, (int)tx_hs.codec, Z, K, P, T, 0u, false, true);
     uint8_t *rx_host = NULL;
-    if (posix_memalign((void **)&rx_host, page_sz, aligned_wire) != 0)
+    if (!cfg->gdr && posix_memalign((void **)&rx_host, page_sz, aligned_wire) != 0)
         rx_host = NULL;
     uint8_t *rx_verify = (uint8_t *)malloc(sys_bytes);
     _Atomic uint64_t *rx_bits_atomic = (_Atomic uint64_t *)calloc((size_t)Z * wpb, sizeof(_Atomic uint64_t));
-    uint64_t *rx_bits = (uint64_t *)calloc((size_t)Z * wpb, sizeof(uint64_t));
+    uint64_t *rx_bits = (uint64_t *)calloc((size_t)Z * wpb * (cfg->pipeline ? 2u : 1u), sizeof(uint64_t));
+    wire_delivery_stats_t stats = {0};
+    if (cfg->gdr)
+        stats.latencies_ns = (uint64_t *)calloc(tx_hs.iters, sizeof(*stats.latencies_ns));
 
     vxfec_vk_buf *rx_vram = NULL;
+    vxfec_vk_buf *second_vram = NULL;
     bool rx_ext_host = false;
     bool gdr_dmabuf = false;
     bool rx_aborted = true;
     int dmabuf_fd = -1;
+    int second_fd = -1;
     int rx_fds[WIRE_NET_MAX_RAILS];
     uint32_t rails = 0;
 
     vxfec_ibv_ctx_t *ibv_ctx = NULL;
     vxfec_ibv_mr_t *ibv_mr = NULL;
+    vxfec_ibv_mr_t *second_mr = NULL;
     vxfec_ibv_ep_t *ibv_ep = NULL;
     wire_ctrl_handshake_t rx_hs = tx_hs;
 
-    if (!rx_host || !rx_verify || !rx_bits_atomic || !rx_bits || (!tx_hs.wire_only && !rx_ring)) {
+    if ((!cfg->gdr && !rx_host) || !rx_verify || !rx_bits_atomic || !rx_bits || (!tx_hs.wire_only && !rx_ring) ||
+        (cfg->gdr && !stats.latencies_ns)) {
         fprintf(stderr, "Failed to allocate RX superframe buffers/ring\n");
         goto cleanup;
     }
@@ -793,7 +1145,9 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         if (vxfec_vk_has_dmabuf_export(ctx)) {
             rx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &dmabuf_fd);
             if (rx_vram && dmabuf_fd >= 0) {
-                ibv_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, aligned_wire, (uint64_t)(uintptr_t)rx_host, dmabuf_fd, true);
+                /* A DMA-BUF MR uses a page-aligned IOVA, independent of any host mapping. */
+                uint64_t iova = cfg->gdr ? page_sz : (uint64_t)(uintptr_t)rx_host;
+                ibv_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, aligned_wire, iova, dmabuf_fd, true);
                 if (ibv_mr)
                     gdr_dmabuf = true;
                 else {
@@ -807,6 +1161,10 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 rx_vram = NULL;
             }
         }
+        if (cfg->gdr && !gdr_dmabuf) {
+            fprintf(stderr, "RX --gdr failed to export or register a GPU DMA-BUF\n");
+            goto cleanup;
+        }
         if (!ibv_mr) {
             if (vxfec_vk_has_ext_host_mem(ctx)) {
                 rx_vram = vxfec_vk_buf_import_host_ptr(ctx, rx_host, aligned_wire);
@@ -819,7 +1177,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             if (mr_ptr)
                 ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, mr_ptr, wire_bytes, true);
         }
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, 4u, 256u, false, true, &rx_hs.ibv_info);
+        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, WIRE_NET_IBV_QPS, 256u, false, true, &rx_hs.ibv_info);
         if (!ibv_mr || !ibv_ep || !vxfec_ibv_ep_connect(ibv_ep, &tx_hs.ibv_info, 0)) {
             fprintf(stderr, "Failed to setup RX ibverbs endpoint/MR\n");
             goto cleanup;
@@ -868,8 +1226,43 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         rx_hs.rails = rails;
     }
 
-    if (!write_all(ctrl_fd, &rx_hs, sizeof(rx_hs)))
+    wire_rdma_region_t second_region = {0};
+    if (cfg->pipeline) {
+        second_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &second_fd);
+        if (second_vram)
+            second_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, aligned_wire, (uint64_t)page_sz + aligned_wire, second_fd, true);
+        if (!second_mr || !prepare_gdr_buffer(ctx, rx_vram, rx_verify, sys_bytes) ||
+            !prepare_gdr_buffer(ctx, second_vram, rx_verify, sys_bytes)) {
+            fprintf(stderr, "ERROR: could not register and prepare both pipelined RX GPU buffers\n");
+            goto cleanup;
+        }
+        second_region.iova = vxfec_ibv_mr_iova(second_mr);
+        second_region.rkey = vxfec_ibv_mr_rkey(second_mr);
+    }
+
+    if (!write_all(ctrl_fd, &rx_hs, sizeof(rx_hs)) || (cfg->pipeline && !write_all(ctrl_fd, &second_region, sizeof(second_region))))
         goto cleanup;
+
+    wire_rx_recovery_t job = {
+        .ctx = ctx,
+        .ring = rx_ring,
+        .vram = rx_vram,
+        .host = rx_host,
+        .verify = rx_verify,
+        .bits = rx_bits,
+        .Z = Z,
+        .K = K,
+        .wpb = wpb,
+        .sys_bytes = sys_bytes,
+        .wire_bytes = wire_bytes,
+        .gdr = gdr_dmabuf,
+        .ext_host = rx_ext_host,
+        .wire_only = tx_hs.wire_only,
+    };
+    if (cfg->pipeline) {
+        rx_aborted = !receive_pipelined_frames(ctrl_fd, ibv_ep, &tx_hs, job, second_vram, rx_bits, &stats);
+        goto cleanup;
+    }
 
     rx_aborted = false;
     uint64_t total_frames = (uint64_t)(K + P) * Z;
@@ -886,8 +1279,8 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         if (!tx_hs.wire_only) {
             /* poison systematic buffer before each iteration so stale bytes cannot pass verification */
             if (gdr_dmabuf) {
-                memset(rx_verify, 0xa5, sys_bytes);
-                if (!vxfec_vk_buf_write_offset(ctx, rx_vram, 0, rx_verify, sys_bytes)) {
+                if (!prepare_gdr_buffer(ctx, rx_vram, rx_verify, sys_bytes)) {
+                    fprintf(stderr, "ERROR: failed to prepare RX GPU buffer at iter %u\n", it);
                     rx_aborted = true;
                     break;
                 }
@@ -902,84 +1295,23 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
         uint64_t rx_frames = 0;
         uint64_t wire_ns = 1ULL;
+        uint64_t ready_ns = 0u;
 
         if (tx_hs.use_ibv) {
             uint32_t ready_ack = it;
+            if (cfg->gdr)
+                ready_ns = now_ns();
             if (!write_all(ctrl_fd, &ready_ack, sizeof(ready_ack))) {
                 rx_aborted = true;
                 break;
             }
-            uint64_t f_ns = 0, l_ns = 0;
-            uint64_t tail_ns = 0;
-            uint64_t wait_start_ns = now_ns();
-            uint64_t last_prog_ns = wait_start_ns;
-            uint32_t empty_polls = 0;
-            vxfec_ibv_rx_wc_t wcs[64];
-            while (rx_frames < expected_frames) {
-                uint64_t t_pre = now_ns();
-                uint32_t n = vxfec_ibv_ep_poll_rx(ibv_ep, wcs, 64u);
-                if (vxfec_ibv_ep_has_error(ibv_ep)) {
-                    fprintf(stderr, "ERROR: fatal IBV RX completion error at iter %u\n", it);
-                    rx_aborted = true;
-                    break;
-                }
-                if (n == 0) {
-                    if (tail_ns != 0 && (t_pre - tail_ns) > 50000000ULL)
-                        break;
-                    /* bound idle wait if unplanned UC drops also lost all 4 tail beacons */
-                    if (f_ns != 0 && (t_pre - last_prog_ns) > 2000000000ULL)
-                        break;
-                    if (f_ns == 0 && (t_pre - wait_start_ns) > 15000000000ULL) {
-                        fprintf(stderr, "ERROR: timed out waiting for IBV RX burst at iter %u\n", it);
-                        rx_aborted = true;
-                        break;
-                    }
-                    if ((++empty_polls & 1023u) == 0u) {
-                        uint8_t probe = 0;
-                        ssize_t pr = recv(ctrl_fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-                        if (pr == 0 || (pr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-                            fprintf(stderr, "ERROR: peer disconnected ctrl channel during IBV RX at iter %u\n", it);
-                            rx_aborted = true;
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                empty_polls = 0;
-                last_prog_ns = t_pre;
-                uint32_t batch_data = 0;
-                for (uint32_t i = 0; i < n; i++) {
-                    if (wcs[i].has_imm) {
-                        uint32_t seq = wcs[i].imm_data;
-                        if (seq == UINT32_MAX) {
-                            if (tail_ns == 0)
-                                tail_ns = t_pre;
-                        } else if ((uint64_t)seq < total_frames) {
-                            vxfec_wire_mark_seq(rx_bits, Z, wpb, (uint64_t)seq);
-                            rx_frames++;
-                            batch_data++;
-                        }
-                    }
-                    if (!vxfec_ibv_ep_repost_rx(ibv_ep, wcs[i].slot_id)) {
-                        fprintf(stderr, "ERROR: failed to repost IBV RX slot at iter %u\n", it);
-                        rx_aborted = true;
-                        break;
-                    }
-                }
-                if (batch_data > 0u) {
-                    uint64_t t_post = now_ns();
-                    if (f_ns == 0)
-                        f_ns = t_pre;
-                    l_ns = (t_post > f_ns) ? t_post : (f_ns + 1ULL);
-                }
-                if (rx_aborted)
-                    break;
-                if (tail_ns != 0 && rx_frames >= expected_frames)
-                    break;
-            }
-            if (rx_aborted)
+            wire_ctrl_result_t received = {.iter = it};
+            if (!receive_ibv_frame(ibv_ep, ctrl_fd, Z, wpb, total_frames, expected_frames, cfg->gdr, rx_bits, &received)) {
+                rx_aborted = true;
                 break;
-            wire_ns = (l_ns > f_ns) ? (l_ns - f_ns) : 1ULL;
+            }
+            rx_frames = received.rx_frames;
+            wire_ns = received.wire_ns;
         } else {
             _Atomic uint32_t ready_workers = 0;
             _Atomic uint64_t rx_cnt = 0;
@@ -1052,81 +1384,19 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             wire_ns = (fn != UINT64_MAX && ln > fn) ? (ln - fn) : 1ULL;
         }
 
-        uint64_t dma_ns = 0;
-        uint64_t rec_wall_ns = 0;
-        vxfec_wire_stats st = {0};
-        bool verify_ok = false;
-        bool fatal_err = false;
-
-        bool enough_frames = true;
-        for (uint32_t z = 0; z < Z; z++) {
-            uint32_t cnt = 0;
-            for (size_t w = 0; w < wpb; w++)
-                cnt += (uint32_t)__builtin_popcountll(rx_bits[(size_t)z * wpb + w]);
-            if (cnt < K) {
-                enough_frames = false;
-                break;
-            }
-        }
-
-        if (tx_hs.wire_only) {
-            /* verify each block received >= K frames for decodability without CPU llvmpipe simulation */
-            verify_ok = enough_frames;
-        } else {
-            uint64_t dma_t0 = now_ns();
-            bool prep_ok = (gdr_dmabuf || rx_ext_host) ? vxfec_vk_buf_acquire_external(ctx, rx_vram)
-                                                       : vxfec_vk_buf_upload(ctx, rx_vram, wire_bytes);
-            dma_ns = now_ns() - dma_t0;
-
-            uint64_t rec_t0 = now_ns();
-            bool rec_ok = prep_ok && vxfec_wire_recover_vram(rx_ring, rx_vram, rx_bits, &st);
-            rec_wall_ns = now_ns() - rec_t0;
-
-            if (rec_ok) {
-                if (rx_ext_host && !gdr_dmabuf) {
-                    (void)vxfec_vk_buf_release_external(ctx, rx_vram);
-                    verify_ok = verify_deterministic_superframe(rx_host, sys_bytes);
-                } else {
-                    if (vxfec_vk_buf_read_offset(ctx, rx_vram, 0, rx_verify, sys_bytes))
-                        verify_ok = verify_deterministic_superframe(rx_verify, sys_bytes);
-                    if (gdr_dmabuf)
-                        (void)vxfec_vk_buf_release_external(ctx, rx_vram);
-                }
-                if (!verify_ok) {
-                    fprintf(stderr, "ERROR: RX payload verification mismatch at iter %u!\n", it);
-                    fatal_err = true;
-                }
-            } else {
-                if (gdr_dmabuf || rx_ext_host)
-                    (void)vxfec_vk_buf_release_external(ctx, rx_vram);
-                if (enough_frames) {
-                    fprintf(stderr, "ERROR: RX FEC decode failed despite >= K frames/block at iter %u!\n", it);
-                    fatal_err = true;
-                }
-            }
-        }
-
-        wire_ctrl_result_t res = {
-            .iter = it,
-            .ok = verify_ok ? 1u : 0u,
-            .fatal_err = fatal_err ? 1u : 0u,
-            .rx_frames = rx_frames,
-            .wire_ns = wire_ns,
-            .dma_ns = dma_ns,
-            .recover_wall_ns = rec_wall_ns,
-            .recover_gpu_ns = st.gpu_exec_ns,
-            .blocks_repaired = st.blocks_repaired,
-            .unique_masks = st.unique_masks,
-        };
-        if (!write_all(ctrl_fd, &res, sizeof(res)))
-            break;
-        if (fatal_err) {
+        wire_ctrl_result_t res = {.iter = it, .rx_frames = rx_frames, .wire_ns = wire_ns};
+        recover_rx_frame(&job, &res);
+        if (cfg->gdr)
+            record_delivery(&stats, &res, ready_ns, now_ns());
+        if (!write_all(ctrl_fd, &res, sizeof(res)) || res.fatal_err) {
             rx_aborted = true;
             break;
         }
     }
 
 cleanup:
+    if (stats.start_ns != 0u)
+        report_delivery(&stats, tx_hs.iters, sys_bytes);
     for (uint32_t r = 0; r < rails; r++)
         close(rx_fds[r]);
     bool ibv_quiesced = !ibv_ep || vxfec_ibv_ep_destroy(ibv_ep);
@@ -1137,6 +1407,8 @@ cleanup:
             *out_retain_vk = true;
     }
     if (ibv_quiesced) {
+        if (second_mr)
+            vxfec_ibv_mr_dereg(second_mr);
         if (ibv_mr)
             vxfec_ibv_mr_dereg(ibv_mr);
         if (ibv_ctx)
@@ -1145,6 +1417,9 @@ cleanup:
     if (ibv_quiesced && vk_quiesced) {
         vxfec_wire_ring_free(rx_ring);
         vxfec_vk_buf_free(ctx, rx_vram);
+        vxfec_vk_buf_free(ctx, second_vram);
+        if (second_fd >= 0)
+            close(second_fd);
         if (dmabuf_fd >= 0)
             close(dmabuf_fd);
         free(rx_host);
@@ -1152,6 +1427,7 @@ cleanup:
     free(rx_bits);
     free(rx_bits_atomic);
     free(rx_verify);
+    free(stats.latencies_ns);
     close(ctrl_fd);
     close(listen_fd);
     return rx_aborted ? 1 : 0;
@@ -1179,7 +1455,18 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     size_t wire_bytes = (size_t)Z * (K + P) * T;
     uint64_t total_frames = (uint64_t)(K + P) * Z;
 
-    uint8_t *tx_host = (uint8_t *)malloc(wire_bytes);
+    size_t dmabuf_bytes = 0u;
+    size_t page_sz = 0u;
+    if (cfg->gdr) {
+        page_sz = (size_t)sysconf(_SC_PAGESIZE);
+        if (wire_bytes > SIZE_MAX - page_sz) {
+            fprintf(stderr, "TX superframe is too large for page-aligned DMA-BUF registration\n");
+            close(ctrl_fd);
+            return 1;
+        }
+        dmabuf_bytes = (wire_bytes + page_sz - 1u) & ~(page_sz - 1u);
+    }
+    uint8_t *tx_host = (uint8_t *)malloc(cfg->gdr ? sys_bytes : wire_bytes);
     if (!tx_host) {
         close(ctrl_fd);
         return 1;
@@ -1188,6 +1475,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     fill_deterministic_superframe(tx_host, sys_bytes);
     vxfec_wire_ring *tx_ring = NULL;
     vxfec_vk_buf *tx_vram = NULL;
+    int dmabuf_fd = -1;
     vxfec_ibv_ctx_t *ibv_ctx = NULL;
     vxfec_ibv_mr_t *ibv_mr = NULL;
     vxfec_ibv_ep_t *ibv_ep = NULL;
@@ -1200,17 +1488,28 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         fill_deterministic_superframe(tx_host + sys_bytes, wire_bytes - sys_bytes);
     } else {
         tx_ring = vxfec_wire_ring_new_ex(ctx, cfg->codec, Z, K, P, T, 0u, true, false);
-        tx_vram = vxfec_vk_buf_new(ctx, wire_bytes, false);
+        tx_vram =
+            cfg->gdr ? vxfec_vk_buf_new_exportable(ctx, dmabuf_bytes, true, &dmabuf_fd) : vxfec_vk_buf_new(ctx, wire_bytes, false);
+        if (cfg->gdr && !tx_vram) {
+            fprintf(stderr, "TX --gdr failed to allocate/export a GPU DMA-BUF\n");
+            goto tx_cleanup;
+        }
         if (!tx_ring || !tx_vram || !vxfec_vk_buf_write_offset(ctx, tx_vram, 0, tx_host, sys_bytes) ||
-            !vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) || !vxfec_vk_buf_read_offset(ctx, tx_vram, 0, tx_host, wire_bytes)) {
+            !vxfec_wire_encode_vram(tx_ring, tx_vram, NULL) ||
+            (cfg->gdr ? !vxfec_vk_buf_release_external(ctx, tx_vram)
+                      : !vxfec_vk_buf_read_offset(ctx, tx_vram, 0, tx_host, wire_bytes))) {
             fprintf(stderr, "TX superframe GPU encode failed\n");
             goto tx_cleanup;
+        }
+        if (cfg->gdr) {
+            free(tx_host);
+            tx_host = NULL;
         }
     }
 
     wire_ctrl_handshake_t hs;
     memset(&hs, 0, sizeof(hs));
-    hs.magic = WIRE_NET_MAGIC;
+    hs.magic = wire_handshake_magic(cfg);
     hs.codec = (uint32_t)cfg->codec;
     hs.Z = Z;
     hs.K = K;
@@ -1227,8 +1526,13 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             fprintf(stderr, "TX requested --ibv but no active RDMA device found\n");
             goto tx_cleanup;
         }
-        ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, 4u, 256u, true, false, &hs.ibv_info);
+        ibv_mr = cfg->gdr ? vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, dmabuf_bytes, page_sz, dmabuf_fd, false)
+                          : vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
+        if (cfg->gdr && !ibv_mr) {
+            fprintf(stderr, "TX --gdr failed to register the GPU DMA-BUF with ibverbs\n");
+            goto tx_cleanup;
+        }
+        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, WIRE_NET_IBV_QPS, 256u, true, false, &hs.ibv_info);
         if (!ibv_mr || !ibv_ep) {
             fprintf(stderr, "TX failed to create ibverbs MR/EP\n");
             goto tx_cleanup;
@@ -1236,8 +1540,17 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     }
 
     wire_ctrl_handshake_t rx_hs;
-    if (!write_all(ctrl_fd, &hs, sizeof(hs)) || !read_all(ctrl_fd, &rx_hs, sizeof(rx_hs))) {
+    if (!write_all(ctrl_fd, &hs, sizeof(hs)) || !read_all(ctrl_fd, &rx_hs, sizeof(rx_hs)) || rx_hs.magic != hs.magic) {
         fprintf(stderr, "TX/RX handshake failed\n");
+        goto tx_cleanup;
+    }
+    if (cfg->gdr && !rx_hs.gdr_dmabuf) {
+        fprintf(stderr, "TX --gdr requires a GPU DMA-BUF MR from RX\n");
+        goto tx_cleanup;
+    }
+    wire_rdma_region_t regions[2] = {{.iova = rx_hs.remote_iova, .rkey = rx_hs.remote_rkey}, {0}};
+    if (cfg->pipeline && (!read_all(ctrl_fd, &regions[1], sizeof(regions[1])) || regions[1].iova == 0u)) {
+        fprintf(stderr, "TX --pipeline requires a second registered RX GPU buffer\n");
         goto tx_cleanup;
     }
     if (cfg->use_ibv && !vxfec_ibv_ep_connect(ibv_ep, &rx_hs.ibv_info, 0)) {
@@ -1245,8 +1558,13 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         goto tx_cleanup;
     }
 
+    if (cfg->use_ibv && T > vxfec_ibv_ep_path_mtu(ibv_ep)) {
+        fprintf(stderr, "TX --sym-t %u exceeds the RDMA path MTU of %u bytes\n", T, vxfec_ibv_ep_path_mtu(ibv_ep));
+        goto tx_cleanup;
+    }
+
     struct sockaddr_in peer_addrs[WIRE_NET_MAX_RAILS];
-    uint32_t rails = cfg->use_ibv ? 4u : rx_hs.rails;
+    uint32_t rails = cfg->use_ibv ? WIRE_NET_IBV_QPS : rx_hs.rails;
     if (!cfg->use_ibv) {
         uint32_t idx = 0;
         for (uint32_t ip_i = 0; ip_i < n_peers && idx < rails && idx < WIRE_NET_MAX_RAILS; ip_i++) {
@@ -1287,51 +1605,60 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     uint32_t last_rep = 0, last_masks = 0, pass_count = 0;
 
     printf("===========================================================================================================\n");
-    printf("vxfec Multi-Rail Wire -> VRAM Superframe Benchmark (%s%s, Z=%u K=%u P=%u T=%u B, %.1f MiB)\n",
-           cfg->use_ibv ? (rx_hs.gdr_dmabuf ? "IBV GPUDirect DMA-BUF" : "IBV Zero-Bounce UC") : "Multi-NIC UDP",
+    const char *transport = "Multi-NIC UDP";
+    if (cfg->pipeline)
+        transport = "IBV UC GPU-to-GPU DMA-BUF, two RX buffers";
+    else if (cfg->gdr)
+        transport = "IBV UC GPU-to-GPU DMA-BUF";
+    else if (cfg->use_ibv)
+        transport = rx_hs.gdr_dmabuf ? "IBV UC host-to-GPU DMA-BUF" : "IBV Zero-Bounce UC";
+    printf("vxfec Multi-Rail Wire -> VRAM Superframe Benchmark (%s%s, Z=%u K=%u P=%u T=%u B, %.1f MiB)\n", transport,
            cfg->wire_only ? ", wire-only" : "", Z, K, P, T, (double)sys_bytes / (1024.0 * 1024.0));
     printf("===========================================================================================================\n");
 
+    struct wire_tx_sample {
+        uint64_t planned_frames;
+        uint64_t started_ns;
+        uint64_t wire_ns;
+    } samples[2];
+    /* In pipeline mode, send the next frame before waiting for the previous recovery result. */
+    const uint32_t result_lag = cfg->pipeline ? 1u : 0u;
     bool tx_aborted = false;
-    for (uint32_t it = 1; it <= cfg->iters; it++) {
-        uint64_t planned_frames =
-            count_planned_tx_frames(total_frames, drop_beg, drop_end, cfg->loss_ppm, rails, (uint16_t)it, cfg->use_ibv);
-        if (bidir_fd >= 0) {
-            uint32_t peer_it = 0;
-            if (!write_all(bidir_fd, &it, sizeof(it)) || !read_all(bidir_fd, &peer_it, sizeof(peer_it)) || peer_it != it) {
+    for (uint32_t send_it = 1; send_it <= cfg->iters + result_lag; send_it++) {
+        if (send_it <= cfg->iters) {
+            uint32_t it = send_it;
+            uint64_t planned_frames =
+                count_planned_tx_frames(total_frames, drop_beg, drop_end, cfg->loss_ppm, rails, it, cfg->use_ibv);
+            if (bidir_fd >= 0) {
+                uint32_t peer_it = 0;
+                if (!write_all(bidir_fd, &it, sizeof(it)) || !read_all(bidir_fd, &peer_it, sizeof(peer_it)) || peer_it != it) {
+                    tx_aborted = true;
+                    break;
+                }
+            }
+            uint64_t iter_wall_t0 = now_ns();
+            uint32_t ready_ack = 0;
+            if (!write_all(ctrl_fd, &planned_frames, sizeof(planned_frames)) || !read_all(ctrl_fd, &ready_ack, sizeof(ready_ack)) ||
+                ready_ack != it) {
                 tx_aborted = true;
                 break;
             }
-        }
-        uint64_t iter_wall_t0 = now_ns();
-        uint32_t ready_ack = 0;
-        if (!write_all(ctrl_fd, &planned_frames, sizeof(planned_frames)) || !read_all(ctrl_fd, &ready_ack, sizeof(ready_ack))) {
-            tx_aborted = true;
-            break;
-        }
-        uint64_t tx_wire_t0 = now_ns();
+            uint64_t tx_wire_t0 = now_ns();
 
-        if (cfg->use_ibv) {
-            uint64_t rng = 0x9876543210fedcbaULL ^ it;
-            uint32_t lkey = vxfec_ibv_mr_lkey(ibv_mr);
-            for (uint64_t seq = 0; seq < total_frames; seq++) {
-                if (seq >= drop_beg && seq < drop_end)
-                    continue;
-                if (cfg->loss_ppm > 0 && (splitmix64(&rng) % 1000000ULL) < cfg->loss_ppm)
-                    continue;
-                while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, (uint32_t)(seq & 3u), tx_host + seq * (size_t)T, T, lkey,
-                                                    rx_hs.remote_iova + seq * (uint64_t)T, rx_hs.remote_rkey, (uint32_t)seq)) {
-                    vxfec_ibv_ep_drain_tx(ibv_ep);
-                    if (vxfec_ibv_ep_has_error(ibv_ep))
-                        break;
-                }
-                if (vxfec_ibv_ep_has_error(ibv_ep))
-                    break;
-            }
-            if (!vxfec_ibv_ep_has_error(ibv_ep)) {
-                for (uint32_t q = 0; q < 4u; q++) {
-                    while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, q, tx_host, 0u, lkey, rx_hs.remote_iova, rx_hs.remote_rkey,
-                                                        UINT32_MAX)) {
+            if (cfg->use_ibv) {
+                uint64_t rng = 0x9876543210fedcbaULL ^ it;
+                uint32_t lkey = vxfec_ibv_mr_lkey(ibv_mr);
+                uint64_t src_iova = vxfec_ibv_mr_iova(ibv_mr);
+                const wire_rdma_region_t *region = &regions[(it - 1u) % (result_lag + 1u)];
+                for (uint64_t seq = 0; seq < total_frames; seq++) {
+                    if (seq >= drop_beg && seq < drop_end)
+                        continue;
+                    if (cfg->loss_ppm > 0 && (splitmix64(&rng) % 1000000ULL) < cfg->loss_ppm)
+                        continue;
+                    uint64_t offset = seq * (uint64_t)T;
+                    const void *src = (const void *)(uintptr_t)(src_iova + offset);
+                    while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, (uint32_t)(seq % WIRE_NET_IBV_QPS), src, T, lkey,
+                                                        region->iova + offset, region->rkey, (uint32_t)seq)) {
                         vxfec_ibv_ep_drain_tx(ibv_ep);
                         if (vxfec_ibv_ep_has_error(ibv_ep))
                             break;
@@ -1339,61 +1666,81 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                     if (vxfec_ibv_ep_has_error(ibv_ep))
                         break;
                 }
-                vxfec_ibv_ep_drain_tx(ibv_ep);
-            }
-            if (vxfec_ibv_ep_has_error(ibv_ep)) {
-                fprintf(stderr, "ERROR: TX ibverbs fatal CQ/send failure at iter %u\n", it);
-                tx_aborted = true;
-                shutdown(ctrl_fd, SHUT_RDWR);
-                break;
-            }
-        } else {
-            pthread_t tx_th[WIRE_NET_MAX_RAILS];
-            udp_tx_worker_t tx_w[WIRE_NET_MAX_RAILS];
-            uint32_t started_tx = 0;
-            double rail_rate = (cfg->rate_gbps > 0.0 && rails > 0u) ? (cfg->rate_gbps / (double)rails) : 0.0;
-            for (uint32_t r = 0; r < rails; r++) {
-                tx_w[r] = (udp_tx_worker_t){
-                    .fd = tx_fds[r],
-                    .peer = peer_addrs[r],
-                    .wire_src = tx_host,
-                    .rail_idx = r,
-                    .num_rails = rails,
-                    .T = T,
-                    .iter = (uint16_t)it,
-                    .total_frames = total_frames,
-                    .drop_beg = drop_beg,
-                    .drop_end = drop_end,
-                    .loss_ppm = cfg->loss_ppm,
-                    .rail_rate_gbps = rail_rate,
-                    .sent_frames = 0u,
-                };
-                if (pthread_create(&tx_th[r], NULL, udp_tx_worker_fn, &tx_w[r]) != 0) {
+                if (!vxfec_ibv_ep_has_error(ibv_ep)) {
+                    for (uint32_t q = 0; q < WIRE_NET_IBV_QPS; q++) {
+                        while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, q, NULL, 0u, lkey, region->iova, region->rkey, UINT32_MAX)) {
+                            vxfec_ibv_ep_drain_tx(ibv_ep);
+                            if (vxfec_ibv_ep_has_error(ibv_ep))
+                                break;
+                        }
+                        if (vxfec_ibv_ep_has_error(ibv_ep))
+                            break;
+                    }
+                    vxfec_ibv_ep_drain_tx(ibv_ep);
+                }
+                if (vxfec_ibv_ep_has_error(ibv_ep)) {
+                    fprintf(stderr, "ERROR: TX ibverbs fatal CQ/send failure at iter %u\n", it);
                     tx_aborted = true;
+                    shutdown(ctrl_fd, SHUT_RDWR);
                     break;
                 }
-                started_tx++;
+            } else {
+                pthread_t tx_th[WIRE_NET_MAX_RAILS];
+                udp_tx_worker_t tx_w[WIRE_NET_MAX_RAILS];
+                uint32_t started_tx = 0;
+                double rail_rate = (cfg->rate_gbps > 0.0 && rails > 0u) ? (cfg->rate_gbps / (double)rails) : 0.0;
+                for (uint32_t r = 0; r < rails; r++) {
+                    tx_w[r] = (udp_tx_worker_t){
+                        .fd = tx_fds[r],
+                        .peer = peer_addrs[r],
+                        .wire_src = tx_host,
+                        .rail_idx = r,
+                        .num_rails = rails,
+                        .T = T,
+                        .iter = (uint16_t)it,
+                        .total_frames = total_frames,
+                        .drop_beg = drop_beg,
+                        .drop_end = drop_end,
+                        .loss_ppm = cfg->loss_ppm,
+                        .rail_rate_gbps = rail_rate,
+                        .sent_frames = 0u,
+                    };
+                    if (pthread_create(&tx_th[r], NULL, udp_tx_worker_fn, &tx_w[r]) != 0) {
+                        tx_aborted = true;
+                        break;
+                    }
+                    started_tx++;
+                }
+                for (uint32_t r = 0; r < started_tx; r++)
+                    pthread_join(tx_th[r], NULL);
+                send_tail_beacons(tx_fds, peer_addrs, rails, (uint16_t)it);
+                if (tx_aborted) {
+                    shutdown(ctrl_fd, SHUT_RDWR);
+                    break;
+                }
             }
-            for (uint32_t r = 0; r < started_tx; r++)
-                pthread_join(tx_th[r], NULL);
-            send_tail_beacons(tx_fds, peer_addrs, rails, (uint16_t)it);
-            if (tx_aborted) {
-                shutdown(ctrl_fd, SHUT_RDWR);
-                break;
-            }
+            uint64_t tx_wire_ns = now_ns() - tx_wire_t0;
+            struct wire_tx_sample *sample = &samples[(it - 1u) % 2u];
+            *sample = (struct wire_tx_sample){
+                .planned_frames = planned_frames,
+                .started_ns = iter_wall_t0,
+                .wire_ns = tx_wire_ns ? tx_wire_ns : 1u,
+            };
         }
-        uint64_t tx_wire_ns = now_ns() - tx_wire_t0;
-        if (tx_wire_ns == 0ULL)
-            tx_wire_ns = 1ULL;
+        if (send_it <= result_lag)
+            continue;
 
+        uint32_t it = send_it - result_lag;
+        const struct wire_tx_sample *sample = &samples[(it - 1u) % 2u];
+        uint64_t planned_frames = sample->planned_frames;
         wire_ctrl_result_t res;
-        if (!read_all(ctrl_fd, &res, sizeof(res))) {
+        if (!read_all(ctrl_fd, &res, sizeof(res)) || res.iter != it) {
             tx_aborted = true;
             break;
         }
-        if (res.wire_ns < tx_wire_ns)
-            res.wire_ns = tx_wire_ns;
-        uint64_t iter_wall_ns = now_ns() - iter_wall_t0;
+        if (res.wire_ns < sample->wire_ns)
+            res.wire_ns = sample->wire_ns;
+        uint64_t iter_wall_ns = now_ns() - sample->started_ns;
 
         double wire_gbps = (8.0 * (double)res.rx_frames * (double)T) / (double)(res.wire_ns ? res.wire_ns : 1ULL);
         uint64_t e2e_ns = res.wire_ns + res.dma_ns + res.recover_wall_ns;
@@ -1472,7 +1819,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         }
     }
     printf("===========================================================================================================\n");
-    bench_ok = !tx_aborted && (pass_count > 0);
+    bench_ok = !tx_aborted && (cfg->gdr ? pass_count == cfg->iters : pass_count > 0);
     if (!bench_ok)
         fprintf(stderr, "ERROR: Wire benchmark aborted or failed RX recovery!\n");
 
@@ -1485,7 +1832,8 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         "transport,codec,wire_only,Z,K,P,T,rails,blackout_pct,loss_ppm,planned_frames,rx_frames,payload_mib,"
                         "wire_gbps,bidir_wire_gbps,bidir_wall_gbps,e2e_gbps,gpu_gbps,blocks_repaired,unique_masks,gdr_dmabuf\n");
             }
-            fprintf(fp, "%s,%s,%u,%u,%u,%u,%u,%u,%.2f,%u,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,", cfg->use_ibv ? "ibv" : "udp",
+            fprintf(fp, "%s,%s,%u,%u,%u,%u,%u,%u,%.2f,%u,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,",
+                    cfg->pipeline ? "ibv-gdr-pipeline" : (cfg->gdr ? "ibv-gdr" : (cfg->use_ibv ? "ibv" : "udp")),
                     (cfg->codec == VXFEC_WIRE_MDS) ? "mds" : "rateless", cfg->wire_only ? 1u : 0u, Z, K, P, T, rails,
                     cfg->blackout_pct, cfg->loss_ppm, best_planned_frames, best_rx_frames, (double)sys_bytes / (1024.0 * 1024.0),
                     best_wire_gbps);
@@ -1519,9 +1867,11 @@ tx_cleanup:
         if (ibv_ctx)
             vxfec_ibv_ctx_close(ibv_ctx);
     }
-    if (vk_quiesced) {
+    if (ibv_quiesced && vk_quiesced) {
         vxfec_wire_ring_free(tx_ring);
         vxfec_vk_buf_free(ctx, tx_vram);
+        if (dmabuf_fd >= 0)
+            close(dmabuf_fd);
     }
     if (ibv_quiesced)
         free(tx_host);
@@ -1551,6 +1901,7 @@ int main(int argc, char **argv)
         .wire_only = false,
         .self_test = false,
     };
+    bool sym_t_set = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--self-test") == 0) {
@@ -1576,6 +1927,7 @@ int main(int argc, char **argv)
             cfg.P = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sym-t") == 0 && i + 1 < argc) {
             cfg.T = (uint32_t)strtoul(argv[++i], NULL, 10);
+            sym_t_set = true;
         } else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
             cfg.iters = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--blackout-pct") == 0 && i + 1 < argc) {
@@ -1586,6 +1938,11 @@ int main(int argc, char **argv)
             cfg.loss_ppm = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--ibv") == 0) {
             cfg.use_ibv = true;
+        } else if (strcmp(argv[i], "--gdr") == 0) {
+            cfg.gdr = true;
+            cfg.use_ibv = true;
+        } else if (strcmp(argv[i], "--pipeline") == 0) {
+            cfg.pipeline = true;
         } else if (strcmp(argv[i], "--wire-only") == 0) {
             cfg.wire_only = true;
         } else if (strcmp(argv[i], "--bidir-sync") == 0 && i + 1 < argc) {
@@ -1597,12 +1954,30 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage:\n");
             printf("  %s --self-test\n", argv[0]);
-            printf("  %s --mode rx [--bind ip1,ip2] [--port 31500] [--ports-per-ip 4]\n", argv[0]);
+            printf("  %s --mode rx [--bind ip1,ip2] [--port 31500] [--ports-per-ip 4] [--gdr [--pipeline]]\n", argv[0]);
             printf("  %s --mode tx --peers ip1,ip2 [--port 31500] [--ports-per-ip 4] [--codec rateless|mds] "
-                   "[--z 64] [--k 200] [--p 48] [--sym-t 8192] [--blackout-pct 10] [--ibv] [--csv out.csv]\n",
+                   "[--z 64] [--k 200] [--p 48] [--sym-t bytes] [--blackout-pct 10] [--ibv | --gdr [--pipeline]] [--csv out.csv]\n",
                    argv[0]);
+            printf("  --gdr        Require GPU DMA-BUF RDMA on both peers; use on TX and RX.\n");
+            printf("  --pipeline   With --gdr on both peers, use two RX buffers to overlap transfer and recovery.\n");
+            printf("  --sym-t      Symbol size (default 4096 with --gdr, 8192 otherwise).\n");
             return 0;
         }
+    }
+
+    if (cfg.pipeline && !cfg.gdr) {
+        fprintf(stderr, "--pipeline requires --gdr on both endpoints\n");
+        return 1;
+    }
+
+    if (cfg.gdr) {
+        if (cfg.self_test || !cfg.mode || (strcmp(cfg.mode, "tx") != 0 && strcmp(cfg.mode, "rx") != 0) || cfg.wire_only ||
+            cfg.bidir_sync || cfg.bidir_leader || cfg.rate_gbps != 0.0) {
+            fprintf(stderr, "--gdr requires --mode tx or rx and cannot use --self-test, --wire-only, --bidir-*, or --rate-gbps\n");
+            return 1;
+        }
+        if (!sym_t_set)
+            cfg.T = 4096u;
     }
 
     if (!cfg.self_test && cfg.mode) {
@@ -1614,7 +1989,7 @@ int main(int argc, char **argv)
         }
         if (strcmp(cfg.mode, "tx") == 0) {
             if (cfg.Z == 0u || cfg.Z > 4096u || cfg.K == 0u || cfg.K > 56403u || cfg.P == 0u || cfg.P > 65535u || cfg.T < 64u ||
-                cfg.T > (1u << 20) || (cfg.T & 15u) != 0u || cfg.iters == 0u || cfg.blackout_pct < 0.0 ||
+                cfg.T > (1u << 20) || (cfg.T & 15u) != 0u || cfg.iters == 0u || cfg.iters > 100000u || cfg.blackout_pct < 0.0 ||
                 cfg.blackout_pct > 100.0 || (uint64_t)(cfg.K + cfg.P) > SIZE_MAX / ((size_t)cfg.Z * (size_t)cfg.T)) {
                 fprintf(stderr, "Invalid TX superframe parameters (Z=%u K=%u P=%u T=%u iters=%u blackout=%.2f)\n", cfg.Z, cfg.K,
                         cfg.P, cfg.T, cfg.iters, cfg.blackout_pct);
@@ -1630,9 +2005,16 @@ int main(int argc, char **argv)
         if (!req_env || !*req_env)
             req_env = getenv("NANORQ_VK_REQUIRED");
         bool vk_req = req_env && *req_env && strcmp(req_env, "0") != 0;
-        bool can_skip = (vk_status == VXFEC_VK_UNAVAILABLE && !vk_req);
+        bool can_skip = (vk_status == VXFEC_VK_UNAVAILABLE && !vk_req && !cfg.gdr);
         fprintf(stderr, "%s: Vulkan 1.2 compute device unavailable (status=%d)\n", can_skip ? "SKIP" : "FAIL", vk_status);
         return can_skip ? 0 : 1;
+    }
+
+    if (cfg.gdr && (!vxfec_vk_has_dmabuf_export(ctx) || !vxfec_ibv_has_dmabuf())) {
+        fprintf(stderr, "--gdr requires Vulkan GPU DMA-BUF export and ibverbs DMA-BUF registration (device: %s)\n",
+                vxfec_vk_device_name(ctx));
+        vxfec_vk_ctx_free(ctx);
+        return 1;
     }
 
     if (cfg.self_test || !cfg.mode) {

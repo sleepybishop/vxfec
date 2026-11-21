@@ -80,3 +80,27 @@ VXFEC_NCCL_IFNAMES=<rank1-nic> ./bench_nccl --rank 1 --master <rank0-ip>:29600
 # Live GPU ncclAllReduce A/B demo across lossless, reordering, and burst-loss phases
 ./demo_nccl_e2e
 ```
+
+Run a one-direction GPU-to-GPU RDMA UC check on two RDMA-capable hosts with Vulkan DMA-BUF export:
+
+```sh
+# Receiver
+./bench_wire_net --mode rx --bind <receiver-ip> --gdr
+
+# Sender
+./bench_wire_net --mode tx --peers <receiver-ip> --gdr --blackout-pct 10 --csv gdr.csv
+```
+
+`--gdr` requires DMA-BUF registration at both endpoints. Use `--sym-t` to lower the default 4096-byte symbol size if the RDMA path MTU is smaller. The sender encodes a test superframe in GPU memory before timing, then the NIC reads it directly. The receiver recovers in GPU memory and reads the result back for byte-for-byte verification. This baseline runs one superframe at a time and records passing runs as `ibv-gdr` in the CSV.
+
+Add `--pipeline` to both endpoints to receive into two registered GPU buffers. A worker recovers and verifies one superframe while the NIC fills the other. The sender still uses the same pre-encoded superframe. Pipeline runs use the `ibv-gdr-pipeline` CSV label.
+
+```sh
+# Receiver
+./bench_wire_net --mode rx --bind <receiver-ip> --gdr --pipeline
+
+# Sender
+./bench_wire_net --mode tx --peers <receiver-ip> --gdr --pipeline --iters 100 --blackout-pct 10 --csv gdr.csv
+```
+
+For a baseline comparison, run the same commands with `--pipeline` removed. The receiver reports verified payload goodput across the run and p99 latency from granting each frame's receive buffer to completing recovery and verification. The CSV keeps the per-frame metrics for the best passing wire iteration.

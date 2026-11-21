@@ -2722,6 +2722,12 @@ static void rx_quiesce_broken_ibv(vxfec_recv_comm_t *comm)
         comm->delay_head = (comm->delay_head + 1u) & (VXFEC_DELAY_RING - 1u);
         comm->delay_cnt--;
     }
+    while (comm->header_delay_q && comm->header_delay_cnt > 0u) {
+        const vxfec_delay_ctrl_t *hd = &comm->header_delay_q[comm->header_delay_head];
+        rx_notify_broken_pkt(comm, hd->data, hd->len);
+        comm->header_delay_head = (comm->header_delay_head + 1u) & (VXFEC_DELAY_RING - 1u);
+        comm->header_delay_cnt--;
+    }
 #endif
     for (uint32_t w = 0; w < VXFEC_RX_WIRE_SLOTS / 64u; w++) {
         uint64_t m = comm->active_slot_mask[w];
@@ -2806,16 +2812,68 @@ static vxfec_rx_udp_batch_t *ensure_rx_udp_batch(vxfec_recv_comm_t *comm)
     return rb;
 }
 
+#if VXFEC_ENABLE_SIM
+uint64_t vxf_rx_deliver_due_headers(vxfec_recv_comm_t *comm, uint64_t now_ns)
+{
+    while (comm->header_delay_cnt) {
+        vxfec_delay_ctrl_t *pkt = &comm->header_delay_q[comm->header_delay_head];
+        if (pkt->deliver_ns > now_ns)
+            return pkt->deliver_ns;
+        rx_process_wire_pkt(comm, 0u, pkt->data, pkt->len, false, now_ns);
+        comm->header_delay_head = (comm->header_delay_head + 1u) & (VXFEC_DELAY_RING - 1u);
+        comm->header_delay_cnt--;
+    }
+    return 0u;
+}
+#endif
+
+static void rx_receive_header(vxfec_recv_comm_t *comm, const uint8_t *buf, size_t len, uint64_t now_ns)
+{
+#if VXFEC_ENABLE_SIM
+    uint64_t delay_ns = vxf_sim_delay_ns();
+    if (delay_ns || comm->header_delay_cnt) {
+        if (!comm->header_delay_q)
+            comm->header_delay_q = calloc(VXFEC_DELAY_RING, sizeof(*comm->header_delay_q));
+        if (!comm->header_delay_q || comm->header_delay_cnt == VXFEC_DELAY_RING || len > sizeof(comm->header_delay_q[0].data)) {
+            atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
+            return;
+        }
+        uint64_t deliver_ns = now_ns + delay_ns;
+        if (comm->header_delay_cnt > 0u) {
+            uint32_t prev = (comm->header_delay_head + comm->header_delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
+            if (deliver_ns < comm->header_delay_q[prev].deliver_ns)
+                deliver_ns = comm->header_delay_q[prev].deliver_ns;
+        }
+        uint32_t tail = (comm->header_delay_head + comm->header_delay_cnt) & (VXFEC_DELAY_RING - 1u);
+        vxfec_delay_ctrl_t *pkt = &comm->header_delay_q[tail];
+        pkt->deliver_ns = deliver_ns;
+        pkt->len = (uint16_t)len;
+        memcpy(pkt->data, buf, len);
+        if (++comm->header_delay_cnt == 1u)
+            vxf_rx_bg_schedule_delay();
+        return;
+    }
+#endif
+    rx_process_wire_pkt(comm, 0u, buf, len, false, now_ns);
+}
+
 void vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns)
 {
+#if VXFEC_ENABLE_SIM
+    (void)vxf_rx_deliver_due_headers(comm, now_ns);
+#endif
     if (comm->ctrl_fd < 0)
         return;
     uint8_t cbuf[sizeof(vxfec_wire_hdr_ext_t)];
     for (;;) {
+#if VXFEC_ENABLE_SIM
+        if (comm->header_delay_cnt == VXFEC_DELAY_RING)
+            break;
+#endif
         ssize_t n = recv(comm->ctrl_fd, cbuf, sizeof(cbuf), MSG_DONTWAIT);
         if (n <= 0)
             break;
-        rx_process_wire_pkt(comm, 0u, cbuf, (size_t)n, false, now_ns);
+        rx_receive_header(comm, cbuf, (size_t)n, now_ns);
     }
 }
 
@@ -2827,6 +2885,10 @@ void vxf_rx_bg_peek_data_ports(vxfec_recv_comm_t *comm)
         if (comm->fds[p] < 0)
             continue;
         for (;;) {
+#if VXFEC_ENABLE_SIM
+            if (comm->header_delay_cnt == VXFEC_DELAY_RING)
+                return;
+#endif
             ssize_t n = recv(comm->fds[p], hbuf, sizeof(hbuf), MSG_PEEK | MSG_DONTWAIT);
             if (n < 0)
                 break;
@@ -2842,52 +2904,54 @@ void vxf_rx_bg_peek_data_ports(vxfec_recv_comm_t *comm)
             }
             rx_confirm_handshake(comm);
 
-            if (hdr.pkt_type == PKT_ERR) {
+            if (hdr.pkt_type == PKT_ERR || rx_comm_was_done(comm, hdr.msg_seq, NULL, NULL, NULL, NULL, NULL, NULL) ||
+                rx_tag_seq_is_retired(comm, hdr.tag, hdr.tag_seq)) {
                 (void)recv(comm->fds[p], &sink, 1u, MSG_DONTWAIT);
-                rx_process_wire_pkt(comm, p, hbuf, (size_t)n, false, mono_ns());
-                continue;
-            }
-
-            uint32_t prev_lost = 0u, prev_ecn_mask = 0u, prev_k = 0u, prev_rx_pkts = 0u, prev_ecn_ce = 0u;
-            bool prev_err = false;
-            if (rx_comm_was_done(comm, hdr.msg_seq, &prev_lost, &prev_k, &prev_ecn_ce, &prev_rx_pkts, &prev_ecn_mask, &prev_err)) {
-                (void)recv(comm->fds[p], &sink, 1u, MSG_DONTWAIT);
-                if (hdr.pkt_type == PKT_TAIL || hdr.pkt_type == PKT_DATA) {
-                    vxfec_ctrl_pkt_t dhdr = {
-                        .magic = VXFEC_NET_MAGIC,
-                        .cookie = comm->cookie,
-                        .pkt_type = prev_err ? PKT_ERR : PKT_DONE,
-                        .msg_seq = hdr.msg_seq,
-                        .tag = hdr.tag,
-                        .K = prev_k,
-                        .rx_pkts = prev_rx_pkts,
-                        .ecn_ce_pkts = prev_ecn_ce,
-                        .ecn_port_mask = prev_ecn_mask,
-                        .esi = prev_lost,
-                    };
-                    rx_send_ctrl(comm, &dhdr, NULL, 0, 1);
-                }
-                continue;
-            }
-            if (rx_tag_seq_is_retired(comm, hdr.tag, hdr.tag_seq)) {
-                (void)recv(comm->fds[p], &sink, 1u, MSG_DONTWAIT);
-                if (hdr.pkt_type == PKT_TAIL || hdr.pkt_type == PKT_DATA) {
-                    if (rx_prepare_done(comm, hdr.msg_seq))
-                        rx_record_done(comm, hdr.msg_seq, hdr.K, 0u, 0u, 0u, 0u, true);
-                    vxfec_ctrl_pkt_t ehdr = {
-                        .magic = VXFEC_NET_MAGIC,
-                        .cookie = comm->cookie,
-                        .pkt_type = PKT_ERR,
-                        .msg_seq = hdr.msg_seq,
-                        .tag = hdr.tag,
-                    };
-                    rx_send_ctrl(comm, &ehdr, NULL, 0, 1);
-                }
+                rx_receive_header(comm, hbuf, (size_t)n, mono_ns());
                 continue;
             }
             break;
         }
     }
+}
+
+static uint32_t rx_batch_capacity(vxfec_recv_comm_t *comm, uint64_t delay_ns, uint32_t max)
+{
+#if VXFEC_ENABLE_SIM
+    if ((delay_ns || comm->delay_cnt) && VXFEC_DELAY_RING - comm->delay_cnt < max)
+        return VXFEC_DELAY_RING - comm->delay_cnt;
+#endif
+    return max;
+}
+
+static void rx_receive_data(vxfec_recv_comm_t *comm, uint32_t port, const uint8_t *pkt, size_t len, bool ecn, uint64_t now_ns,
+                            uint64_t delay_ns)
+{
+#if VXFEC_ENABLE_SIM
+    if (delay_ns || comm->delay_cnt) {
+        if (!comm->delay_q)
+            comm->delay_q = calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
+        if (!comm->delay_q || comm->delay_cnt == VXFEC_DELAY_RING || len > sizeof(comm->delay_q[0].data)) {
+            atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
+            return;
+        }
+        uint64_t deliver_ns = now_ns + delay_ns;
+        if (comm->delay_cnt > 0u) {
+            uint32_t prev = (comm->delay_head + comm->delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
+            if (deliver_ns < comm->delay_q[prev].deliver_ns)
+                deliver_ns = comm->delay_q[prev].deliver_ns;
+        }
+        uint32_t tail = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
+        vxfec_delay_data_t *entry = &comm->delay_q[tail];
+        entry->deliver_ns = deliver_ns;
+        entry->port_idx = port;
+        entry->len = (uint16_t)len;
+        entry->is_ecn_ce = ecn;
+        memcpy(entry->data, pkt, len);
+        return;
+    }
+#endif
+    rx_process_wire_pkt(comm, port, pkt, len, ecn, now_ns);
 }
 
 void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
@@ -2904,29 +2968,13 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
     if (comm->ibv_ep) {
         vxfec_ibv_rx_wc_t wcs[64];
         for (;;) {
-            uint32_t nw = vxfec_ibv_ep_poll_rx(comm->ibv_ep, wcs, 64u);
+            uint32_t capacity = rx_batch_capacity(comm, delay_ns, 64u);
+            if (!capacity)
+                break;
+            uint32_t nw = vxfec_ibv_ep_poll_rx(comm->ibv_ep, wcs, capacity);
             for (uint32_t i = 0; i < nw; i++) {
                 uint32_t qp_idx = vxfec_ibv_slot_qp(wcs[i].slot_id);
-#if VXFEC_ENABLE_SIM
-                if (delay_ns > 0u && wcs[i].byte_len <= sizeof(comm->delay_q[0].data)) {
-                    if (!comm->delay_q)
-                        comm->delay_q = (vxfec_delay_data_t *)calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
-                    if (comm->delay_q && comm->delay_cnt < VXFEC_DELAY_RING) {
-                        uint32_t dst = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
-                        comm->delay_q[dst].deliver_ns = now_ns + delay_ns;
-                        comm->delay_q[dst].port_idx = qp_idx;
-                        comm->delay_q[dst].len = (uint16_t)wcs[i].byte_len;
-                        comm->delay_q[dst].is_ecn_ce = false;
-                        memcpy(comm->delay_q[dst].data, wcs[i].data, wcs[i].byte_len);
-                    } else {
-                        rx_process_wire_pkt(comm, qp_idx, wcs[i].data, wcs[i].byte_len, false, now_ns);
-                    }
-                } else
-#endif
-                {
-                    (void)delay_ns;
-                    rx_process_wire_pkt(comm, qp_idx, wcs[i].data, wcs[i].byte_len, false, now_ns);
-                }
+                rx_receive_data(comm, qp_idx, wcs[i].data, wcs[i].byte_len, false, now_ns, delay_ns);
                 if (!vxfec_ibv_ep_repost_rx(comm->ibv_ep, wcs[i].slot_id))
                     break;
             }
@@ -2951,7 +2999,10 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
         if (!rb)
             break;
         for (;;) {
-            int n = recvmmsg(comm->fds[p], rb->msgs, VXFEC_RX_BATCH, MSG_DONTWAIT, NULL);
+            uint32_t capacity = rx_batch_capacity(comm, delay_ns, VXFEC_RX_BATCH);
+            if (!capacity)
+                break;
+            int n = recvmmsg(comm->fds[p], rb->msgs, capacity, MSG_DONTWAIT, NULL);
             if (n <= 0)
                 break;
 
@@ -2962,22 +3013,7 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
                 size_t len = rb->msgs[i].msg_len;
                 const uint8_t *pkt = rb->pkt_bufs + (size_t)i * rb->pkt_stride;
 
-#if VXFEC_ENABLE_SIM
-                if (delay_ns > 0u && len <= sizeof(comm->delay_q[0].data)) {
-                    if (!comm->delay_q)
-                        comm->delay_q = (vxfec_delay_data_t *)calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
-                    if (comm->delay_q && comm->delay_cnt < VXFEC_DELAY_RING) {
-                        uint32_t dst = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
-                        comm->delay_q[dst].deliver_ns = now_ns + delay_ns;
-                        comm->delay_q[dst].port_idx = p;
-                        comm->delay_q[dst].len = (uint16_t)len;
-                        comm->delay_q[dst].is_ecn_ce = is_ecn_ce;
-                        memcpy(comm->delay_q[dst].data, pkt, len);
-                        continue;
-                    }
-                }
-#endif
-                rx_process_wire_pkt(comm, p, pkt, len, is_ecn_ce, now_ns);
+                rx_receive_data(comm, p, pkt, len, is_ecn_ce, now_ns, delay_ns);
             }
         }
     }
@@ -3176,6 +3212,7 @@ static void tx_account_repair_slice(vxfec_tx_slot_t *req, uint32_t count, bool p
     } else {
         req->ir_start_esi += count;
         req->ir_rem -= count;
+        req->last_ir_tx_ns = now_ns;
     }
     harq_pacer_consume(&comm->pacer, bytes);
     comm->inflight_bytes += bytes;
@@ -3296,6 +3333,7 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
             }
             req->sack_head += n_sack;
             req->sack_cnt -= n_sack;
+            req->last_sack_tx_ns = now_ns;
             harq_pacer_consume(&comm->pacer, sent_b);
             comm->inflight_bytes += sent_b;
             req->queued_bytes += sent_b;
@@ -3362,6 +3400,8 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
                 bool more_gens = (req->parent && (req->gen_idx + 1u < req->num_gens));
                 bool need_ack = (comm->inflight_bytes + sent_b + req->sym_T > comm->pacer.cwnd_bytes) &&
                                 (req->tx_sys_cursor + n_sys < req->K || req->proactive_target > 0u || more_gens);
+                if (req->tx_sys_cursor == 0u && comm->pacer.srtt_ns == 0u)
+                    req->first_sys_tx_ns = mono_ns();
                 if (!tx_spray_sys_range(req, req->tx_sys_cursor, NULL, n_sys, false, need_ack, now_ns)) {
                     tx_fail_req(comm, req, ncclSystemError);
                     continue;
@@ -3432,6 +3472,72 @@ static void tx_update_ecn_port_weights(vxfec_tx_slot_t *req, uint32_t reported_m
     if (hot_ports != 0u || comm->has_nonuniform_weights)
         comm->has_nonuniform_weights =
             harq_update_port_weights(comm->port_weights, comm->num_ports, hot_ports, VXFEC_PORT_WEIGHT_MAX);
+}
+
+/* seed retry RTT from first cold-flight feedback while leaving congestion control to probe/DONE samples */
+static void tx_bootstrap_srtt(vxfec_tx_slot_t *req, uint64_t now_ns)
+{
+    uint64_t ref_ns = req->burst_end_tx_ns ? req->burst_end_tx_ns : req->first_sys_tx_ns;
+    if (req->comm->pacer.srtt_ns == 0u && !req->retx_or_ir_sent && ref_ns && now_ns > ref_ns)
+        req->comm->pacer.srtt_ns = now_ns - ref_ns;
+}
+
+/* suppress duplicate feedback while repairs covering the same holes are still queued or in flight */
+static bool tx_recovery_in_flight(const vxfec_send_comm_t *comm, uint32_t pending, uint64_t last_tx_ns, uint64_t now_ns)
+{
+    uint64_t window_ns = clamp_u64(comm->pacer.srtt_ns, 300000ULL, 20000000ULL);
+    return pending || (last_tx_ns && now_ns - last_tx_ns < window_ns);
+}
+
+static bool tx_sack_subset_in_queue(const uint32_t *esis, uint32_t valid, const uint32_t *queued, uint32_t queued_total)
+{
+    if (valid > queued_total)
+        return false;
+    for (uint32_t i = 0; i < valid; i++) {
+        bool found = false;
+        for (uint32_t j = 0; j < queued_total; j++) {
+            if (esis[i] == queued[j]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return false;
+    }
+    return true;
+}
+
+static void tx_queue_sack(vxfec_tx_slot_t *req, uint32_t count, const uint8_t *payload, size_t len, uint64_t now_ns)
+{
+    uint32_t esis[VXFEC_SACK_MAX];
+    if (count > VXFEC_SACK_MAX)
+        count = VXFEC_SACK_MAX;
+    if (len < count * sizeof(*esis))
+        return;
+    memcpy(esis, payload, count * sizeof(*esis));
+    uint32_t valid = 0u;
+    for (uint32_t i = 0; i < count; i++) {
+        if (esis[i] < req->K)
+            esis[valid++] = esis[i];
+    }
+    if (!valid)
+        return;
+    if (!req->sack_queue) {
+        req->sack_queue = malloc(sizeof(esis));
+        if (!req->sack_queue)
+            return;
+    } else if (tx_sack_subset_in_queue(esis, valid, req->sack_queue, req->sack_head + req->sack_cnt) &&
+               tx_recovery_in_flight(req->comm, req->sack_cnt, req->last_sack_tx_ns, now_ns)) {
+        return;
+    }
+    tx_bootstrap_srtt(req, now_ns);
+    req->ack_probe_tx_ns = 0u;
+    tx_release_req_inflight(req->comm, req);
+    memcpy(req->sack_queue, esis, valid * sizeof(*esis));
+    req->sack_head = 0u;
+    req->sack_cnt = valid;
+    req->need_recovery_tail = true;
+    req->retx_or_ir_sent = true;
 }
 
 static void tx_quiesce_broken_ibv(vxfec_send_comm_t *comm)
@@ -3522,19 +3628,31 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
 
     for (;;) {
         ssize_t n = -1;
-        if (comm->ctrl_fd >= 0) {
+        bool can_recv = comm->ctrl_fd >= 0;
+#if VXFEC_ENABLE_SIM
+        can_recv = can_recv && comm->ctrl_delay_cnt < VXFEC_DELAY_RING;
+#endif
+        if (can_recv) {
             ssize_t r = recv(comm->ctrl_fd, ctrl_buf, sizeof(ctrl_buf), MSG_DONTWAIT);
 #if VXFEC_ENABLE_SIM
-            if (r > 0 && delay_ns > 0u && (size_t)r <= sizeof(comm->ctrl_delay_q[0].data)) {
+            if (r > 0 && (delay_ns > 0u || comm->ctrl_delay_cnt > 0u)) {
                 if (!comm->ctrl_delay_q)
                     comm->ctrl_delay_q = (vxfec_delay_ctrl_t *)calloc(VXFEC_DELAY_RING, sizeof(*comm->ctrl_delay_q));
-                if (comm->ctrl_delay_q && comm->ctrl_delay_cnt < VXFEC_DELAY_RING) {
+                if (comm->ctrl_delay_q && (size_t)r <= sizeof(comm->ctrl_delay_q[0].data)) {
+                    uint64_t deliver_ns = now_ns + delay_ns;
+                    if (comm->ctrl_delay_cnt > 0u) {
+                        uint32_t prev = (comm->ctrl_delay_head + comm->ctrl_delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
+                        if (deliver_ns < comm->ctrl_delay_q[prev].deliver_ns)
+                            deliver_ns = comm->ctrl_delay_q[prev].deliver_ns;
+                    }
                     uint32_t dst = (comm->ctrl_delay_head + comm->ctrl_delay_cnt++) & (VXFEC_DELAY_RING - 1u);
-                    comm->ctrl_delay_q[dst].deliver_ns = now_ns + delay_ns;
+                    comm->ctrl_delay_q[dst].deliver_ns = deliver_ns;
                     comm->ctrl_delay_q[dst].len = (uint16_t)r;
                     memcpy(comm->ctrl_delay_q[dst].data, ctrl_buf, (size_t)r);
-                    continue;
+                } else {
+                    atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
                 }
+                continue;
             }
 #else
             (void)delay_ns;
@@ -3614,6 +3732,7 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                 }
                 if (harq_pacer_on_ack(&comm->pacer, acked_b, rtt_ns, newly_rx, delta_ce))
                     atomic_fetch_add_explicit(&vxf_st_tx_cnp_events, 1, memory_order_relaxed);
+                tx_bootstrap_srtt(req, now_ns);
                 tx_update_ecn_port_weights(req, ctrl.ecn_port_mask, delta_ce);
             }
         } else if (ctrl.pkt_type == PKT_DONE) {
@@ -3660,43 +3779,20 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
         } else if (ctrl.pkt_type == PKT_ERR) {
             tx_fail_req(comm, req, ncclRemoteError);
         } else if (ctrl.pkt_type == PKT_SACK) {
-            uint32_t cnt = ctrl.sack_cnt;
-            if (cnt > VXFEC_SACK_MAX)
-                cnt = VXFEC_SACK_MAX;
-            size_t avail = (size_t)n - sizeof(vxfec_ctrl_pkt_t);
-            if (avail >= cnt * sizeof(uint32_t) && cnt > 0u) {
-                if (!req->sack_queue)
-                    req->sack_queue = (uint32_t *)malloc(VXFEC_SACK_MAX * sizeof(*req->sack_queue));
-                if (req->sack_queue) {
-                    uint32_t esis[VXFEC_SACK_MAX];
-                    memcpy(esis, ctrl_buf + sizeof(vxfec_ctrl_pkt_t), cnt * sizeof(uint32_t));
-                    req->ack_probe_tx_ns = 0u;
-                    tx_release_req_inflight(comm, req);
-                    uint32_t valid = 0u;
-                    for (uint32_t i = 0; i < cnt; i++) {
-                        if (esis[i] < req->K)
-                            req->sack_queue[valid++] = esis[i];
-                    }
-                    if (valid > 0u) {
-                        req->sack_head = 0u;
-                        req->sack_cnt = valid;
-                        req->need_recovery_tail = true;
-                        req->retx_or_ir_sent = true;
-                    }
-                }
-            }
+            tx_queue_sack(req, ctrl.sack_cnt, ctrl_buf + sizeof(ctrl), (size_t)n - sizeof(ctrl), now_ns);
         } else if (ctrl.pkt_type == PKT_HARQ_IR) {
             uint32_t count = ctrl.ir_count ? ctrl.ir_count : 1u;
-            uint64_t dup_gate_ns = clamp_u64(2ULL * (comm->pacer.srtt_ns ? comm->pacer.srtt_ns : 200000ULL), 300000ULL, 2000000ULL);
-            bool is_dup = (req->last_ir_tx_ns > 0u && ctrl.esi == req->last_ir_ctrl_esi && count == req->last_ir_ctrl_cnt &&
-                           (now_ns - req->last_ir_tx_ns) < dup_gate_ns);
+            uint8_t codec_flag = ctrl.flags & WIRE_CODEC_MASK;
+            bool is_dup = ctrl.esi == req->last_ir_ctrl_esi && count <= req->last_ir_ctrl_cnt &&
+                          codec_flag == req->last_ir_ctrl_codec &&
+                          tx_recovery_in_flight(comm, req->ir_rem, req->last_ir_tx_ns, now_ns);
             if (!is_dup) {
+                tx_bootstrap_srtt(req, now_ns);
                 uint32_t start = (ctrl.esi >= req->next_rep_esi) ? ctrl.esi : req->next_rep_esi;
                 uint32_t proactive_end = req->K + req->proactive_target;
                 if (start < proactive_end)
                     start = proactive_end;
                 uint32_t send_cnt = count;
-                uint8_t codec_flag = ctrl.flags & WIRE_CODEC_MASK;
                 if (codec_flag == WIRE_FLAG_RS_CAUCHY8 && (req->codec != VXFEC_CODEC_RS_CAUCHY8 || start + send_cnt > 256u))
                     send_cnt += wire_flags_ir_slack(WIRE_FLAG_RQ_GF256, req->K);
                 req->ack_probe_tx_ns = 0u;
@@ -3707,13 +3803,14 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                 } else if (send_cnt > req->ir_rem) {
                     req->ir_rem = send_cnt;
                 }
-                req->last_ir_tx_ns = now_ns;
                 req->last_ir_ctrl_esi = ctrl.esi;
                 req->last_ir_ctrl_cnt = count;
+                req->last_ir_ctrl_codec = codec_flag;
                 req->need_recovery_tail = true;
                 req->retx_or_ir_sent = true;
             }
         } else if (ctrl.pkt_type == PKT_GBN_NACK) {
+            tx_bootstrap_srtt(req, now_ns);
             uint32_t first_miss = (ctrl.esi < req->K) ? ctrl.esi : 0u;
             req->ack_probe_tx_ns = 0u;
             tx_release_req_inflight(comm, req);

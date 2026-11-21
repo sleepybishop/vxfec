@@ -9,7 +9,7 @@ Building the repository produces:
 
 ![vxfec Benchmarks](docs/vxfec_benchmarks.png)
 
-> *[`docs/vxfec_benchmarks.png`](docs/vxfec_benchmarks.png) summarizes local `RX 7900 XTX` GPU resident-VRAM decode benchmarks (`1.18–5.39 Tbps` protected payload / decode time, plus `105.3 Gbps` local 4-rail wire / `177 Gbps` GPU recovery), physical 2-node Google Cloud `TIER_1` Titanium `gVNIC` superframe runs on CPU-only `n2-standard-96` VMs (`96.1` and `94.9 Gbps` directional `--wire-only` wire rates across `4x 100G` `8896 B` Jumbo NICs; `96.4 Gbps` wire / `98.1 Gbps` software-Vulkan `lavapipe` recovery / `43.0 Gbps` end-to-end source goodput with full decode), and multi-node `AllReduce` results across intra-zone Ethernet, Soft-RoCE `rdma_rxe` (`IBV_QPT_UC`), cross-zone DCI (`670 µs` RTT), and cross-region WAN (`24.4 ms` RTT) against user-space cumulative-NACK Go-Back-N (`gbn`, with out-of-order RX bitmap buffering for multi-port ECMP fairness) and selective-repeat `SACK`. Workload tradeoffs vary by RTT and tensor size — for example, on CPU-only `64 MiB` `AllReduce` at `2%` burst loss over `~100 µs` intra-zone RTT, `SACK` reaches `71.5 Gbps` (`16.6 ms` sample-max) vs. `63.1 Gbps` (`18.7 ms`) for `auto` due to upfront CPU parity cost, whereas `vxfec` cuts tail latency by `20%–59%` on smaller collectives, RoCEv2 UC, cross-zone DCI, and WAN paths. Cloud runners live in [`scripts/gcp/`](scripts/gcp/); [`docs/plot_benchmarks.R`](docs/plot_benchmarks.R) renders aggregated multi-panel summary CSVs (`Rscript docs/plot_benchmarks.R <summary.csv> [out.png]`).*
+*On the CPU-only intra-zone link with 2% burst loss, SACK reached 71.5 Gbps on a 64 MiB AllReduce versus 63.1 Gbps for `auto` FEC. On the cross-zone and WAN runs, vxfec had lower p99 completion times than SACK.*
 
 ## Quick Start
 
@@ -80,7 +80,3 @@ VXFEC_NCCL_IFNAMES=<rank1-nic> ./bench_nccl --rank 1 --master <rank0-ip>:29600
 # Live GPU ncclAllReduce A/B demo across lossless, reordering, and burst-loss phases
 ./demo_nccl_e2e
 ```
-
-## License
-
-MIT — Copyright (c) 2026 Joseph Calderon and Bishop Calderon. See [LICENSE](LICENSE).

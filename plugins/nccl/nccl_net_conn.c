@@ -29,6 +29,9 @@ static int g_rx_wake_fds[2] = {-1, -1};
 static pthread_t g_rx_bg_thr;
 static bool g_rx_bg_started = false;
 static atomic_bool g_rx_bg_stop = false;
+#if VXFEC_ENABLE_SIM
+static atomic_bool g_rx_delay_changed = false;
+#endif
 
 uint64_t vxf_next_unique_u64(void)
 {
@@ -122,6 +125,14 @@ void vxf_rx_bg_wake(void)
         (void)write(g_rx_wake_fds[1], &b, 1u);
 }
 
+#if VXFEC_ENABLE_SIM
+void vxf_rx_bg_schedule_delay(void)
+{
+    if (!atomic_exchange_explicit(&g_rx_delay_changed, true, memory_order_acq_rel))
+        vxf_rx_bg_wake();
+}
+#endif
+
 static bool ensure_bg_epoll_started_locked(void)
 {
     if (g_rx_bg_started)
@@ -147,10 +158,35 @@ static void *rx_bg_main(void *arg)
 {
     (void)arg;
     struct epoll_event evs[64];
+#if VXFEC_ENABLE_SIM
+    uint64_t next_header_ns = 0;
+#endif
     while (!atomic_load_explicit(&g_rx_bg_stop, memory_order_acquire)) {
         pthread_mutex_lock(&g_rx_bg_mtx);
         bool has_retired = atomic_load_explicit(&vxf_retired_lc_cnt, memory_order_acquire) > 0u;
         int timeout_ms = (g_tx_bg_head != NULL) ? 2 : (has_retired ? 100 : -1);
+#if VXFEC_ENABLE_SIM
+        /* deliver delayed headers even after receiver polling stops */
+        if ((atomic_load_explicit(&g_rx_delay_changed, memory_order_relaxed) &&
+             atomic_exchange_explicit(&g_rx_delay_changed, false, memory_order_acq_rel)) ||
+            (next_header_ns && mono_ns() >= next_header_ns)) {
+            next_header_ns = 0;
+            for (vxfec_recv_comm_t *rc = g_rx_bg_head; rc; rc = rc->bg_next) {
+                pthread_mutex_lock(&rc->mtx);
+                uint64_t due = vxf_rx_deliver_due_headers(rc, mono_ns());
+                pthread_mutex_unlock(&rc->mtx);
+                if (due && (!next_header_ns || due < next_header_ns))
+                    next_header_ns = due;
+            }
+        }
+        if (next_header_ns) {
+            uint64_t now = mono_ns();
+            uint64_t wait_ms = next_header_ns > now ? 1u + (next_header_ns - now - 1u) / 1000000u : 0u;
+            int delay_timeout_ms = wait_ms > INT_MAX ? INT_MAX : (int)wait_ms;
+            if (timeout_ms < 0 || delay_timeout_ms < timeout_ms)
+                timeout_ms = delay_timeout_ms;
+        }
+#endif
         pthread_mutex_unlock(&g_rx_bg_mtx);
 
         int nfds = epoll_wait(g_rx_epoll_fd, evs, 64, timeout_ms);
@@ -1165,6 +1201,7 @@ ncclResult_t vxf_close_recv(void *recvComm)
     }
 #if VXFEC_ENABLE_SIM
     free(rc->delay_q);
+    free(rc->header_delay_q);
 #endif
     vxf_tag_map_free(&rc->tag_map);
     vxf_rx_done_range_discard(&rc->pending_done, UINT64_MAX);

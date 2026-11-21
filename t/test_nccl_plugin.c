@@ -1928,6 +1928,7 @@ static uint32_t test_rq_expected_k = RQ_K;
 static uint32_t test_rq_drop_base = 80u;
 static uint8_t test_rq_expected_flag = 0u;
 static uint64_t test_rq_drop_mask;
+static unsigned test_rq_drop_budget; /* zero keeps the fault active for the entire transfer */
 static unsigned test_rq_repair_packets;
 static struct {
     int fd;
@@ -1960,6 +1961,8 @@ static int test_rq_send_with_loss(int fd, struct mmsghdr *msgs, unsigned count, 
                             memcpy(&test_rq_late.peer, hdr->msg_name, hdr->msg_namelen);
                     }
                     test_rq_drop_mask |= 1ULL << (wire.esi - test_rq_drop_base);
+                    if (test_rq_drop_budget && --test_rq_drop_budget == 0u)
+                        test_rq_drop_tag = 0;
                     msg->msg_len = sizeof(wire) + wire.sym_len;
                     continue;
                 }
@@ -2178,6 +2181,118 @@ static bool progress_rq_test_transfer(const ncclNet_v8_t *net, rq_test_transfer 
         ok = xfer->rx_done || net->test(xfer->rx_req, &xfer->rx_done, &xfer->got) == ncclSuccess;
     }
     test_rq_vk.side = 0;
+    return ok;
+}
+
+static bool test_cold_sack_recovery(const ncclNet_v8_t *net, ring_comms_t *ring, void (*get_stats)(vxfec_nccl_stats_t *),
+                                    void (*reset_stats)(void))
+{
+    enum { k = 8, bytes = k * RQ_SYM };
+    uint8_t src[bytes], dst[bytes];
+    bool ok = true;
+    test_rq_expected_k = k;
+    test_rq_expected_flag = 0x08u; /* WIRE_FLAG_SACK_ONLY */
+    test_rq_drop_base = 2u;
+    test_rq_drop_cnt = 1u;
+    /* keep clean DONE and window ACK samples absent so RTT must bootstrap from SACK */
+    for (int gen = 0; gen < 4 && ok; gen++) {
+        for (size_t i = 0; i < sizeof(src); i++)
+            src[i] = (uint8_t)(i * 17u + (i >> 6u) + (unsigned)gen);
+        memset(dst, 0, sizeof(dst));
+        reset_stats();
+        int tag = 860 + gen;
+        bool subset_late = (gen == 0);
+        unsigned drops = (gen == 0 || gen == 2) ? 2u : 1u; /* gen 1 shrinks SACK via late ESI; gen 3 loses first retx */
+        uint64_t exp_mask = subset_late ? 3u : 1u;
+        test_rq_drop_cnt = subset_late ? 2u : 1u;
+        test_rq_drop_tag = tag;
+        test_rq_drop_budget = drops;
+        test_rq_drop_mask = 0;
+        test_rq_late.len = 0u;
+        rq_test_transfer xfer;
+        uint64_t t0 = test_rq_now_ns();
+        bool late_sent = !subset_late;
+        ok = post_rq_test_transfer(net, ring->send_comm[0], ring->recv_comm[1], src, dst, bytes, tag, &xfer);
+        uint64_t deadline = t0 + 2000000000ULL;
+        while (ok && (!xfer.tx_done || !xfer.rx_done)) {
+            uint64_t now = test_rq_now_ns();
+            if (!late_sent && test_rq_late.len && now - t0 >= 400000ULL) {
+                if (test_rq_late.peer_len)
+                    (void)sendto(test_rq_late.fd, test_rq_late.bytes, test_rq_late.len, MSG_DONTWAIT,
+                                 (const struct sockaddr *)&test_rq_late.peer, test_rq_late.peer_len);
+                else
+                    (void)send(test_rq_late.fd, test_rq_late.bytes, test_rq_late.len, MSG_DONTWAIT);
+                test_rq_late.len = 0u;
+                late_sent = true;
+            }
+            ok = now < deadline && progress_rq_test_transfer(net, &xfer);
+        }
+        vxfec_nccl_stats_t st;
+        get_stats(&st);
+        uint64_t max_retx = subset_late ? 2u : 3u;
+        if (!ok || xfer.got != bytes || memcmp(src, dst, bytes) || test_rq_drop_mask != exp_mask || test_rq_drop_budget ||
+            st.tx_sack_retx_pkts < drops || st.tx_sack_retx_pkts > max_retx) {
+            fprintf(stderr, "FAIL: cold 10 ms RTT SACK generation %d (drops=%u/%u retx=%lu)\n", gen + 1,
+                    drops - test_rq_drop_budget, drops, (unsigned long)st.tx_sack_retx_pkts);
+            ok = false;
+        }
+    }
+    test_rq_drop_tag = 0;
+    test_rq_drop_cnt = 0u;
+    test_rq_drop_budget = 0;
+    test_rq_late.len = 0u;
+    return ok;
+}
+
+static bool test_delayed_loss_recovery(const ncclNet_v8_t *net, void (*get_stats)(vxfec_nccl_stats_t *), void (*reset_stats)(void),
+                                       void (*set_fault)(uint32_t, uint32_t, bool), void (*set_delay)(uint64_t),
+                                       void (*set_codec)(const char *))
+{
+    const char *modes[] = {"sack", "rs8"};
+    bool ok = true;
+    set_delay(5000000ULL); /* 5 ms each way */
+    for (unsigned m = 0; m < 2; m++) {
+        ring_comms_t ring;
+        set_codec(modes[m]);
+        set_fault(0u, 1u, false);
+        if (!setup_ring(net, &ring) || (m == 0 && !test_cold_sack_recovery(net, &ring, get_stats, reset_stats))) {
+            teardown_ring(net, &ring);
+            ok = false;
+            continue;
+        }
+        reset_stats();
+        bool transferred = run_host_ring_allreduce(net, &ring, 32768u, 99u);
+        vxfec_nccl_stats_t st;
+        get_stats(&st);
+        uint64_t extra = st.tx_sack_retx_pkts + st.tx_harq_ir_pkts + st.tx_proactive_rep_pkts;
+        if (!transferred || extra > st.tx_sys_pkts / 20u) {
+            fprintf(stderr, "FAIL: 10 ms RTT %s lossless control (sys=%lu extra=%lu)\n", modes[m], (unsigned long)st.tx_sys_pkts,
+                    (unsigned long)extra);
+            ok = false;
+        }
+
+        set_fault(20000u, 6u, true);
+        reset_stats();
+        for (uint32_t i = 0; i < 3 && transferred; i++)
+            transferred = run_host_ring_allreduce(net, &ring, 32768u, 100u + i);
+        get_stats(&st);
+        teardown_ring(net, &ring);
+
+        extra = st.tx_sack_retx_pkts + st.tx_harq_ir_pkts + st.tx_proactive_rep_pkts;
+        bool recovered = m == 0 ? st.tx_sack_retx_pkts > 0 : st.rx_rs8_decodes > 0;
+        /* allow burst adaptation and parity while catching repeated requests for in-flight packets */
+        if (!transferred || !st.sim_dropped_pkts || !recovered || extra > st.tx_sys_pkts / 4u) {
+            fprintf(stderr, "FAIL: 10 ms RTT %s recovery (drops=%lu sys=%lu retx=%lu ir=%lu proactive=%lu rs8_dec=%lu)\n", modes[m],
+                    (unsigned long)st.sim_dropped_pkts, (unsigned long)st.tx_sys_pkts, (unsigned long)st.tx_sack_retx_pkts,
+                    (unsigned long)st.tx_harq_ir_pkts, (unsigned long)st.tx_proactive_rep_pkts, (unsigned long)st.rx_rs8_decodes);
+            ok = false;
+        }
+    }
+    set_fault(0u, 1u, false);
+    set_delay(0u);
+    set_codec(NULL);
+    if (ok)
+        printf("PASS: bounded SACK and RS8 recovery at 10 ms RTT under 2%% burst loss\n");
     return ok;
 }
 
@@ -5577,7 +5692,8 @@ static int count_self_fds(void)
 }
 
 static bool test_lost_done_and_send_abort_and_close_listen(const ncclNet_v8_t *net, void (*set_hs_fault)(uint32_t, uint32_t),
-                                                           void (*set_done_fault)(uint32_t), void (*set_abort_fault)(uint32_t))
+                                                           void (*set_done_fault)(uint32_t), void (*set_abort_fault)(uint32_t),
+                                                           void (*set_delay)(uint64_t))
 {
     /* 1) closeListen immediately after accept with dropped HELLO_ACK must connect within < 100 tight polls */
     {
@@ -5632,6 +5748,7 @@ static bool test_lost_done_and_send_abort_and_close_listen(const ncclNet_v8_t *n
         uint8_t tx_buf[8192], rx_buf[8192] = {0};
         for (size_t i = 0; i < sizeof(tx_buf); i++)
             tx_buf[i] = (uint8_t)((i * 41u + 9u) & 0xffu);
+        set_delay(5000000ULL);
         set_done_fault(4u);
         void *sreq = NULL, *rreq = NULL, *rptr = rx_buf;
         int cap = (int)sizeof(rx_buf), tag = 910, sdone = 0, rdone = 0, got = 0;
@@ -5671,6 +5788,7 @@ static bool test_lost_done_and_send_abort_and_close_listen(const ncclNet_v8_t *n
                 usleep(200);
         }
         set_done_fault(0u);
+        set_delay(0u);
         if (!sdone) {
             net->closeSend(sc);
             net->closeRecv(rc);
@@ -6156,13 +6274,14 @@ int main(int argc, char **argv)
     void (*set_hs_fault)(uint32_t, uint32_t) = (void (*)(uint32_t, uint32_t))dlsym(dl, "vxfec_nccl_set_handshake_fault");
     void (*set_done_fault)(uint32_t) = (void (*)(uint32_t))dlsym(dl, "vxfec_nccl_set_done_fault");
     void (*set_abort_fault)(uint32_t) = (void (*)(uint32_t))dlsym(dl, "vxfec_nccl_set_abort_fault");
+    void (*set_delay)(uint64_t) = (void (*)(uint64_t))dlsym(dl, "vxfec_nccl_set_link_delay_ns");
     void (*set_gpu_rx_fault)(uint32_t) = (void (*)(uint32_t))dlsym(dl, "vxfec_nccl_set_gpu_rx_fault");
     void (*set_cong)(uint32_t, uint32_t, uint64_t) =
         (void (*)(uint32_t, uint32_t, uint64_t))dlsym(dl, "vxfec_nccl_set_congestion_sim");
     void (*set_codec)(const char *) = (void (*)(const char *))dlsym(dl, "vxfec_nccl_set_codec_override");
 
     if (!net || !get_stats_v1 || !get_stats || !reset_stats || !set_fault || !set_hs_fault || !set_done_fault || !set_abort_fault ||
-        !set_gpu_rx_fault || !set_cong || !set_codec) {
+        !set_delay || !set_gpu_rx_fault || !set_cong || !set_codec) {
         fprintf(stderr, "FAIL: missing symbols in libnccl-vxfec.so\n");
         dlclose(dl);
         return 1;
@@ -6184,7 +6303,8 @@ int main(int argc, char **argv)
     printf("Loaded plugin '%s' (dev='%s', speed=%d Mbps, ptrSupport=0x%x)\n", net->name, props.name, props.speed, props.ptrSupport);
 
     if (!test_path_mtu_limits(net) || !test_fresh_ecn_feedback(net) || !test_low_rate_cap_and_tail_clock(net, set_cong) ||
-        !test_lost_done_and_send_abort_and_close_listen(net, set_hs_fault, set_done_fault, set_abort_fault)) {
+        !test_lost_done_and_send_abort_and_close_listen(net, set_hs_fault, set_done_fault, set_abort_fault, set_delay)) {
+        set_delay(0u);
         dlclose(dl);
         return 1;
     }
@@ -6343,6 +6463,9 @@ int main(int argc, char **argv)
         goto fail;
 
     if (!test_rs8_subblock_slicing_and_multichannel(net, &props, get_stats, reset_stats, set_fault))
+        goto fail;
+
+    if (!test_delayed_loss_recovery(net, get_stats, reset_stats, set_fault, set_delay, set_codec))
         goto fail;
 
     teardown_ring(net, &ring);

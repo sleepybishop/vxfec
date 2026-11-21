@@ -441,13 +441,16 @@ typedef struct vxfec_tx_req_impl {
     uint32_t win_ecn_port_mask;
     uint64_t win_acked_bytes;
     uint64_t queued_bytes;
+    uint64_t first_sys_tx_ns;
     uint64_t ack_probe_tx_ns;
     uint64_t last_send_ns;
     uint64_t burst_end_tx_ns;
     uint64_t last_tail_ns;
+    uint64_t last_sack_tx_ns;
     uint64_t last_ir_tx_ns;
     uint32_t last_ir_ctrl_esi;
     uint32_t last_ir_ctrl_cnt;
+    uint8_t last_ir_ctrl_codec;
     bool initial_tail_sent;
     bool retx_or_ir_sent;
 
@@ -659,6 +662,9 @@ struct vxfec_recv_comm {
     vxfec_delay_data_t *delay_q;
     uint32_t delay_head;
     uint32_t delay_cnt;
+    vxfec_delay_ctrl_t *header_delay_q;
+    uint32_t header_delay_head;
+    uint32_t header_delay_cnt;
 #endif
 
     vxfec_stage_slot_t stage_pool[VXFEC_STAGE_POOL_SLOTS];
@@ -923,6 +929,10 @@ uint64_t vxf_next_unique_u64(void);
 uint32_t vxf_next_unique_u32(void);
 void vxf_accept_node_release(vxfec_accept_node_t *node);
 void vxf_rx_bg_wake(void);
+#if VXFEC_ENABLE_SIM
+void vxf_rx_bg_schedule_delay(void);
+uint64_t vxf_rx_deliver_due_headers(vxfec_recv_comm_t *comm, uint64_t now_ns);
+#endif
 void vxf_rx_bg_register(vxfec_recv_comm_t *rc);
 void vxf_rx_bg_unregister(vxfec_recv_comm_t *rc);
 void vxf_tx_bg_register(vxfec_send_comm_t *sc);

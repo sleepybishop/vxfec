@@ -11,11 +11,11 @@ fi
 
 GCP_PROJECT="${GCP_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
 : "${GCP_PROJECT:?Set GCP_PROJECT=<project-id>}"
-VM_REGEX='^vxfec-bench-(g2-[01]|g2-xzone|a3-[01]|nic-[01]|nic-xzone|nic-wan|n[01]|n-xzone|n-wan|t1-[01])$'
+VM_REGEX='^vxfec-bench-(g2-[01]|g2-xzone|a3-[01]|u[01]|nic-[01]|nic-xzone|nic-wan|n[01]|n-xzone|n-wan|t1-[01])$'
 POL_REGEX='^vxfec-bench-compact-[a-z0-9-]+$'
-FW_REGEX='^vxfec-bench-(vpc-allow-(internal|ssh)|vpc2-allow-internal|(vpc[234]|vpc-gpunic[0-9]+)-internal|r[0-9a-f]{16}-(gpunic[0-9]+-internal|vpc[234]-(allow-)?internal))$'
-SUB_REGEX='^vxfec-bench-(subnet[234]?-[a-z0-9-]+(-gpunic[0-9]+)?|r[0-9a-f]{16}-(gpusub[0-9]+|sub[234](-[a-z0-9-]+)?))$'
-VPC_REGEX='^vxfec-bench-(vpc([234]|-gpunic[0-9]+)?|r[0-9a-f]{16}-(gpunic[0-9]+|vpc[234]))$'
+FW_REGEX='^vxfec-bench-(vpc-allow-(internal|ssh)|vpc2-allow-internal|(vpc[234]|vpc-gpunic[0-9]+|gvnic[0-9]+)-internal|r[0-9a-f]{16}-((gpunic|gvnic)[0-9]+-internal|vpc[234]-(allow-)?internal))$'
+SUB_REGEX='^vxfec-bench-(subnet[234]?-[a-z0-9-]+(-gpunic[0-9]+)?|r[0-9a-f]{16}-((gpusub|gvsub|rocesub)[0-9]+|sub[234](-[a-z0-9-]+)?))$'
+VPC_REGEX='^vxfec-bench-(vpc([234]|-gpunic[0-9]+)?|r[0-9a-f]{16}-((gpunic|gvnic)[0-9]+|roce|vpc[234]))$'
 EXIT_RC=0
 
 run_delete_ignore_not_found() {

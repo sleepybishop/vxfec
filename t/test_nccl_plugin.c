@@ -2813,9 +2813,15 @@ static bool test_rq_wire_selection(const ncclNet_v8_t *net, void (*set_codec)(co
     memcpy(handle, &h, sizeof(h));
 
     uint8_t expected = 0;
+    bool ack_sent = false;
     for (int spin = 0; spin < 50000 && !sc; spin++) {
         if (net->connect(0, handle, &sc, NULL) != ncclSuccess)
             goto out;
+        if (sc || ack_sent) {
+            if (ack_sent && !sc)
+                sched_yield();
+            continue;
+        }
         test_hello_t hello;
         struct sockaddr_in peer;
         socklen_t plen = sizeof(peer);
@@ -2854,6 +2860,7 @@ static bool test_rq_wire_selection(const ncclNet_v8_t *net, void (*set_codec)(co
             ack.rx_ports_be[p] = addr.sin_port;
         if (sendto(fd, &ack, sizeof(ack), 0, (struct sockaddr *)&peer, plen) != sizeof(ack))
             goto out;
+        ack_sent = true;
 #ifdef NANORQ_HAS_GF2_MODE
         if (!(hello.features & 1u))
             goto out;

@@ -50,7 +50,7 @@ for reg in "${REGIONS[@]}"; do
     gcloud compute regions describe "${reg}" --project="${GCP_PROJECT}" \
         --flatten="quotas[]" \
         --format="table(quotas.metric,quotas.limit,quotas.usage)" \
-        | grep -E "METRIC|${QUOTA_METRICS}|NVIDIA_V100_GPUS|PREEMPTIBLE_NVIDIA_V100_GPUS" || echo "  (unable to query ${reg})"
+        | grep -E "METRIC|^CPUS |PREEMPTIBLE_CPUS|${QUOTA_METRICS}|NVIDIA_V100_GPUS|PREEMPTIBLE_NVIDIA_V100_GPUS" || echo "  (unable to query ${reg})"
 done
 
 echo ""

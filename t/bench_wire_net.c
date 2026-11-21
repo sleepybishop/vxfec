@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define WIRE_NET_MAGIC 0x5658574Eu /* "VXWN" */
+#define WIRE_NET_MAGIC 0x5658574Eu          /* "VXWN" */
 #define WIRE_NET_GDR_MAGIC 0x56584752u      /* "VXGR": DMA-BUF required on both peers */
 #define WIRE_NET_PIPELINE_MAGIC 0x56584750u /* "VXGP": two RX DMA-BUF regions */
 #define WIRE_NET_MAX_RAILS 128u
@@ -748,7 +748,7 @@ static int open_bidir_sync_socket(const char *spec, bool leader)
     return vxfec_bench_tcp_connect_retry(peer_ip, port, 350, 100000000L);
 }
 
-static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t Z, size_t wpb, uint64_t total_frames,
+static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t ibv_qps, uint32_t Z, size_t wpb, uint64_t total_frames,
                               uint64_t expected_frames, bool require_tails, uint64_t *rx_bits, wire_ctrl_result_t *res)
 {
     uint32_t it = res->iter;
@@ -756,7 +756,7 @@ static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t Z, s
     uint64_t f_ns = 0, l_ns = 0;
     uint64_t tail_ns = 0;
     uint32_t tail_qps = 0u;
-    const uint32_t all_qps = (1u << WIRE_NET_IBV_QPS) - 1u;
+    const uint32_t all_qps = (ibv_qps >= 32u) ? UINT32_MAX : ((1u << ibv_qps) - 1u);
     uint64_t wait_start_ns = now_ns();
     uint64_t last_prog_ns = wait_start_ns;
     uint32_t empty_polls = 0;
@@ -1005,8 +1005,9 @@ static void *recover_wire_frames(void *arg)
     }
 }
 
-static bool receive_pipelined_frames(int ctrl_fd, vxfec_ibv_ep_t *ep, const wire_ctrl_handshake_t *hs, wire_rx_recovery_t job,
-                                     vxfec_vk_buf *second_vram, uint64_t *masks, wire_delivery_stats_t *stats)
+static bool receive_pipelined_frames(int ctrl_fd, vxfec_ibv_ep_t *ep, uint32_t ibv_qps, const wire_ctrl_handshake_t *hs,
+                                     wire_rx_recovery_t job, vxfec_vk_buf *second_vram, uint64_t *masks,
+                                     wire_delivery_stats_t *stats)
 {
     wire_recovery_worker_t worker = {0};
     if (sem_init(&worker.work, 0, 0) != 0) {
@@ -1043,7 +1044,7 @@ static bool receive_pipelined_frames(int ctrl_fd, vxfec_ibv_ep_t *ep, const wire
         uint64_t ready_ns = now_ns();
         /* The ACK grants access to this slot. Its previous recovery and reinitialization already finished. */
         if (!write_all(ctrl_fd, &it, sizeof(it)) ||
-            !receive_ibv_frame(ep, ctrl_fd, job.Z, job.wpb, total_frames, expected_frames, true, bits, &received)) {
+            !receive_ibv_frame(ep, ctrl_fd, ibv_qps, job.Z, job.wpb, total_frames, expected_frames, true, bits, &received)) {
             ok = false;
             break;
         }
@@ -1182,6 +1183,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     vxfec_ibv_mr_t *ibv_mr = NULL;
     vxfec_ibv_mr_t *second_mr = NULL;
     vxfec_ibv_ep_t *ibv_ep = NULL;
+    uint32_t ibv_qps = WIRE_NET_IBV_QPS;
     wire_ctrl_handshake_t rx_hs = tx_hs;
 
     if ((!cfg->gdr && !rx_host) || !rx_verify || !rx_bits_atomic || !rx_bits || (!is_wire_only && !rx_ring) ||
@@ -1231,11 +1233,14 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             if (mr_ptr)
                 ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, mr_ptr, wire_bytes, true);
         }
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, WIRE_NET_IBV_QPS, 256u, false, true, &rx_hs.ibv_info);
+        setenv("VXFEC_IBV_RX_DEPTH", "4096", 0);
+        ibv_qps = (tx_hs.rails > 0u && tx_hs.rails <= VXFEC_IBV_MAX_QPS) ? tx_hs.rails : WIRE_NET_IBV_QPS;
+        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, ibv_qps, 256u, false, true, &rx_hs.ibv_info);
         if (!ibv_mr || !ibv_ep || !vxfec_ibv_ep_connect(ibv_ep, &tx_hs.ibv_info, 0)) {
             fprintf(stderr, "Failed to setup RX ibverbs endpoint/MR\n");
             goto cleanup;
         }
+        rx_hs.rails = ibv_qps;
         rx_hs.remote_iova = vxfec_ibv_mr_iova(ibv_mr);
         rx_hs.remote_rkey = vxfec_ibv_mr_rkey(ibv_mr);
         rx_hs.gdr_dmabuf = gdr_dmabuf ? 1u : 0u;
@@ -1316,7 +1321,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         .wire_only = is_wire_only,
     };
     if (gdr_pipeline) {
-        rx_aborted = !receive_pipelined_frames(ctrl_fd, ibv_ep, &tx_hs, job, second_vram, rx_bits, &stats);
+        rx_aborted = !receive_pipelined_frames(ctrl_fd, ibv_ep, ibv_qps, &tx_hs, job, second_vram, rx_bits, &stats);
         goto cleanup;
     }
 
@@ -1362,7 +1367,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 break;
             }
             wire_ctrl_result_t received = {.iter = it};
-            if (!receive_ibv_frame(ibv_ep, ctrl_fd, Z, wpb, total_frames, expected_frames, cfg->gdr, rx_bits, &received)) {
+            if (!receive_ibv_frame(ibv_ep, ctrl_fd, ibv_qps, Z, wpb, total_frames, expected_frames, cfg->gdr, rx_bits, &received)) {
                 rx_aborted = true;
                 break;
             }
@@ -1644,7 +1649,9 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     if (cfg->use_ibv) {
         if (!ibv_mr)
             ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, WIRE_NET_IBV_QPS, 256u, true, false, &hs.ibv_info);
+        uint32_t ibv_qps = (hs.rails > 0u && hs.rails <= VXFEC_IBV_MAX_QPS) ? hs.rails : WIRE_NET_IBV_QPS;
+        hs.rails = ibv_qps;
+        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, ibv_qps, 256u, true, false, &hs.ibv_info);
         if (!ibv_mr || !ibv_ep) {
             fprintf(stderr, "TX failed to create ibverbs MR/EP\n");
             goto tx_cleanup;
@@ -1676,7 +1683,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     }
 
     struct sockaddr_in peer_addrs[WIRE_NET_MAX_RAILS];
-    uint32_t rails = cfg->use_ibv ? WIRE_NET_IBV_QPS : rx_hs.rails;
+    uint32_t rails = cfg->use_ibv ? (rx_hs.rails ? rx_hs.rails : WIRE_NET_IBV_QPS) : rx_hs.rails;
     if (!cfg->use_ibv) {
         uint32_t idx = 0;
         for (uint32_t ip_i = 0; ip_i < n_peers && idx < rails && idx < WIRE_NET_MAX_RAILS; ip_i++) {
@@ -1789,8 +1796,8 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         continue;
                     uint64_t offset = seq * (uint64_t)T;
                     const void *src = (const void *)(uintptr_t)(src_iova + offset);
-                    while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, (uint32_t)(seq % WIRE_NET_IBV_QPS), src, T, lkey,
-                                                        region->iova + offset, region->rkey, (uint32_t)seq)) {
+                    while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, (uint32_t)(seq % rails), src, T, lkey, region->iova + offset,
+                                                        region->rkey, (uint32_t)seq)) {
                         vxfec_ibv_ep_drain_tx(ibv_ep);
                         if (vxfec_ibv_ep_has_error(ibv_ep))
                             break;
@@ -1799,7 +1806,8 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         break;
                 }
                 if (!vxfec_ibv_ep_has_error(ibv_ep)) {
-                    for (uint32_t q = 0; q < WIRE_NET_IBV_QPS; q++) {
+                    uint64_t tail_seqs[VXFEC_IBV_MAX_QPS] = {0};
+                    for (uint32_t q = 0; q < rails; q++) {
                         while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, q, NULL, 0u, lkey, region->iova, region->rkey, UINT32_MAX)) {
                             vxfec_ibv_ep_drain_tx(ibv_ep);
                             if (vxfec_ibv_ep_has_error(ibv_ep))
@@ -1807,8 +1815,14 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         }
                         if (vxfec_ibv_ep_has_error(ibv_ep))
                             break;
+                        vxfec_ibv_ep_record_qp_tail(ibv_ep, q, tail_seqs);
                     }
-                    vxfec_ibv_ep_drain_tx(ibv_ep);
+                    if (gdr_pipeline) {
+                        vxfec_ibv_ep_drain_tx(ibv_ep);
+                    } else {
+                        while (!vxfec_ibv_ep_has_error(ibv_ep) && !vxfec_ibv_ep_tx_done(ibv_ep, tail_seqs))
+                            vxfec_ibv_ep_drain_tx(ibv_ep);
+                    }
                 }
                 if (vxfec_ibv_ep_has_error(ibv_ep)) {
                     fprintf(stderr, "ERROR: TX ibverbs fatal CQ/send failure at iter %u\n", it);

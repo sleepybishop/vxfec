@@ -1,0 +1,2 @@
+# vulkan loader / mesa icd one-time init allocations left behind after icd dlclose
+leak:vkEnumeratePhysicalDevices

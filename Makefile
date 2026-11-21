@@ -24,6 +24,7 @@ CFLAGS      ?= -O3 -g -std=c11 -Wall -Wextra $(ARCH_FLAGS) -funroll-loops -ftree
 BUILD_DIR   ?= build
 OUT_PREFIX  ?=
 ASAN_DIR     = build-asan
+LSAN_SUPP   ?= $(abspath t/lsan.supp)
 
 NANORQ_CORE_NAMES = \
 	chooser \
@@ -198,6 +199,7 @@ demo-nccl: $(OUT_PREFIX)demo_nccl_e2e $(NCCL_SO)
 
 asan:
 	$(RM) -r $(ASAN_DIR)
+	LSAN_OPTIONS="$${LSAN_OPTIONS:+$$LSAN_OPTIONS:}suppressions=$(LSAN_SUPP)" \
 	$(MAKE) CC=clang ARCH_FLAGS="" BUILD_DIR=$(ASAN_DIR) OUT_PREFIX=$(ASAN_DIR)/ \
 		CFLAGS="-O1 -g -std=c11 -Wall -Wextra -fPIC -fvisibility=hidden -fsanitize=address,undefined -Wno-unused-parameter" \
 		LDFLAGS="-fsanitize=address,undefined" \

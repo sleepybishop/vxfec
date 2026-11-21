@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -102,6 +103,15 @@ static inline int vxfec_bench_tcp_listen_accept_one(struct in_addr bind_ip, uint
     baddr.sin_addr = bind_ip;
     baddr.sin_port = htons(port);
     if (bind(lfd, (struct sockaddr *)&baddr, sizeof(baddr)) < 0 || listen(lfd, 4) < 0) {
+        close(lfd);
+        return -1;
+    }
+    struct pollfd pfd = {.fd = lfd, .events = POLLIN, .revents = 0};
+    int prc;
+    do {
+        prc = poll(&pfd, 1, 45000);
+    } while (prc < 0 && errno == EINTR);
+    if (prc <= 0) {
         close(lfd);
         return -1;
     }

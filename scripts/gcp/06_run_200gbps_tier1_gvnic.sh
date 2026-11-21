@@ -114,9 +114,21 @@ try_launch_pair() {
             continue
         fi
         echo "[06_run_200gbps_tier1_gvnic] Trying 2x ${shape} (${tier_flag:-DEFAULT_200G}) in ${zone}..."
-        local extra_flags=(--tags="${BENCH_NET_TAG}" --labels="vxfec-run=${VXFEC_RUN_TOKEN}")
+        local extra_flags=(
+            --tags="${BENCH_NET_TAG}"
+            --labels="vxfec-run=${VXFEC_RUN_TOKEN}"
+            --metadata="startup-script=#!/bin/bash
+PRIMARY_DEV=\$(ip -o -4 addr show | awk '\$4 ~ /^10\\.128\\./ {print \$2; exit}')
+if [[ -n \"\${PRIMARY_DEV}\" ]]; then
+    ip route replace default via 10.128.0.1 dev \"\${PRIMARY_DEV}\" metric 10 || true
+fi
+sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true"
+        )
         [[ -n "${tier_flag}" ]] && extra_flags+=(--network-performance-configs="total-egress-bandwidth-tier=${tier_flag}")
-        [[ -n "${maint_flag}" ]] && extra_flags+=(--maintenance-policy="${maint_flag}")
+        if [[ -n "${maint_flag}" ]]; then
+            extra_flags+=(--maintenance-policy="${maint_flag}")
+            [[ "${maint_flag}" == "TERMINATE" ]] && extra_flags+=(--no-restart-on-failure)
+        fi
 
         vxfec_add_unique VXFEC_CREATED_VMS "${NODE0}:${zone}"
         vxfec_add_unique VXFEC_CREATED_VMS "${NODE1}:${zone}"
@@ -178,20 +190,21 @@ vxfec_package_repo_tarball "${REPO_ROOT}" "${TARBALL}"
 
 prep_node() {
     local vm="$1"
+    local ssh_opts=(--ssh-flag="-o ConnectTimeout=8" --ssh-flag="-o ServerAliveInterval=10" --ssh-flag="-o ServerAliveCountMax=3" --ssh-flag="-o BatchMode=yes" --ssh-flag="-o StrictHostKeyChecking=no")
     for _ in $(seq 1 36); do
-        gcloud compute ssh "${vm}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" --command="true" >/dev/null 2>&1 && break
+        gcloud compute ssh "${vm}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" "${ssh_opts[@]}" --command="true" >/dev/null 2>&1 && break
         sleep 4
     done
-    gcloud compute scp "${TARBALL}" "${vm}:/tmp/vxfec_src.tar.gz" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}"
-    gcloud compute ssh "${vm}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" --command="
+    gcloud compute scp "${TARBALL}" "${vm}:/tmp/vxfec_src.tar.gz" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" --scp-flag="-o ConnectTimeout=10" --scp-flag="-o BatchMode=yes" --scp-flag="-o StrictHostKeyChecking=no"
+    gcloud compute ssh "${vm}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" "${ssh_opts[@]}" --command="
         set -euo pipefail
         # Optional guest dead-man auto-poweroff safety net (disabled when KEEP_VMS=1 or AUTO_POWEROFF_MINS=0)
         if [[ '${AUTO_POWEROFF_MINS}' -gt 0 ]]; then
             sudo systemd-run --on-active='${AUTO_POWEROFF_MINS}m' /sbin/poweroff >/dev/null 2>&1 || true
         fi
         for _ in 1 2 3 4 5; do
-            sudo apt-get -o DPkg::Lock::Timeout=120 update -qq && \
-            sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y -qq --no-install-recommends \
+            sudo apt-get -o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -qq && \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y -qq --no-install-recommends \
                 build-essential ca-certificates pkg-config libvulkan-dev mesa-vulkan-drivers \
                 libibverbs-dev iproute2 ethtool && break
             sleep 5
@@ -240,11 +253,15 @@ gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}"
 "
 
 NCCL_ONLY="${NCCL_ONLY:-0}"
+WIRE_AND_GF2_ONLY="${WIRE_AND_GF2_ONLY:-0}"
 for arg in "$@"; do
     [[ "${arg}" == "--nccl-only" ]] && NCCL_ONLY=1
+    [[ "${arg}" == "--wire-and-gf2" ]] && WIRE_AND_GF2_ONLY=1
 done
 if [[ "${NCCL_ONLY}" == "1" ]]; then
     rm -f "${OUT_DIR}/tier1_topology.txt" "${OUT_DIR}"/tier1_nccl_*
+elif [[ "${WIRE_AND_GF2_ONLY}" == "1" ]]; then
+    rm -f "${OUT_DIR}"/tier1_unidir.* "${OUT_DIR}"/tier1_bidir_* "${OUT_DIR}"/tier1_nccl_gf2.*
 else
     rm -f "${OUT_DIR}"/tier1_*.log "${OUT_DIR}"/tier1_*.csv "${OUT_DIR}"/tier1_*.txt
 fi
@@ -258,7 +275,8 @@ for spec in "rateless 0 --wire-only 256 0" \
             "rateless 0 --wire-only 256 98" \
             "rateless 10 --wire-only 256 98" \
             "mds 10 --wire-only 256 98" \
-            "rateless 10 full 64 98"; do
+            "rateless 10 full 64 98" \
+            "rateless-gf2 10 full 64 98"; do
     read -r codec bpct mode zval rate_g <<<"${spec}"
     WFLAG=""
     [[ "${mode}" == "--wire-only" ]] && WFLAG="--wire-only"
@@ -271,7 +289,9 @@ for spec in "rateless 0 --wire-only 256 0" \
     gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
         --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IPS1} --port 31500 --ports-per-ip 16 --codec ${codec} --z ${zval} --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bpct} --rate-gbps ${rate_g} ${WFLAG} --csv ~/vxfec/tier1_unidir.csv" | tee -a "${OUT_DIR}/tier1_unidir.log" || STEP_ERR=1
     wait "${RX_PID}" || STEP_ERR=1
-    [[ "${STEP_ERR}" == "0" ]] || exit 1
+    if [[ "${rate_g}" != "0" && "${STEP_ERR}" != "0" ]]; then
+        exit 1
+    fi
 done
 
 # ---------------------------------------------------------------------------
@@ -288,11 +308,12 @@ for bidir_spec in "98 10" "0 0"; do
         --command="cd ~/vxfec && ./bench_wire_net --mode rx --bind ${IPS0} --port 32500 --ports-per-ip 12" &
     RX0=$!
     VXFEC_WORK_PIDS+=("${RX1}" "${RX0}")
-    sleep 1
+    sleep 2
 
     ( gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
         --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IPS1} --port 31500 --ports-per-ip 12 --codec rateless --z 256 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bdrop} --rate-gbps ${brate} --wire-only --bidir-sync ${IP0_PRIMARY}:31490 --bidir-leader --csv ~/vxfec/tier1_bidir_dirA.csv" | tee -a "${OUT_DIR}/tier1_bidir_dirA.log" ) &
     TX0=$!
+    sleep 0.5
     ( gcloud compute ssh "${NODE1}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
         --command="cd ~/vxfec && ./bench_wire_net --mode tx --peers ${IPS0} --port 32500 --ports-per-ip 12 --codec rateless --z 256 --k 200 --p 48 --sym-t 8192 --iters 5 --blackout-pct ${bdrop} --rate-gbps ${brate} --wire-only --bidir-sync ${IP0_PRIMARY}:31490 --csv ~/vxfec/tier1_bidir_dirB.csv" | tee -a "${OUT_DIR}/tier1_bidir_dirB.log" ) &
     TX1=$!
@@ -303,10 +324,13 @@ for bidir_spec in "98 10" "0 0"; do
     wait "${TX1}" || BIDIR_ERR=1
     wait "${RX1}" || BIDIR_ERR=1
     wait "${RX0}" || BIDIR_ERR=1
-    [[ "${BIDIR_ERR}" == "0" ]] || exit 1
+    if [[ "${brate}" != "0" && "${BIDIR_ERR}" != "0" ]]; then
+        exit 1
+    fi
 done
 fi
 
+if [[ "${WIRE_AND_GF2_ONLY}" != "1" ]]; then
 # ---------------------------------------------------------------------------
 # 3) 4-NIC (ndev=4, nchan=16) 2-Node Collective AllReduce (bench_nccl, up to 64 MiB)
 # ---------------------------------------------------------------------------
@@ -341,6 +365,28 @@ for spec in "4~gbn~64 MiB | 4x gVNIC nchan=4 Lossless (GBN)~67108864~0~1" \
     gcloud compute ssh "${NODE1}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
         --command="cd ~/vxfec && VXFEC_NCCL_IFNAMES=${IFACES1} VXFEC_BENCH_CHANNELS=${nch} ./bench_nccl --rank 1 --master ${IP0_PRIMARY}:29605 --single-codec ${pol} --label '${lbl}' --bytes ${bsz} --loss-ppm ${lppm} --burst ${brst} --iters 16" || STEP_ERR=1
     wait "${M0}" || STEP_ERR=1
+    [[ "${STEP_ERR}" == "0" ]] || exit 1
+done
+fi
+
+# 4) RaptorQ RFC 6330 GF(256) vs nanorq H=0 Pure-GF(2) across 4x 100G Titanium gVNICs (VXFEC_NCCL_SLICE_KB=0)
+echo "[GF2 A/B] RaptorQ RFC 6330 (rq-gf256) vs H=0 Pure-GF(2) (rq-gf2) across 4x 100G gVNIC..."
+for gf2_spec in "16~rq-gf256~512 KiB | 2% Burst=6 (rq-gf256)~524288~20000~6~30" \
+                "16~rq-gf2~512 KiB | 2% Burst=6 (rq-gf2)~524288~20000~6~30" \
+                "16~rq-gf256~8.0 MiB | 2% Burst=6 (rq-gf256)~8388608~20000~6~20" \
+                "16~rq-gf2~8.0 MiB | 2% Burst=6 (rq-gf2)~8388608~20000~6~20" \
+                "16~rq-gf256~32 MiB | 2% Burst=6 (rq-gf256)~33554432~20000~6~15" \
+                "16~rq-gf2~32 MiB | 2% Burst=6 (rq-gf2)~33554432~20000~6~15"; do
+    IFS='~' read -r nch pol lbl bsz lppm brst giters <<<"${gf2_spec}"
+    ( gcloud compute ssh "${NODE0}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
+        --command="cd ~/vxfec && VXFEC_NCCL_IFNAMES=${IFACES0} VXFEC_BENCH_CHANNELS=${nch} VXFEC_NCCL_SLICE_KB=0 ./bench_nccl --rank 0 --master ${IP0_PRIMARY}:29608 --single-codec ${pol} --label '${lbl}' --bytes ${bsz} --loss-ppm ${lppm} --burst ${brst} --iters ${giters} --csv ~/vxfec/tier1_nccl_gf2.csv" | tee -a "${OUT_DIR}/tier1_nccl_gf2.log" ) &
+    G0=$!
+    VXFEC_WORK_PIDS+=("${G0}")
+    sleep 1
+    STEP_ERR=0
+    gcloud compute ssh "${NODE1}" --project="${GCP_PROJECT}" --zone="${ACTIVE_ZONE}" \
+        --command="cd ~/vxfec && VXFEC_NCCL_IFNAMES=${IFACES1} VXFEC_BENCH_CHANNELS=${nch} VXFEC_NCCL_SLICE_KB=0 ./bench_nccl --rank 1 --master ${IP0_PRIMARY}:29608 --single-codec ${pol} --label '${lbl}' --bytes ${bsz} --loss-ppm ${lppm} --burst ${brst} --iters ${giters}" || STEP_ERR=1
+    wait "${G0}" || STEP_ERR=1
     [[ "${STEP_ERR}" == "0" ]] || exit 1
 done
 

@@ -9,7 +9,7 @@ Building the repository produces:
 
 ![vxfec Benchmarks](docs/vxfec_benchmarks.png)
 
-*On the CPU-only intra-zone link with 2% burst loss, SACK reached 71.5 Gbps on a 64 MiB AllReduce versus 63.1 Gbps for `auto` FEC. On the cross-zone and WAN runs, vxfec had lower p99 completion times than SACK.*
+*On the CPU-only intra-zone link with 2% burst loss, SACK reached 63.0 Gbps on a 64 MiB AllReduce (16 channels) versus 58.7 Gbps for `auto` FEC (68.2 vs. 60.2 Gbps at 32 channels). On the cross-zone and WAN runs, vxfec had lower tail completion times than SACK.*
 
 ## Quick Start
 

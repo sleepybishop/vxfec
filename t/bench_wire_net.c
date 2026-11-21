@@ -203,7 +203,12 @@ typedef struct {
     uint64_t drop_end;
     uint32_t loss_ppm;
     double rail_rate_gbps;
+    _Atomic uint32_t *ready_workers;
+    _Atomic bool *go_flag;
     uint64_t sent_frames;
+    uint64_t my_first_ns;
+    uint64_t my_last_ns;
+    uint8_t pad[64];
 } udp_tx_worker_t;
 
 static void send_tail_beacons(const int *tx_fds, const struct sockaddr_in *peers, uint32_t rails, uint16_t iter)
@@ -244,8 +249,16 @@ static void *udp_tx_worker_fn(void *arg)
     uint64_t rng = 0x123456789abcdef0ULL ^ ((uint64_t)w->rail_idx << 32) ^ (uint64_t)w->iter;
     uint32_t batch_n = 0;
     uint64_t sent_total = 0;
-    uint64_t t_start = now_ns();
+    uint64_t first_ns = 0, last_ns = 0;
     double bits_per_pkt = 8.0 * (double)(28u + sizeof(wire_pkt_hdr_t) + w->T);
+
+    if (w->ready_workers)
+        atomic_fetch_add_explicit(w->ready_workers, 1u, memory_order_release);
+    if (w->go_flag) {
+        while (!atomic_load_explicit(w->go_flag, memory_order_acquire)) {
+        }
+    }
+    uint64_t t_start = now_ns();
 
     for (uint64_t seq = w->rail_idx; seq < w->total_frames; seq += w->num_rails) {
         if (seq >= w->drop_beg && seq < w->drop_end)
@@ -270,6 +283,8 @@ static void *udp_tx_worker_fn(void *arg)
         batch_n++;
 
         if (batch_n == WIRE_NET_BATCH) {
+            if (first_ns == 0)
+                first_ns = now_ns();
             uint32_t off = 0;
             while (off < batch_n) {
                 int rc = sendmmsg(w->fd, &msgs[off], batch_n - off, 0);
@@ -281,6 +296,7 @@ static void *udp_tx_worker_fn(void *arg)
                 off += (uint32_t)rc;
                 sent_total += (uint64_t)rc;
             }
+            last_ns = now_ns();
             batch_n = 0;
             if (w->rail_rate_gbps > 0.0) {
                 uint64_t target_ns = t_start + (uint64_t)(((double)sent_total * bits_per_pkt) / w->rail_rate_gbps);
@@ -292,6 +308,8 @@ static void *udp_tx_worker_fn(void *arg)
     }
 
     if (batch_n > 0) {
+        if (first_ns == 0)
+            first_ns = now_ns();
         uint32_t off = 0;
         while (off < batch_n) {
             int rc = sendmmsg(w->fd, &msgs[off], batch_n - off, 0);
@@ -303,9 +321,12 @@ static void *udp_tx_worker_fn(void *arg)
             off += (uint32_t)rc;
             sent_total += (uint64_t)rc;
         }
+        last_ns = now_ns();
     }
 
     w->sent_frames = sent_total;
+    w->my_first_ns = first_ns;
+    w->my_last_ns = last_ns;
     return NULL;
 }
 
@@ -354,6 +375,8 @@ static void *udp_rx_worker_fn(void *arg)
     uint64_t total_slots = (uint64_t)(w->K + w->P) * (uint64_t)w->Z;
     uint64_t tail_seen_ns = 0;
     uint64_t local_first = 0, local_last = 0;
+    uint64_t wait_start_ns = now_ns();
+    uint64_t last_prog_ns = wait_start_ns;
 
     while (!atomic_load_explicit(w->stop_flag, memory_order_relaxed)) {
         uint64_t t_pre = now_ns();
@@ -364,7 +387,16 @@ static void *udp_rx_worker_fn(void *arg)
                 atomic_store_explicit(w->stop_flag, true, memory_order_release);
                 break;
             }
-            if (tail_seen_ns != 0 && (now_ns() - tail_seen_ns) > 50000000ULL) {
+            if (tail_seen_ns != 0 && (t_pre - tail_seen_ns) > 50000000ULL) {
+                atomic_store_explicit(w->stop_flag, true, memory_order_release);
+                break;
+            }
+            /* bound idle wait if VM shaper/link drops both data frames and tail beacons */
+            if (local_first != 0 && (t_pre - last_prog_ns) > 500000000ULL) {
+                atomic_store_explicit(w->stop_flag, true, memory_order_release);
+                break;
+            }
+            if (local_first == 0 && (t_pre - wait_start_ns) > 15000000000ULL) {
                 atomic_store_explicit(w->stop_flag, true, memory_order_release);
                 break;
             }
@@ -376,6 +408,7 @@ static void *udp_rx_worker_fn(void *arg)
             }
             continue;
         }
+        last_prog_ns = t_pre;
 
         uint64_t batch_new = 0;
 
@@ -702,7 +735,7 @@ static int open_bidir_sync_socket(const char *spec, bool leader)
     struct in_addr peer_ip;
     if (inet_pton(AF_INET, host, &peer_ip) != 1)
         return -1;
-    return vxfec_bench_tcp_connect_retry(peer_ip, port, 150, 100000000L);
+    return vxfec_bench_tcp_connect_retry(peer_ip, port, 350, 100000000L);
 }
 
 static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t Z, size_t wpb, uint64_t total_frames,
@@ -1090,9 +1123,10 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
     size_t page_sz = (size_t)sysconf(_SC_PAGESIZE);
     uint32_t Z = tx_hs.Z, K = tx_hs.K, P = tx_hs.P, T = tx_hs.T;
-    if ((tx_hs.codec != (uint32_t)VXFEC_WIRE_RATELESS && tx_hs.codec != (uint32_t)VXFEC_WIRE_MDS) || Z == 0u || Z > 4096u ||
-        K == 0u || K > 56403u || P == 0u || P > 65535u || T < 64u || T > (1u << 20) || (T & 15u) != 0u || tx_hs.iters == 0u ||
-        tx_hs.iters > 100000u || (uint64_t)(K + P) > (SIZE_MAX - page_sz) / ((size_t)Z * (size_t)T)) {
+    if ((tx_hs.codec != (uint32_t)VXFEC_WIRE_RATELESS && tx_hs.codec != (uint32_t)VXFEC_WIRE_MDS &&
+         tx_hs.codec != (uint32_t)VXFEC_WIRE_RATELESS_GF2) ||
+        Z == 0u || Z > 4096u || K == 0u || K > 56403u || P == 0u || P > 65535u || T < 64u || T > (1u << 20) || (T & 15u) != 0u ||
+        tx_hs.iters == 0u || tx_hs.iters > 100000u || (uint64_t)(K + P) > (SIZE_MAX - page_sz) / ((size_t)Z * (size_t)T)) {
         fprintf(stderr, "Invalid superframe dimensions in TX handshake (Z=%u K=%u P=%u T=%u iters=%u)\n", Z, K, P, T, tx_hs.iters);
         close(ctrl_fd);
         close(listen_fd);
@@ -1643,9 +1677,10 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 tx_aborted = true;
                 break;
             }
-            uint64_t tx_wire_t0 = now_ns();
+            uint64_t tx_wire_ns = 1ULL;
 
             if (cfg->use_ibv) {
+                uint64_t tx_wire_t0 = now_ns();
                 uint64_t rng = 0x9876543210fedcbaULL ^ it;
                 uint32_t lkey = vxfec_ibv_mr_lkey(ibv_mr);
                 uint64_t src_iova = vxfec_ibv_mr_iova(ibv_mr);
@@ -1684,7 +1719,10 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                     shutdown(ctrl_fd, SHUT_RDWR);
                     break;
                 }
+                tx_wire_ns = now_ns() - tx_wire_t0;
             } else {
+                _Atomic uint32_t ready_tx = 0;
+                _Atomic bool go_tx = false;
                 pthread_t tx_th[WIRE_NET_MAX_RAILS];
                 udp_tx_worker_t tx_w[WIRE_NET_MAX_RAILS];
                 uint32_t started_tx = 0;
@@ -1703,7 +1741,11 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         .drop_end = drop_end,
                         .loss_ppm = cfg->loss_ppm,
                         .rail_rate_gbps = rail_rate,
+                        .ready_workers = &ready_tx,
+                        .go_flag = &go_tx,
                         .sent_frames = 0u,
+                        .my_first_ns = 0u,
+                        .my_last_ns = 0u,
                     };
                     if (pthread_create(&tx_th[r], NULL, udp_tx_worker_fn, &tx_w[r]) != 0) {
                         tx_aborted = true;
@@ -1711,6 +1753,11 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                     }
                     started_tx++;
                 }
+                if (!tx_aborted) {
+                    while (atomic_load_explicit(&ready_tx, memory_order_acquire) < started_tx)
+                        sched_yield();
+                }
+                atomic_store_explicit(&go_tx, true, memory_order_release);
                 for (uint32_t r = 0; r < started_tx; r++)
                     pthread_join(tx_th[r], NULL);
                 send_tail_beacons(tx_fds, peer_addrs, rails, (uint16_t)it);
@@ -1718,8 +1765,15 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                     shutdown(ctrl_fd, SHUT_RDWR);
                     break;
                 }
+                uint64_t tfn = UINT64_MAX, tln = 0;
+                for (uint32_t r = 0; r < started_tx; r++) {
+                    if (tx_w[r].my_first_ns > 0 && tx_w[r].my_first_ns < tfn)
+                        tfn = tx_w[r].my_first_ns;
+                    if (tx_w[r].my_last_ns > tln)
+                        tln = tx_w[r].my_last_ns;
+                }
+                tx_wire_ns = (tfn != UINT64_MAX && tln > tfn) ? (tln - tfn) : 1ULL;
             }
-            uint64_t tx_wire_ns = now_ns() - tx_wire_t0;
             struct wire_tx_sample *sample = &samples[(it - 1u) % 2u];
             *sample = (struct wire_tx_sample){
                 .planned_frames = planned_frames,
@@ -1832,11 +1886,12 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                         "transport,codec,wire_only,Z,K,P,T,rails,blackout_pct,loss_ppm,planned_frames,rx_frames,payload_mib,"
                         "wire_gbps,bidir_wire_gbps,bidir_wall_gbps,e2e_gbps,gpu_gbps,blocks_repaired,unique_masks,gdr_dmabuf\n");
             }
+            const char *cname =
+                (cfg->codec == VXFEC_WIRE_MDS) ? "mds" : ((cfg->codec == VXFEC_WIRE_RATELESS_GF2) ? "rateless-gf2" : "rateless");
             fprintf(fp, "%s,%s,%u,%u,%u,%u,%u,%u,%.2f,%u,%" PRIu64 ",%" PRIu64 ",%.2f,%.3f,",
-                    cfg->pipeline ? "ibv-gdr-pipeline" : (cfg->gdr ? "ibv-gdr" : (cfg->use_ibv ? "ibv" : "udp")),
-                    (cfg->codec == VXFEC_WIRE_MDS) ? "mds" : "rateless", cfg->wire_only ? 1u : 0u, Z, K, P, T, rails,
-                    cfg->blackout_pct, cfg->loss_ppm, best_planned_frames, best_rx_frames, (double)sys_bytes / (1024.0 * 1024.0),
-                    best_wire_gbps);
+                    cfg->pipeline ? "ibv-gdr-pipeline" : (cfg->gdr ? "ibv-gdr" : (cfg->use_ibv ? "ibv" : "udp")), cname,
+                    cfg->wire_only ? 1u : 0u, Z, K, P, T, rails, cfg->blackout_pct, cfg->loss_ppm, best_planned_frames,
+                    best_rx_frames, (double)sys_bytes / (1024.0 * 1024.0), best_wire_gbps);
             if (bidir_fd >= 0 && best_bidir_wire_gbps > 0.0)
                 fprintf(fp, "%.3f,%.3f,", best_bidir_wire_gbps, best_bidir_wall_gbps);
             else
@@ -1881,6 +1936,7 @@ tx_cleanup:
 
 int main(int argc, char **argv)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     wire_cli_cfg_t cfg = {
         .mode = NULL,
         .bind_csv = "0.0.0.0",
@@ -1918,7 +1974,12 @@ int main(int argc, char **argv)
             cfg.ports_per_ip = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             const char *c = argv[++i];
-            cfg.codec = (strcmp(c, "mds") == 0 || strcmp(c, "rs8") == 0) ? VXFEC_WIRE_MDS : VXFEC_WIRE_RATELESS;
+            if (strcmp(c, "mds") == 0 || strcmp(c, "rs8") == 0)
+                cfg.codec = VXFEC_WIRE_MDS;
+            else if (strcmp(c, "rateless-gf2") == 0 || strcmp(c, "gf2") == 0)
+                cfg.codec = VXFEC_WIRE_RATELESS_GF2;
+            else
+                cfg.codec = VXFEC_WIRE_RATELESS;
         } else if (strcmp(argv[i], "--z") == 0 && i + 1 < argc) {
             cfg.Z = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--k") == 0 && i + 1 < argc) {

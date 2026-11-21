@@ -56,7 +56,7 @@ draw_panel_gpu <- function(df) {
     gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 12.2, col = "#0f172a")
   )
   grid.text(
-    "1.18-5.39 Tbps Protected Payload / Decode Time (RX 7900 XTX, 1.0-1.5 GiB GDDR6)",
+    "1.16-5.34 Tbps Protected Payload / Decode Time (RX 7900 XTX, 1.0-1.5 GiB GDDR6)",
     x = unit(14, "pt"), y = unit(1, "npc") - unit(30, "pt"),
     just = c("left", "top"),
     gp = gpar(fontfamily = font_fam, fontsize = 9.0, col = "#475569")
@@ -249,7 +249,7 @@ draw_panel_pipe <- function(df) {
   ))
 
   n <- nrow(df)
-  xmax <- 2.75
+  xmax <- 2.92
   sx <- function(v) v / xmax
   sy <- function(i) (i - 0.5) / n
 
@@ -465,10 +465,10 @@ draw_panel_cloud_wire <- function(df) {
     gp = gpar(fill = "#ecfdf5", col = "#0f766e", lwd = 1)
   )
   grid.text(
-    "24.4 ms WAN Kernel-Drop (Iowa-VA): vxfec 49.8 ms p50 / 76.3 ms p99 (2.0x faster vs SACK 103.1 / 151.6 ms; GBN >3s)",
+    "23.7 ms WAN Kernel-Drop (512K, Iowa-VA): vxfec 51.6 ms p50 / 76.1 ms tail (2.0x faster vs SACK 102.8 / 129.0 ms; GBN 126.7 / 173.7 ms)",
     x = unit(0.5, "npc"), y = unit(1, "npc") - unit(50, "pt"),
     just = c("center", "center"),
-    gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 7.3, col = "#0f766e")
+    gp = gpar(fontfamily = font_fam, fontface = "bold", fontsize = 6.7, col = "#0f766e")
   )
 
   left_pt <- 192
@@ -587,10 +587,10 @@ popViewport()
 pushViewport(viewport(layout.pos.row = 3, layout.pos.col = 1))
 draw_grouped_cct_panel(
   subset(raw, panel == "cloud_cct"),
-  "D. GCP Multi-Node 4x 100G gVNIC & Soft-RoCE (rdma_rxe) p99 CCT",
-  "Collocated ToR (81us), 4x 100G Spine, Cross-Zone Drop (670us) & Soft-RoCE rdma_rxe UC",
-  xmax = 33.0,
-  x_ticks = c(0, 5, 10, 15, 20, 25),
+  "D. GCP Multi-Node 4x 100G gVNIC & Soft-RoCE (rdma_rxe) Tail CCT",
+  "Collocated ToR (88us), Cross-Zone DCI Netem (688us) & Soft-RoCE rdma_rxe UC (N=15..35)",
+  xmax = 46.5,
+  x_ticks = c(0, 10, 20, 30, 35),
   series_order = c("User-Space UDP Go-Back-N", "RFC 2018 SACK (No FEC)", "vxfec (MDS / Rateless HARQ)"),
   left_pt = 196,
   compact_legend = TRUE

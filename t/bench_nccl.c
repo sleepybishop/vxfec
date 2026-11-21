@@ -1112,6 +1112,18 @@ static int run_multinode_main(const ncclNet_v8_t *net, get_stats_fn get_stats, r
     return ok ? 0 : 1;
 }
 
+/* keep libvulkan mapped after dlclose so LSan can symbolize ICD suppressions */
+static void pin_vulkan_for_lsan(void)
+{
+#if defined(__SANITIZE_ADDRESS__)
+    (void)dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE);
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    (void)dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE);
+#endif
+#endif
+}
+
 static int run_2node_self_test(void)
 {
     int sv[2] = {-1, -1};
@@ -1139,6 +1151,7 @@ static int run_2node_self_test(void)
         (void)waitpid(pid, NULL, 0);
         return 1;
     }
+    pin_vulkan_for_lsan();
 
     const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
     g_bench_get_stats_ex = (get_stats_ex_fn)dlsym(dl, "vxfec_nccl_get_stats_ex");
@@ -1221,6 +1234,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "dlopen(%s) failed: %s\n", so_path, dlerror());
         return 1;
     }
+    pin_vulkan_for_lsan();
 
     const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
     g_bench_get_stats_ex = (get_stats_ex_fn)dlsym(dl, "vxfec_nccl_get_stats_ex");

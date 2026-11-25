@@ -137,15 +137,15 @@ $(NCCL_SO): $(NCCL_PLUGIN_OBJ) $(VK_OBJ) $(NANORQ_CORE_OBJ)
 
 $(OUT_PREFIX)bench_vulkan: $(BUILD_DIR)/t/bench_vulkan.o $(CORE_STATIC_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_vulkan.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -pthread $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_vulkan.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
 $(OUT_PREFIX)bench_pipeline: $(BUILD_DIR)/t/bench_pipeline.o $(CORE_STATIC_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_pipeline.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -pthread $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_pipeline.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
-$(OUT_PREFIX)bench_nccl: $(BUILD_DIR)/t/bench_nccl.o $(NCCL_SO)
+$(OUT_PREFIX)bench_nccl: $(BUILD_DIR)/t/bench_nccl.o $(VK_STATIC_LIB) $(NCCL_SO)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_nccl.o -ldl -pthread $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/bench_nccl.o $(VK_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
 $(OUT_PREFIX)bench_wire_net: $(BUILD_DIR)/t/bench_wire_net.o $(CORE_STATIC_LIB)
 	@mkdir -p $(dir $@)
@@ -157,11 +157,11 @@ $(OUT_PREFIX)demo_nccl_e2e: $(BUILD_DIR)/examples/demo_nccl_e2e.o $(NCCL_SO)
 
 $(OUT_PREFIX)t/test_vk_codecs: $(BUILD_DIR)/t/test_vk_codecs.o $(CORE_STATIC_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/test_vk_codecs.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -pthread $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/test_vk_codecs.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
 $(OUT_PREFIX)t/test_interleave_ring: $(BUILD_DIR)/t/test_interleave_ring.o $(CORE_STATIC_LIB)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/test_interleave_ring.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -pthread $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(BUILD_DIR)/t/test_interleave_ring.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
 $(OUT_PREFIX)t/test_nccl_plugin: $(BUILD_DIR)/t/test_nccl_plugin.o $(CORE_STATIC_LIB) $(NCCL_SO)
 	@mkdir -p $(dir $@)
@@ -171,6 +171,15 @@ $(OUT_PREFIX)t/test_nccl_plugin: $(BUILD_DIR)/t/test_nccl_plugin.o $(CORE_STATIC
 # The fixture includes the protocol translation unit to test private RX handlers.
 $(BUILD_DIR)/t/test_nccl_direct_repair: $(BUILD_DIR)/t/test_nccl_direct_repair.o $(filter-out $(BUILD_DIR)/plugins/nccl_net_proto.o,$(NCCL_PLUGIN_OBJ)) $(CORE_STATIC_LIB)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
+
+# Standalone hardware discovery and offline topology validation.
+$(OUT_PREFIX)t/probe_gdr_pair: t/probe_gdr_pair.c t/bench_common.h $(CORE_STATIC_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -It $< $(CORE_STATIC_LIB) $(LDFLAGS) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS) -o $@
+
+$(OUT_PREFIX)t/test_probe_gdr_pair: t/test_probe_gdr_pair.c t/probe_gdr_pair.c t/bench_common.h $(CORE_STATIC_LIB)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -It $< $(CORE_STATIC_LIB) $(LDFLAGS) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS) -o $@
 
 shaders:
 	python3 vk/shaders/gen_spv.py
@@ -197,7 +206,10 @@ check-nccl: $(OUT_PREFIX)t/test_nccl_plugin $(OUT_PREFIX)bench_nccl $(NCCL_SO) $
 check-wire-net: $(OUT_PREFIX)bench_wire_net
 	./$(OUT_PREFIX)bench_wire_net --self-test
 
-check: check-vk check-interleave check-nccl check-wire-net
+check-probe: $(OUT_PREFIX)t/test_probe_gdr_pair
+	./$(OUT_PREFIX)t/test_probe_gdr_pair
+
+check: check-vk check-interleave check-nccl check-wire-net check-probe
 
 bench: $(OUT_PREFIX)bench_vulkan
 	./$(OUT_PREFIX)bench_vulkan
@@ -223,9 +235,9 @@ asan:
 		all check
 
 indent:
-	clang-format -style=file -i include/*.h vk/vk_internal.h vk/*.c interleave/*.c transport/*.h transport/*.c plugins/nccl/*.h plugins/nccl/*.c t/*.h t/*.c examples/*.c
+	clang-format -style=file -i include/*.h vk/vk_internal.h vk/*.c interleave/*.c transport/*.h transport/*.c plugins/nccl/*.h plugins/nccl/*.c t/*.h t/*.c examples/*.c scripts/rocev2_clos/clos_switch.c scripts/rocev2_clos/test_switch.c
 
 clean:
-	$(RM) -r $(BUILD_DIR) $(ASAN_DIR) $(VK_STATIC_LIB) $(CORE_STATIC_LIB) $(NCCL_SO) $(BENCH_BINS) $(DEMO_BINS) $(TEST_BINS)
+	$(RM) -r $(BUILD_DIR) $(ASAN_DIR) $(VK_STATIC_LIB) $(CORE_STATIC_LIB) $(NCCL_SO) $(BENCH_BINS) $(DEMO_BINS) $(TEST_BINS) $(OUT_PREFIX)t/probe_gdr_pair $(OUT_PREFIX)t/test_probe_gdr_pair
 
 -include $(wildcard $(BUILD_DIR)/*/*.d)

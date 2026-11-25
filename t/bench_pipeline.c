@@ -145,35 +145,95 @@ static bool fill_vram_pattern(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, size_t tota
     return true;
 }
 
-/* poison all erased systematic wire slots in wire_vram before recovery */
-static bool poison_erased_sys_vram(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, const uint64_t *bits, uint32_t Z, uint32_t K, size_t wpb,
-                                   uint32_t stride, const uint8_t *poison_chunk, size_t poison_cap)
+typedef struct {
+    uint64_t tickets[2];
+    uint64_t arrivals[2];
+    uint64_t lat_sum;
+    uint64_t max_lat_ns;
+    uint32_t misses;
+} sla_progress_t;
+
+static bool poll_sla_slots(vxfec_vk_ctx *ctx, sla_progress_t *sla)
 {
+    for (int s = 0; s < 2; s++) {
+        if (sla->tickets[s] == 0u)
+            continue;
+        int pst = vxfec_vk_poll_status(ctx, sla->tickets[s]);
+        if (pst < 0)
+            return false;
+        uint64_t elapsed = now_ns() - sla->arrivals[s];
+        if (pst > 0) {
+            sla->lat_sum += elapsed;
+            if (elapsed > sla->max_lat_ns)
+                sla->max_lat_ns = elapsed;
+            if (elapsed > DEADLINE_NS)
+                sla->misses++;
+            sla->tickets[s] = 0u;
+        } else if (elapsed > DRAIN_TIMEOUT_NS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* build coalesced VRAM byte spans for all erased systematic wire slots */
+static bool build_erased_sys_spans(const uint64_t *bits, uint32_t Z, uint32_t K, size_t wpb, uint32_t stride,
+                                   vxfec_vk_span **out_spans, size_t *out_count)
+{
+    *out_spans = NULL;
+    *out_count = 0u;
     uint64_t sys_frames = (uint64_t)K * Z;
+    size_t cap = 256u, cnt = 0u;
+    vxfec_vk_span *spans = (vxfec_vk_span *)malloc(cap * sizeof(*spans));
+    if (!spans)
+        return false;
+
     uint64_t seq = 0;
     while (seq < sys_frames) {
         uint32_t z = 0, esi = 0;
         vxfec_interleave_unwire_seq(Z, seq, &z, &esi);
-        bool present = ((bits[(size_t)z * wpb + (esi >> 6u)] >> (esi & 63u)) & 1ULL) != 0ULL;
-        if (present) {
+        if (((bits[(size_t)z * wpb + (esi >> 6u)] >> (esi & 63u)) & 1ULL) != 0ULL) {
             seq++;
             continue;
         }
-        uint64_t run_beg = seq;
-        size_t max_run = poison_cap / stride;
-        if (max_run == 0u)
-            max_run = 1u;
-        while (seq < sys_frames && (seq - run_beg) < max_run) {
+        uint64_t run_beg = seq++;
+        while (seq < sys_frames) {
             vxfec_interleave_unwire_seq(Z, seq, &z, &esi);
             if (((bits[(size_t)z * wpb + (esi >> 6u)] >> (esi & 63u)) & 1ULL) != 0ULL)
                 break;
             seq++;
         }
-        size_t bytes = (size_t)(seq - run_beg) * stride;
-        if (!vxfec_vk_buf_write_offset(ctx, vram, (size_t)run_beg * stride, poison_chunk, bytes))
-            return false;
+        if (cnt == cap) {
+            size_t ncap = cap * 2u;
+            vxfec_vk_span *tmp = (vxfec_vk_span *)realloc(spans, ncap * sizeof(*spans));
+            if (!tmp) {
+                free(spans);
+                return false;
+            }
+            spans = tmp;
+            cap = ncap;
+        }
+        spans[cnt++] = (vxfec_vk_span){
+            .offset = (size_t)run_beg * stride,
+            .bytes = (size_t)(seq - run_beg) * stride,
+        };
     }
+    *out_spans = spans;
+    *out_count = cnt;
     return true;
+}
+
+/* poison all erased systematic wire slots in wire_vram in one batched command buffer */
+static bool poison_erased_sys_vram(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, const uint64_t *bits, uint32_t Z, uint32_t K, size_t wpb,
+                                   uint32_t stride)
+{
+    vxfec_vk_span *spans = NULL;
+    size_t cnt = 0u;
+    if (!build_erased_sys_spans(bits, Z, K, wpb, stride, &spans, &cnt))
+        return false;
+    bool ok = vxfec_vk_buf_fill_spans(ctx, vram, spans, cnt, 0xa5a5a5a5u);
+    free(spans);
+    return ok;
 }
 
 /* verify 100% of sys_bytes in wire_vram bit-for-bit against the reference seed */
@@ -299,7 +359,7 @@ static void build_uncapped_wire_channel(uint64_t *bits, uint32_t Z, uint32_t K, 
 static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_gf2, vxfec_wire_ring *wring_rq,
                                     vxfec_wire_ring *wring_mds, vxfec_vk_buf *vram_ref, vxfec_vk_buf *vram_work, uint32_t Z,
                                     uint32_t K, uint32_t P, size_t wpb, uint32_t stride, size_t sys_bytes, size_t wire_bytes,
-                                    const uint8_t *seed_buf, size_t seed_len, const uint8_t *poison_buf, uint8_t *verify_buf)
+                                    const uint8_t *seed_buf, size_t seed_len, uint8_t *verify_buf)
 {
     static const struct {
         uint32_t burst_pct;
@@ -338,7 +398,7 @@ static bool run_fade_boundary_sweep(vxfec_vk_ctx *ctx, vxfec_wire_ring *wring_gf
                 loss_sum += cs.wire_loss_pct;
 
                 if (!vxfec_vk_buf_copy(ctx, vram_work, vram_ref, wire_bytes) ||
-                    !poison_erased_sys_vram(ctx, vram_work, bits, Z, K, wpb, stride, poison_buf, seed_len)) {
+                    !poison_erased_sys_vram(ctx, vram_work, bits, Z, K, wpb, stride)) {
                     free(bits);
                     return false;
                 }
@@ -415,39 +475,13 @@ static bool poll_inflight_slots(vxfec_vk_ctx *ctx, uint64_t slot_tkt[2], const u
     return true;
 }
 
-static bool poll_sla_slots(vxfec_vk_ctx *ctx, uint64_t sla_tkt[2], const uint64_t sla_arr[2], uint64_t *io_lat_sum,
-                           uint64_t *io_max_lat_ns, uint32_t *io_misses)
-{
-    uint64_t t_now = now_ns();
-    for (int s = 0; s < 2; s++) {
-        if (sla_tkt[s] == 0u)
-            continue;
-        int pst = vxfec_vk_poll_status(ctx, sla_tkt[s]);
-        if (pst < 0)
-            return false;
-        if (pst > 0) {
-            uint64_t lat = (t_now > sla_arr[s]) ? (t_now - sla_arr[s]) : 0u;
-            *io_lat_sum += lat;
-            if (lat > *io_max_lat_ns)
-                *io_max_lat_ns = lat;
-            if (lat > DEADLINE_NS)
-                (*io_misses)++;
-            sla_tkt[s] = 0u;
-        } else if (t_now > sla_arr[s] && (t_now - sla_arr[s]) > DRAIN_TIMEOUT_NS) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool prep_poisoned_pair(vxfec_vk_ctx *ctx, vxfec_vk_buf *wire_vram[2], const vxfec_vk_buf *wire_ref,
-                               uint64_t *const rx_bits[PIPE_ITERS], uint32_t Z, uint32_t K, size_t wpb, uint32_t stride,
-                               size_t wire_bytes, const uint8_t *poison_buf, size_t seed_len)
+                               vxfec_vk_span *const rx_spans[PIPE_ITERS], const size_t rx_span_cnt[PIPE_ITERS], size_t wire_bytes)
 {
     return vxfec_vk_buf_copy(ctx, wire_vram[0], wire_ref, wire_bytes) &&
            vxfec_vk_buf_copy(ctx, wire_vram[1], wire_ref, wire_bytes) &&
-           poison_erased_sys_vram(ctx, wire_vram[0], rx_bits[0], Z, K, wpb, stride, poison_buf, seed_len) &&
-           poison_erased_sys_vram(ctx, wire_vram[1], rx_bits[1], Z, K, wpb, stride, poison_buf, seed_len);
+           vxfec_vk_buf_fill_spans(ctx, wire_vram[0], rx_spans[0], rx_span_cnt[0], 0xa5a5a5a5u) &&
+           vxfec_vk_buf_fill_spans(ctx, wire_vram[1], rx_spans[1], rx_span_cnt[1], 0xa5a5a5a5u);
 }
 
 static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K, uint32_t P, uint32_t stride, bool run_sweep)
@@ -484,16 +518,13 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
 
     size_t seed_len = (sys_bytes < SEED_CHUNK_BYTES) ? sys_bytes : SEED_CHUNK_BYTES;
     uint8_t *seed_buf = (uint8_t *)malloc(seed_len);
-    uint8_t *poison_buf = (uint8_t *)malloc(seed_len);
     uint8_t *verify_buf = (uint8_t *)malloc(seed_len);
-    if (!seed_buf || !poison_buf || !verify_buf) {
+    if (!seed_buf || !verify_buf) {
         free(verify_buf);
-        free(poison_buf);
         free(seed_buf);
         return false;
     }
     init_seed_chunk(seed_buf, seed_len);
-    memset(poison_buf, 0xa5, seed_len);
 
     vxfec_vk_buf *wire_vram[2] = {NULL, NULL};
     vxfec_vk_buf *wire_ref = vxfec_vk_buf_new(ctx, wire_bytes, false);
@@ -505,13 +536,14 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
         vxfec_vk_buf_free(ctx, wire_vram[0]);
         vxfec_vk_buf_free(ctx, wire_ref);
         free(verify_buf);
-        free(poison_buf);
         free(seed_buf);
         return false;
     }
 
     size_t wpb = ((size_t)(K + P) + 63u) / 64u;
     uint64_t *rx_bits[PIPE_ITERS] = {0};
+    vxfec_vk_span *rx_spans[PIPE_ITERS] = {0};
+    size_t rx_span_cnt[PIPE_ITERS] = {0};
     bool bits_ok = true;
     double loss_pct_sum = 0.0;
     channel_summary_t cs0 = {0};
@@ -524,18 +556,23 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
         fade_pos_t pos = (f % 3 == 0) ? FADE_INTERIOR : ((f % 3 == 1) ? FADE_PARITY_TAIL : FADE_BOUNDARY_WRAP);
         channel_summary_t csf = {0};
         build_uncapped_wire_channel(rx_bits[f], Z, K, P, wpb, 14u, 20000u, pos, (uint32_t)f, &csf);
+        if (!build_erased_sys_spans(rx_bits[f], Z, K, wpb, stride, &rx_spans[f], &rx_span_cnt[f])) {
+            bits_ok = false;
+            break;
+        }
         loss_pct_sum += csf.wire_loss_pct;
         if (f == 0)
             cs0 = csf;
     }
     if (!bits_ok) {
-        for (int f = 0; f < PIPE_ITERS; f++)
+        for (int f = 0; f < PIPE_ITERS; f++) {
+            free(rx_spans[f]);
             free(rx_bits[f]);
+        }
         vxfec_vk_buf_free(ctx, wire_vram[1]);
         vxfec_vk_buf_free(ctx, wire_vram[0]);
         vxfec_vk_buf_free(ctx, wire_ref);
         free(verify_buf);
-        free(poison_buf);
         free(seed_buf);
         return false;
     }
@@ -544,6 +581,7 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
            loss_pct_sum / (double)PIPE_ITERS, PIPE_ITERS);
     printf("Frame 0 Stats    : %.1f avg sys erasures/blk [%u..%u], min surviving=%u/%u, %u/%u unique block masks\n", cs0.avg_sys_e,
            cs0.min_sys_e, cs0.max_sys_e, cs0.min_surviving, K + P, cs0.unique_masks, Z);
+    printf("RX pipeline wall time includes erasure writes when reusing buffers. Paced arrivals stay 10 ms apart.\n");
     printf("------------------------------------------------------------------------------------------------------------------\n");
     printf("  Codec    | Pipeline Stage / Contention   | CPU Comp | Tab DMA | Avg Step | Max Lat   | Max<=10 | Useful Rate\n");
     printf("  ---------+-------------------------------+----------+---------+----------+-----------+---------+------------\n");
@@ -571,7 +609,7 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
         for (int f = 0; f < PIPE_ITERS; f++) {
             vxfec_vk_buf *dst = wire_vram[f & 1];
             if (!vxfec_vk_buf_copy(ctx, dst, wire_ref, wire_bytes) ||
-                !poison_erased_sys_vram(ctx, dst, rx_bits[f], Z, K, wpb, stride, poison_buf, seed_len) ||
+                !vxfec_vk_buf_fill_spans(ctx, dst, rx_spans[f], rx_span_cnt[f], 0xa5a5a5a5u) ||
                 !vxfec_wire_recover_vram(wring, dst, rx_bits[f], NULL) ||
                 !verify_full_superframe(ctx, dst, sys_bytes, seed_buf, seed_len, verify_buf)) {
                 fprintf(stderr, "FAIL: full-superframe verification failed on fresh mask %d (%s)\n", f, cnames[ci]);
@@ -612,7 +650,7 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
         for (int it = 0; it < 4; it++) {
             vxfec_vk_buf *dst = wire_vram[it & 1];
             if (!vxfec_vk_buf_copy(ctx, dst, wire_ref, wire_bytes) ||
-                !poison_erased_sys_vram(ctx, dst, rx_bits[it], Z, K, wpb, stride, poison_buf, seed_len)) {
+                !vxfec_vk_buf_fill_spans(ctx, dst, rx_spans[it], rx_span_cnt[it], 0xa5a5a5a5u)) {
                 all_ok = false;
                 break;
             }
@@ -642,7 +680,7 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
                (rx_ser_max_ms <= DEADLINE_MS) ? "PASS" : "MISS", rx_ser_tbps);
 
         /* 3. RX double-buffered saturation throughput */
-        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_bits, Z, K, wpb, stride, wire_bytes, poison_buf, seed_len)) {
+        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_spans, rx_span_cnt, wire_bytes)) {
             all_ok = false;
             break;
         }
@@ -665,6 +703,12 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
                 if (lat > pipe_max_lat_ns)
                     pipe_max_lat_ns = lat;
                 slot_tkt[sl] = 0u;
+            }
+            if (it >= 2) {
+                if (vxfec_vk_buf_fill_spans_submit(ctx, wire_vram[sl], rx_spans[it], rx_span_cnt[it], 0xa5a5a5a5u) == 0u) {
+                    all_ok = false;
+                    break;
+                }
             }
             slot_t0[sl] = now_ns();
             vxfec_wire_stats st = {0};
@@ -700,55 +744,37 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
                pipe_avg_ms, pipe_max_ms, (pipe_max_ms <= DEADLINE_MS) ? "PASS" : "MISS", pipe_tbps);
 
         /* 4. paced 10.00 ms arrival-cadence SLA check */
-        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_bits, Z, K, wpb, stride, wire_bytes, poison_buf, seed_len)) {
+        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_spans, rx_span_cnt, wire_bytes)) {
             all_ok = false;
             break;
         }
-        uint64_t sla_cpu_sum = 0, sla_lat_sum = 0, sla_max_lat_ns = 0;
-        uint32_t sla_misses = 0;
-        uint64_t sla_tkt[2] = {0, 0};
-        uint64_t sla_arr[2] = {0, 0};
-        uint64_t cadence_t0 = now_ns();
+        uint64_t sla_cpu_sum = 0;
+        sla_progress_t sla = {0};
+        const uint64_t cadence_t0 = now_ns();
         for (int it = 0; it < PIPE_ITERS; it++) {
+            int sl = it & 1;
             uint64_t target_arr = cadence_t0 + (uint64_t)it * DEADLINE_NS;
-            for (;;) {
-                if (!poll_sla_slots(ctx, sla_tkt, sla_arr, &sla_lat_sum, &sla_max_lat_ns, &sla_misses)) {
-                    all_ok = false;
-                    break;
-                }
-                if (now_ns() >= target_arr)
-                    break;
-            }
+            /* prepare the next frame as soon as its buffer becomes available */
+            while (all_ok && (sla.tickets[sl] > 0u || (it >= 2 && !vxfec_vk_is_discrete(ctx) && sla.tickets[1 - sl] > 0u)))
+                all_ok = poll_sla_slots(ctx, &sla);
+            if (all_ok && it >= 2)
+                all_ok = vxfec_vk_buf_fill_spans_submit(ctx, wire_vram[sl], rx_spans[it], rx_span_cnt[it], 0xa5a5a5a5u) != 0u;
+            while (all_ok && now_ns() < target_arr)
+                all_ok = poll_sla_slots(ctx, &sla);
             if (!all_ok)
                 break;
 
-            int sl = it & 1;
-            if (sla_tkt[sl] > 0u) {
-                if (!vxfec_vk_wait(ctx, sla_tkt[sl], DRAIN_TIMEOUT_NS)) {
-                    all_ok = false;
-                    break;
-                }
-                uint64_t lat = now_ns() - sla_arr[sl];
-                sla_lat_sum += lat;
-                if (lat > sla_max_lat_ns)
-                    sla_max_lat_ns = lat;
-                if (lat > DEADLINE_NS)
-                    sla_misses++;
-                sla_tkt[sl] = 0u;
-            }
-            sla_arr[sl] = target_arr;
+            sla.arrivals[sl] = target_arr;
             vxfec_wire_stats st = {0};
-            sla_tkt[sl] = vxfec_wire_recover_submit(wring, wire_vram[sl], rx_bits[it], &st);
-            if (sla_tkt[sl] == 0u) {
+            sla.tickets[sl] = vxfec_wire_recover_submit(wring, wire_vram[sl], rx_bits[it], &st);
+            if (sla.tickets[sl] == 0u) {
                 all_ok = false;
                 break;
             }
             sla_cpu_sum += st.cpu_compile_ns;
         }
-        while (all_ok && (sla_tkt[0] > 0u || sla_tkt[1] > 0u)) {
-            if (!poll_sla_slots(ctx, sla_tkt, sla_arr, &sla_lat_sum, &sla_max_lat_ns, &sla_misses))
-                all_ok = false;
-        }
+        while (all_ok && (sla.tickets[0] > 0u || sla.tickets[1] > 0u))
+            all_ok = poll_sla_slots(ctx, &sla);
         uint64_t sla_sched_span = now_ns() - cadence_t0;
         if (!all_ok || !verify_full_superframe(ctx, wire_vram[0], sys_bytes, seed_buf, seed_len, verify_buf) ||
             !verify_full_superframe(ctx, wire_vram[1], sys_bytes, seed_buf, seed_len, verify_buf)) {
@@ -759,18 +785,18 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
 
         /* include frame 0's 10.00 ms ingress interval so rate reflects 8 frames over >= 80 ms */
         uint64_t sla_total_span = sla_sched_span + DEADLINE_NS;
-        double sla_avg_lat_ms = (double)(sla_lat_sum / (uint64_t)PIPE_ITERS) / 1e6;
-        double sla_max_lat_ms = (double)sla_max_lat_ns / 1e6;
+        double sla_avg_lat_ms = (double)(sla.lat_sum / (uint64_t)PIPE_ITERS) / 1e6;
+        double sla_max_lat_ms = (double)sla.max_lat_ns / 1e6;
         double sla_deliv_tbps = ((double)sys_bytes * (double)PIPE_ITERS * 8.0) / ((double)sla_total_span * 1e3);
-        bool sla_pass = (sla_misses == 0u && sla_max_lat_ms <= DEADLINE_MS);
+        bool sla_pass = (sla.misses == 0u && sla_max_lat_ms <= DEADLINE_MS);
         char sla_lbl[40];
-        snprintf(sla_lbl, sizeof(sla_lbl), "RX Paced 10ms (miss=%u/%d)", sla_misses, PIPE_ITERS);
+        snprintf(sla_lbl, sizeof(sla_lbl), "RX Paced 10ms (miss=%u/%d)", sla.misses, PIPE_ITERS);
         printf("  %s | %-29s | %5.2f ms | %4.1f MB | %5.2f ms |  %5.2f ms |  %s   |  %5.2f Tbps\n", cnames[ci], sla_lbl,
                (double)(sla_cpu_sum / (uint64_t)PIPE_ITERS) / 1e6, (double)rx_tab_bytes / (1024.0 * 1024.0), sla_avg_lat_ms,
                sla_max_lat_ms, sla_pass ? "PASS" : "MISS", sla_deliv_tbps);
 
         /* 5. RX pipelined decode + concurrent device-local VRAM copy contention */
-        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_bits, Z, K, wpb, stride, wire_bytes, poison_buf, seed_len)) {
+        if (!prep_poisoned_pair(ctx, wire_vram, wire_ref, rx_spans, rx_span_cnt, wire_bytes)) {
             all_ok = false;
             break;
         }
@@ -782,11 +808,11 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
             while ((now_ns() - spin_t0) < 12000000ULL) {
             }
 
-            unsigned long long rw_b0 = atomic_load_explicit(&vcopy.rw_bytes, memory_order_relaxed);
             uint64_t cv_cpu = 0, cv_max_lat_ns = 0;
             uint64_t cv_tkt[2] = {0, 0};
             uint64_t cv_sub_t0[2] = {0, 0};
             uint64_t cv_t0 = now_ns();
+            unsigned long long rw_b0 = atomic_load_explicit(&vcopy.rw_bytes, memory_order_relaxed);
             for (int it = 0; it < PIPE_ITERS; it++) {
                 int sl = it & 1;
                 if (!poll_inflight_slots(ctx, cv_tkt, cv_sub_t0, &cv_max_lat_ns)) {
@@ -802,6 +828,12 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
                     if (lat > cv_max_lat_ns)
                         cv_max_lat_ns = lat;
                     cv_tkt[sl] = 0u;
+                }
+                if (it >= 2) {
+                    if (vxfec_vk_buf_fill_spans_submit(ctx, wire_vram[sl], rx_spans[it], rx_span_cnt[it], 0xa5a5a5a5u) == 0u) {
+                        all_ok = false;
+                        break;
+                    }
                 }
                 cv_sub_t0[sl] = now_ns();
                 vxfec_wire_stats st = {0};
@@ -852,7 +884,7 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
 
     if (all_ok && run_sweep && rings[0] && rings[1] && rings[2]) {
         if (!run_fade_boundary_sweep(ctx, rings[0], rings[1], rings[2], wire_ref, wire_vram[0], Z, K, P, wpb, stride, sys_bytes,
-                                     wire_bytes, seed_buf, seed_len, poison_buf, verify_buf)) {
+                                     wire_bytes, seed_buf, seed_len, verify_buf)) {
             all_ok = false;
         }
     }
@@ -860,13 +892,14 @@ static bool run_pipeline_suite(vxfec_vk_ctx *ctx, double target_tbps, uint32_t K
     vxfec_wire_ring_free(rings[2]);
     vxfec_wire_ring_free(rings[1]);
     vxfec_wire_ring_free(rings[0]);
-    for (int f = 0; f < PIPE_ITERS; f++)
+    for (int f = 0; f < PIPE_ITERS; f++) {
+        free(rx_spans[f]);
         free(rx_bits[f]);
+    }
     vxfec_vk_buf_free(ctx, wire_vram[1]);
     vxfec_vk_buf_free(ctx, wire_vram[0]);
     vxfec_vk_buf_free(ctx, wire_ref);
     free(verify_buf);
-    free(poison_buf);
     free(seed_buf);
     return all_ok;
 }

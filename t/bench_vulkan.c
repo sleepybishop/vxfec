@@ -513,6 +513,11 @@ static bool run_interleave_row(vxfec_vk_ctx *ctx, uint32_t K, uint32_t T, size_t
 
     if (!vxfec_vk_buf_copy(ctx, d_buf, d_ref, ring_bytes))
         goto cleanup;
+    uint64_t dir_warm_t0 = mono_ns();
+    do {
+        if (!vxfec_rq_direct_batch(ctx, gd, d_buf, stride, Z, out_buf, NULL))
+            goto cleanup;
+    } while ((mono_ns() - dir_warm_t0) < 20000000ULL);
     uint64_t dir_ns_sum = 0;
     uint64_t t0 = mono_ns();
     for (int it = 0; it < gpu_iters; it++) {
@@ -637,11 +642,11 @@ static bool run_rq_superframe_row(vxfec_vk_ctx *ctx, uint32_t K, uint32_t T, uin
     nanorq_core_set_op_callback(&dec, &S_dec, ops_push);
     if (!nanorq_core_precalculate(&dec, dec_work, dw_len))
         goto done;
-    uint64_t comp_ns = mono_ns() - comp_t0;
 
     gd = vxfec_rq_direct_new(ctx, &dec, &S_dec, drop_esis, drops);
     if (!gd)
         goto done;
+    uint64_t comp_ns = mono_ns() - comp_t0;
 
     uint32_t rows_dec = nanorq_core_get_pc_rows(&dec);
     size_t blk_bytes = (size_t)rows_dec * stride;
@@ -998,9 +1003,11 @@ int main(int argc, char **argv)
            T_rq_super, T_rs_super);
     printf("    Burst Loss    | Mode |    VRAM Ring (Z) | CPU Comp |  GPU Stream  |  Wall-Clock  | Rebuilt Out | Min RW B/W\n");
     printf("------------------+------+------------------+----------+--------------+--------------+-------------+------------\n");
-    if (!run_rq_superframe_row(ctx, 256, T_rq_super, 10, 2u, vram_ring))
-        goto failed;
     const uint32_t rq_losses[] = {5, 10, 20, 30, 50};
+    for (size_t i = 0; i < sizeof(rq_losses) / sizeof(rq_losses[0]); i++) {
+        if (!run_rq_superframe_row(ctx, 256, T_rq_super, rq_losses[i], 2u, vram_ring))
+            goto failed;
+    }
     for (size_t i = 0; i < sizeof(rq_losses) / sizeof(rq_losses[0]); i++) {
         if (!run_rq_superframe_row(ctx, 256, T_rq_super, rq_losses[i], p256.H + 8u, vram_ring))
             goto failed;

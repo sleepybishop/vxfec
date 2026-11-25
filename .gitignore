@@ -18,3 +18,9 @@ perf.data*
 *.gcda
 *.gcno
 *.gcov
+docs/local_runs/
+docs/cloud_runs/
+__pycache__/
+*.pyc
+t/probe_gdr_pair
+t/test_probe_gdr_pair

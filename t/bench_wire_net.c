@@ -1,8 +1,8 @@
 #define _GNU_SOURCE
-#include "bench_common.h"
 #include "ibv_transport.h"
 #include "vxfec_interleave.h"
 #include "vxfec_vk.h"
+#include "bench_common.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -106,13 +106,15 @@ static uint64_t count_planned_tx_frames(uint64_t total_frames, uint64_t drop_beg
 {
     uint64_t planned = 0u;
     if (use_ibv) {
-        uint64_t rng = 0x9876543210fedcbaULL ^ (uint64_t)iter;
-        for (uint64_t seq = 0; seq < total_frames; seq++) {
-            if (seq >= drop_beg && seq < drop_end)
-                continue;
-            if (loss_ppm > 0u && (splitmix64(&rng) % 1000000ULL) < loss_ppm)
-                continue;
-            planned++;
+        for (uint32_t q = 0; q < rails; q++) {
+            uint64_t rng = 0x9876543210fedcbaULL ^ ((uint64_t)q << 32u) ^ (uint64_t)iter;
+            for (uint64_t seq = q; seq < total_frames; seq += rails) {
+                if (seq >= drop_beg && seq < drop_end)
+                    continue;
+                if (loss_ppm > 0u && (splitmix64(&rng) % 1000000ULL) < loss_ppm)
+                    continue;
+                planned++;
+            }
         }
         return planned;
     }
@@ -716,6 +718,7 @@ typedef struct {
     const char *bidir_sync;
     uint16_t base_port;
     uint32_t ports_per_ip;
+    uint32_t ibv_threads;
     int codec;
     uint32_t Z;
     uint32_t K;
@@ -760,11 +763,12 @@ static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t ibv_
     uint64_t wait_start_ns = now_ns();
     uint64_t last_prog_ns = wait_start_ns;
     uint32_t empty_polls = 0;
-    vxfec_ibv_rx_wc_t wcs[64];
+    vxfec_ibv_rx_wc_t wcs[VXFEC_IBV_POLL_MAX];
+    uint32_t repost_slots[VXFEC_IBV_POLL_MAX];
     /* With direct VRAM writes, wait for a completion on every QP before Vulkan can acquire the buffer. */
     while (require_tails ? tail_qps != all_qps : rx_frames < expected_frames) {
         uint64_t t_pre = now_ns();
-        uint32_t n = vxfec_ibv_ep_poll_rx(ibv_ep, wcs, 64u);
+        uint32_t n = vxfec_ibv_ep_poll_rx(ibv_ep, wcs, VXFEC_IBV_POLL_MAX);
         if (vxfec_ibv_ep_has_error(ibv_ep)) {
             fprintf(stderr, "ERROR: fatal IBV RX completion error at iter %u\n", it);
             return false;
@@ -793,6 +797,7 @@ static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t ibv_
         last_prog_ns = t_pre;
         uint32_t batch_data = 0;
         for (uint32_t i = 0; i < n; i++) {
+            repost_slots[i] = wcs[i].slot_id;
             if (wcs[i].has_imm) {
                 uint32_t seq = wcs[i].imm_data;
                 if (seq == UINT32_MAX) {
@@ -805,10 +810,10 @@ static bool receive_ibv_frame(vxfec_ibv_ep_t *ibv_ep, int ctrl_fd, uint32_t ibv_
                     batch_data++;
                 }
             }
-            if (!vxfec_ibv_ep_repost_rx(ibv_ep, wcs[i].slot_id)) {
-                fprintf(stderr, "ERROR: failed to repost IBV RX slot at iter %u\n", it);
-                return false;
-            }
+        }
+        if (!vxfec_ibv_ep_repost_rx_batch(ibv_ep, repost_slots, n)) {
+            fprintf(stderr, "ERROR: failed to repost IBV RX slot batch at iter %u\n", it);
+            return false;
         }
         if (batch_data > 0u) {
             uint64_t t_post = now_ns();
@@ -845,7 +850,7 @@ typedef struct {
     bool wire_only;
 } wire_rx_recovery_t;
 
-static void recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *res)
+static const char *recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *res)
 {
     vxfec_vk_ctx *ctx = job->ctx;
     vxfec_vk_buf *rx_vram = job->vram;
@@ -858,7 +863,7 @@ static void recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *
     uint64_t rec_wall_ns = 0;
     vxfec_wire_stats st = {0};
     bool verify_ok = false;
-    bool fatal_err = false;
+    const char *error = NULL;
 
     uint32_t min_req = K;
     if (job->codec == (uint32_t)VXFEC_WIRE_RATELESS_GF2)
@@ -892,47 +897,98 @@ static void recover_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *
 
         if (rec_ok) {
             if (rx_ext_host && !gdr_dmabuf) {
-                (void)vxfec_vk_buf_release_external(ctx, rx_vram);
-                verify_ok = verify_deterministic_superframe(job->host, sys_bytes);
+                verify_ok = vxfec_vk_buf_release_external(ctx, rx_vram) && verify_deterministic_superframe(job->host, sys_bytes);
             } else {
-                if (vxfec_vk_buf_read_offset(ctx, rx_vram, 0, job->verify, sys_bytes))
-                    verify_ok = verify_deterministic_superframe(job->verify, sys_bytes);
+                verify_ok = vxfec_vk_buf_read_offset(ctx, rx_vram, 0u, job->verify, sys_bytes) &&
+                            verify_deterministic_superframe(job->verify, sys_bytes);
             }
-            if (!verify_ok) {
-                fprintf(stderr, "ERROR: RX payload verification mismatch at iter %u!\n", res->iter);
-                fatal_err = true;
-            }
+            if (!verify_ok)
+                error = "RX payload verification mismatch";
         } else {
             if (rx_ext_host)
                 (void)vxfec_vk_buf_release_external(ctx, rx_vram);
-            if (!prep_ok) {
-                fprintf(stderr, "ERROR: failed to acquire RX GPU buffer at iter %u\n", res->iter);
-                fatal_err = true;
-            } else if (enough_frames) {
-                fprintf(stderr, "ERROR: RX FEC decode failed despite >= K frames/block at iter %u!\n", res->iter);
-                fatal_err = true;
-            }
+            if (!prep_ok)
+                error = "failed to acquire RX GPU buffer";
+            else if (enough_frames)
+                error = "RX FEC decode failed despite >= K frames/block";
         }
         if (gdr_dmabuf && !vxfec_vk_buf_release_external(ctx, rx_vram)) {
-            fprintf(stderr, "ERROR: failed to release RX GPU buffer at iter %u\n", res->iter);
-            fatal_err = true;
+            error = "failed to release RX GPU buffer";
             verify_ok = false;
         }
     }
 
     res->ok = verify_ok;
-    res->fatal_err = fatal_err;
+    res->fatal_err = error != NULL;
     res->dma_ns = dma_ns;
     res->recover_wall_ns = rec_wall_ns;
     res->recover_gpu_ns = st.gpu_exec_ns;
     res->blocks_repaired = st.blocks_repaired;
     res->unique_masks = st.unique_masks;
+    return error;
 }
 
-static bool prepare_gdr_buffer(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, uint8_t *scratch, size_t sys_bytes)
+static uint64_t recover_and_time_rx_frame(const wire_rx_recovery_t *job, wire_ctrl_result_t *res)
 {
-    memset(scratch, 0xa5, sys_bytes);
-    return vxfec_vk_buf_write_offset(ctx, vram, 0, scratch, sys_bytes) && vxfec_vk_buf_release_external(ctx, vram);
+    const char *error = recover_rx_frame(job, res);
+    uint64_t done_ns = now_ns();
+    if (error)
+        fprintf(stderr, "ERROR: %s at iter %u\n", error, res->iter);
+    return done_ns;
+}
+
+/* Use a Vulkan buffer in place of the NIC-written DMA-BUF to exercise the shared RX path. */
+static bool test_gdr_rx_verification(vxfec_vk_ctx *ctx, uint32_t T)
+{
+    const uint32_t K = 16u, P = 2u;
+    const uint64_t bits = (1ULL << (K + P)) - 1ULL;
+    const size_t bytes = K * T, wire_bytes = (K + P) * T;
+    uint8_t *payload = malloc(bytes);
+    wire_rx_recovery_t job = {
+        .ctx = ctx,
+        .ring = vxfec_wire_ring_new_ex(ctx, VXFEC_WIRE_MDS, 1u, K, P, T, 0u, false, true),
+        .vram = vxfec_vk_buf_new(ctx, wire_bytes, false),
+        .verify = payload,
+        .bits = &bits,
+        .codec = VXFEC_WIRE_MDS,
+        .Z = 1u,
+        .K = K,
+        .P = P,
+        .wpb = 1u,
+        .sys_bytes = bytes,
+        .wire_bytes = wire_bytes,
+        .gdr = true,
+    };
+    bool ok = payload && job.ring && job.vram;
+    for (uint32_t it = 1u; ok && it <= 10u; it++) {
+        /* On an intermediate frame, flip a bit between the former sample windows. */
+        bool corrupt = bytes > 16384u && it == 9u;
+        size_t offset = bytes / 2u;
+        fill_deterministic_superframe(payload, bytes);
+        if (corrupt)
+            payload[offset] ^= 1u;
+        uint8_t expected_readback = payload[offset];
+        ok = vxfec_vk_buf_write_offset(ctx, job.vram, 0u, payload, bytes);
+        if (!ok)
+            break;
+        payload[offset] ^= 1u;
+        wire_ctrl_result_t result = {.iter = it};
+        const char *error = recover_rx_frame(&job, &result);
+        ok = result.ok == !corrupt && result.fatal_err == corrupt && payload[offset] == expected_readback;
+        if (!ok && error)
+            fprintf(stderr, "Unexpected RX result at iteration %u: %s\n", it, error);
+    }
+    vxfec_wire_ring_free(job.ring);
+    vxfec_vk_buf_free(ctx, job.vram);
+    free(payload);
+    if (!ok)
+        fprintf(stderr, "FAIL: GDR verification of %zu-byte frames\n", bytes);
+    return ok;
+}
+
+static bool prepare_gdr_buffer(vxfec_vk_ctx *ctx, vxfec_vk_buf *vram, size_t sys_bytes)
+{
+    return vxfec_vk_buf_fill_offset(ctx, vram, 0u, sys_bytes, 0xa5a5a5a5u) && vxfec_vk_buf_release_external(ctx, vram);
 }
 
 typedef struct {
@@ -966,9 +1022,16 @@ static void report_delivery(wire_delivery_stats_t *stats, uint32_t iters, size_t
         qsort(stats->latencies_ns, stats->passed, sizeof(*stats->latencies_ns), compare_duration);
         uint32_t p99 = (99u * stats->passed + 99u) / 100u - 1u;
         double goodput = (8.0 * (double)sys_bytes * stats->passed) / (double)(span_ns ? span_ns : 1u);
-        printf(" | Verified goodput=%.2f Gbps | RX ready-to-verified p99=%.3f ms", goodput, (double)stats->latencies_ns[p99] / 1e6);
+        if (stats->passed >= 100u) {
+            printf(" | Verified goodput=%.2f Gbps | RX ready-to-verified p99=%.3f ms (N=%u)", goodput,
+                   (double)stats->latencies_ns[p99] / 1e6, stats->passed);
+        } else {
+            printf(" | Verified goodput=%.2f Gbps | RX ready-to-verified max=%.3f ms (N=%u<100)", goodput,
+                   (double)stats->latencies_ns[stats->passed - 1u] / 1e6, stats->passed);
+        }
     }
     putchar('\n');
+    printf("  RX payload bytes verified=%" PRIu64 "\n", (uint64_t)stats->passed * sys_bytes);
 }
 
 typedef struct {
@@ -994,10 +1057,9 @@ static void *recover_wire_frames(void *arg)
         wait_for_work_signal(&worker->work);
         if (worker->stop)
             return NULL;
-        recover_rx_frame(&worker->job, &worker->result);
-        worker->completed_ns = now_ns();
+        worker->completed_ns = recover_and_time_rx_frame(&worker->job, &worker->result);
         if (worker->reuse && !worker->result.fatal_err &&
-            !prepare_gdr_buffer(worker->job.ctx, worker->job.vram, worker->job.verify, worker->job.sys_bytes)) {
+            !prepare_gdr_buffer(worker->job.ctx, worker->job.vram, worker->job.sys_bytes)) {
             fprintf(stderr, "ERROR: failed to prepare pipelined RX buffer after iter %u\n", worker->result.iter);
             worker->result.fatal_err = true;
         }
@@ -1198,8 +1260,9 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             fprintf(stderr, "RX requested --ibv but no active RDMA device found\n");
             goto cleanup;
         }
-        if (vxfec_vk_has_dmabuf_export(ctx)) {
-            rx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &dmabuf_fd);
+        if (cfg->gdr || vxfec_vk_has_dmabuf_export(ctx)) {
+            rx_vram = cfg->gdr ? vxfec_bench_alloc_gdr_buf(ctx, aligned_wire, &dmabuf_fd)
+                               : vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &dmabuf_fd);
             if (rx_vram && dmabuf_fd >= 0) {
                 /* A DMA-BUF MR uses a page-aligned IOVA, independent of any host mapping. */
                 uint64_t iova = cfg->gdr ? page_sz : (uint64_t)(uintptr_t)rx_host;
@@ -1235,7 +1298,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         }
         setenv("VXFEC_IBV_RX_DEPTH", "4096", 0);
         ibv_qps = (tx_hs.rails > 0u && tx_hs.rails <= VXFEC_IBV_MAX_QPS) ? tx_hs.rails : WIRE_NET_IBV_QPS;
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, ibv_qps, 256u, false, true, &rx_hs.ibv_info);
+        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, ibv_qps, 0u, false, true, &rx_hs.ibv_info);
         if (!ibv_mr || !ibv_ep || !vxfec_ibv_ep_connect(ibv_ep, &tx_hs.ibv_info, 0)) {
             fprintf(stderr, "Failed to setup RX ibverbs endpoint/MR\n");
             goto cleanup;
@@ -1287,11 +1350,10 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
     wire_rdma_region_t second_region = {0};
     if (gdr_pipeline) {
-        second_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &second_fd);
+        second_vram = vxfec_bench_alloc_gdr_buf(ctx, aligned_wire, &second_fd);
         if (second_vram)
             second_mr = vxfec_ibv_mr_reg_dmabuf(ibv_ctx, 0, aligned_wire, (uint64_t)page_sz + aligned_wire, second_fd, true);
-        if (!second_mr || !prepare_gdr_buffer(ctx, rx_vram, rx_verify, sys_bytes) ||
-            !prepare_gdr_buffer(ctx, second_vram, rx_verify, sys_bytes)) {
+        if (!second_mr || !prepare_gdr_buffer(ctx, rx_vram, sys_bytes) || !prepare_gdr_buffer(ctx, second_vram, sys_bytes)) {
             fprintf(stderr, "ERROR: could not register and prepare both pipelined RX GPU buffers\n");
             goto cleanup;
         }
@@ -1340,7 +1402,7 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         if (!is_wire_only) {
             /* poison systematic buffer before each iteration so stale bytes cannot pass verification */
             if (gdr_dmabuf) {
-                if (!prepare_gdr_buffer(ctx, rx_vram, rx_verify, sys_bytes)) {
+                if (!prepare_gdr_buffer(ctx, rx_vram, sys_bytes)) {
                     fprintf(stderr, "ERROR: failed to prepare RX GPU buffer at iter %u\n", it);
                     rx_aborted = true;
                     break;
@@ -1446,9 +1508,9 @@ static int run_rx_server(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         }
 
         wire_ctrl_result_t res = {.iter = it, .rx_frames = rx_frames, .wire_ns = wire_ns};
-        recover_rx_frame(&job, &res);
+        uint64_t done_ns = recover_and_time_rx_frame(&job, &res);
         if (cfg->gdr)
-            record_delivery(&stats, &res, ready_ns, now_ns());
+            record_delivery(&stats, &res, ready_ns, done_ns);
         if (!write_all(ctrl_fd, &res, sizeof(res)) || res.fatal_err) {
             rx_aborted = true;
             break;
@@ -1492,6 +1554,130 @@ cleanup:
     close(ctrl_fd);
     close(listen_fd);
     return rx_aborted ? 1 : 0;
+}
+
+typedef struct {
+    vxfec_ibv_ep_t *ep;
+    uint32_t worker_idx;
+    uint32_t num_workers;
+    uint32_t rails;
+    uint32_t T;
+    uint32_t lkey;
+    uint64_t src_iova;
+    uint64_t total_frames;
+    uint64_t drop_beg;
+    uint64_t drop_end;
+    uint32_t loss_ppm;
+    uint32_t iter;
+    wire_rdma_region_t region;
+} ibv_tx_worker_t;
+
+static void ibv_tx_worker_run_slice(const ibv_tx_worker_t *w, uint64_t tail_seqs[VXFEC_IBV_MAX_QPS])
+{
+    enum { WIRE_IBV_TX_BATCH = VXFEC_IBV_BATCH_MAX };
+    vxfec_ibv_rdma_wr_t wrs[VXFEC_IBV_MAX_QPS][WIRE_IBV_TX_BATCH];
+    uint32_t wr_cnt[VXFEC_IBV_MAX_QPS] = {0};
+    uint64_t rngs[VXFEC_IBV_MAX_QPS];
+    for (uint32_t q = w->worker_idx; q < w->rails; q += w->num_workers)
+        rngs[q] = 0x9876543210fedcbaULL ^ ((uint64_t)q << 32u) ^ (uint64_t)w->iter;
+
+    uint64_t max_steps = (w->total_frames + w->rails - 1u) / w->rails;
+    for (uint64_t step = 0; step < max_steps && !vxfec_ibv_ep_has_error(w->ep); step++) {
+        for (uint32_t q = w->worker_idx; q < w->rails; q += w->num_workers) {
+            uint64_t seq = step * w->rails + q;
+            if (seq >= w->total_frames)
+                continue;
+            if (seq >= w->drop_beg && seq < w->drop_end)
+                continue;
+            if (w->loss_ppm > 0u && (splitmix64(&rngs[q]) % 1000000ULL) < w->loss_ppm)
+                continue;
+            uint64_t offset = seq * (uint64_t)w->T;
+            uint32_t idx = wr_cnt[q]++;
+            wrs[q][idx] = (vxfec_ibv_rdma_wr_t){
+                .src_addr = (const void *)(uintptr_t)(w->src_iova + offset),
+                .remote_addr = w->region.iova + offset,
+                .byte_len = w->T,
+                .lkey = w->lkey,
+                .rkey = w->region.rkey,
+                .imm_host_order = (uint32_t)seq,
+            };
+            if (wr_cnt[q] == WIRE_IBV_TX_BATCH) {
+                uint32_t off = 0u;
+                while (off < WIRE_IBV_TX_BATCH) {
+                    off += vxfec_ibv_ep_rdma_write_imm_batch(w->ep, q, &wrs[q][off], WIRE_IBV_TX_BATCH - off);
+                    if (off < WIRE_IBV_TX_BATCH) {
+                        vxfec_ibv_ep_drain_tx(w->ep);
+                        if (vxfec_ibv_ep_has_error(w->ep))
+                            break;
+                    }
+                }
+                wr_cnt[q] = 0u;
+                if (vxfec_ibv_ep_has_error(w->ep))
+                    break;
+            }
+        }
+    }
+
+    for (uint32_t q = w->worker_idx; q < w->rails && !vxfec_ibv_ep_has_error(w->ep); q += w->num_workers) {
+        if (wr_cnt[q] == WIRE_IBV_TX_BATCH) {
+            uint32_t off = 0u;
+            while (off < WIRE_IBV_TX_BATCH) {
+                off += vxfec_ibv_ep_rdma_write_imm_batch(w->ep, q, &wrs[q][off], WIRE_IBV_TX_BATCH - off);
+                if (off < WIRE_IBV_TX_BATCH) {
+                    vxfec_ibv_ep_drain_tx(w->ep);
+                    if (vxfec_ibv_ep_has_error(w->ep))
+                        break;
+                }
+            }
+            wr_cnt[q] = 0u;
+            if (vxfec_ibv_ep_has_error(w->ep))
+                break;
+        }
+        uint32_t tidx = wr_cnt[q]++;
+        wrs[q][tidx] = (vxfec_ibv_rdma_wr_t){
+            .src_addr = NULL,
+            .remote_addr = w->region.iova,
+            .byte_len = 0u,
+            .lkey = w->lkey,
+            .rkey = w->region.rkey,
+            .imm_host_order = UINT32_MAX,
+            .force_signal = true,
+        };
+        uint32_t off = 0u;
+        while (off < wr_cnt[q]) {
+            off += vxfec_ibv_ep_rdma_write_imm_batch(w->ep, q, &wrs[q][off], wr_cnt[q] - off);
+            if (off < wr_cnt[q]) {
+                vxfec_ibv_ep_drain_tx(w->ep);
+                if (vxfec_ibv_ep_has_error(w->ep))
+                    break;
+            }
+        }
+        wr_cnt[q] = 0u;
+        if (!vxfec_ibv_ep_has_error(w->ep))
+            vxfec_ibv_ep_record_qp_tail(w->ep, q, tail_seqs);
+    }
+}
+
+typedef struct {
+    ibv_tx_worker_t cfg;
+    uint64_t tail_seqs[VXFEC_IBV_MAX_QPS];
+    sem_t work;
+    sem_t done;
+    bool stop;
+} ibv_tx_thread_ctx_t;
+
+static void *ibv_tx_thread_fn(void *arg)
+{
+    ibv_tx_thread_ctx_t *tc = (ibv_tx_thread_ctx_t *)arg;
+    pin_worker_cpu(tc->cfg.worker_idx, false);
+    for (;;) {
+        wait_for_work_signal(&tc->work);
+        if (tc->stop)
+            return NULL;
+        memset(tc->tail_seqs, 0, sizeof(tc->tail_seqs));
+        ibv_tx_worker_run_slice(&tc->cfg, tc->tail_seqs);
+        sem_post(&tc->done);
+    }
 }
 
 static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out_retain_vk)
@@ -1548,6 +1734,9 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     int tx_fds[WIRE_NET_MAX_RAILS];
     int bidir_fd = -1;
     uint32_t open_tx_fds = 0;
+    ibv_tx_thread_ctx_t ibv_pool[VXFEC_IBV_MAX_QPS];
+    pthread_t ibv_threads[VXFEC_IBV_MAX_QPS];
+    uint32_t started_ibv_helpers = 0u;
     bool bench_ok = false;
 
     if (cfg->use_ibv) {
@@ -1567,7 +1756,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
             goto tx_cleanup;
         }
         if (cfg->gdr) {
-            tx_vram = vxfec_vk_buf_new_exportable(ctx, aligned_wire, true, &tx_dmabuf_fd);
+            tx_vram = vxfec_bench_alloc_gdr_buf(ctx, aligned_wire, &tx_dmabuf_fd);
             if (!tx_vram || tx_dmabuf_fd < 0) {
                 fprintf(stderr, "TX --gdr failed to allocate/export a GPU DMA-BUF\n");
                 goto tx_cleanup;
@@ -1629,11 +1818,12 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     hs.wire_only = cfg->wire_only ? WIRE_MODE_WIRE_ONLY : (stage3_pipeline ? WIRE_MODE_PIPELINE : WIRE_MODE_NORMAL);
 
     if (cfg->use_ibv) {
+        setenv("VXFEC_IBV_TX_DEPTH", "1024", 0);
         if (!ibv_mr)
             ibv_mr = vxfec_ibv_mr_reg_host(ibv_ctx, tx_host, wire_bytes, false);
         uint32_t ibv_qps = (hs.rails > 0u && hs.rails <= VXFEC_IBV_MAX_QPS) ? hs.rails : WIRE_NET_IBV_QPS;
         hs.rails = ibv_qps;
-        ibv_ep = vxfec_ibv_ep_create_ex(ibv_ctx, ibv_qps, 256u, true, false, &hs.ibv_info);
+        ibv_ep = vxfec_ibv_ep_create_opts(ibv_ctx, ibv_qps, 0u, true, false, true, &hs.ibv_info);
         if (!ibv_mr || !ibv_ep) {
             fprintf(stderr, "TX failed to create ibverbs MR/EP\n");
             goto tx_cleanup;
@@ -1659,8 +1849,9 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         goto tx_cleanup;
     }
 
-    if (cfg->use_ibv && T > vxfec_ibv_ep_path_mtu(ibv_ep)) {
-        fprintf(stderr, "TX --sym-t %u exceeds the RDMA path MTU of %u bytes\n", T, vxfec_ibv_ep_path_mtu(ibv_ep));
+    if (cfg->use_ibv && (uint64_t)T > vxfec_ibv_ep_max_msg_bytes(ibv_ep)) {
+        fprintf(stderr, "TX --sym-t %u exceeds the RDMA max message size of %" PRIu64 " bytes\n", T,
+                vxfec_ibv_ep_max_msg_bytes(ibv_ep));
         goto tx_cleanup;
     }
 
@@ -1701,7 +1892,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     uint64_t drop_end = drop_beg + drop_frames;
 
     double best_wire_gbps = 0.0, best_e2e_gbps = 0.0, best_gpu_gbps = 0.0;
-    double best_bidir_wire_gbps = 0.0, best_bidir_wall_gbps = 0.0;
+    double best_bidir_wire_gbps = 0.0, best_bidir_wall_gbps = 0.0, best_bidir_e2e_gbps = 0.0;
     uint64_t best_planned_frames = 0, best_rx_frames = 0;
     uint32_t last_rep = 0, last_masks = 0, pass_count = 0;
 
@@ -1724,6 +1915,34 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
         uint64_t wire_ns;
         uint64_t enc_ns;
     } samples[2];
+    uint32_t n_ibv_workers = 1u;
+    if (cfg->use_ibv) {
+        uint32_t want_w =
+            cfg->ibv_threads ? cfg->ibv_threads : ((rails > 1u && !stage3_pipeline) ? ((rails < 4u) ? rails : 4u) : 1u);
+        if (want_w > rails)
+            want_w = rails;
+        if (want_w > VXFEC_IBV_MAX_QPS)
+            want_w = VXFEC_IBV_MAX_QPS;
+        n_ibv_workers = want_w ? want_w : 1u;
+        memset(ibv_pool, 0, sizeof(ibv_pool));
+        for (uint32_t w = 1u; w < n_ibv_workers; w++) {
+            ibv_pool[w].cfg.worker_idx = w;
+            if (sem_init(&ibv_pool[w].work, 0, 0) != 0)
+                break;
+            if (sem_init(&ibv_pool[w].done, 0, 0) != 0) {
+                sem_destroy(&ibv_pool[w].work);
+                break;
+            }
+            if (pthread_create(&ibv_threads[w], NULL, ibv_tx_thread_fn, &ibv_pool[w]) != 0) {
+                sem_destroy(&ibv_pool[w].done);
+                sem_destroy(&ibv_pool[w].work);
+                break;
+            }
+            started_ibv_helpers++;
+        }
+        n_ibv_workers = 1u + started_ibv_helpers;
+    }
+
     /* In --gdr --pipeline mode, send the next frame before waiting for the previous recovery result. */
     const uint32_t result_lag = gdr_pipeline ? 1u : 0u;
     bool tx_aborted = false;
@@ -1762,43 +1981,41 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
 
             if (cfg->use_ibv) {
                 uint64_t tx_wire_t0 = now_ns();
-                uint64_t rng = 0x9876543210fedcbaULL ^ it;
                 uint32_t lkey = vxfec_ibv_mr_lkey(ibv_mr);
                 uint64_t src_iova = vxfec_ibv_mr_iova(ibv_mr);
                 const wire_rdma_region_t *region = &regions[(it - 1u) % (result_lag + 1u)];
-                for (uint64_t seq = 0; seq < total_frames; seq++) {
-                    if (pipe_enc_tkt != 0ULL && tx_enc_ns == 0ULL && (seq & 63ULL) == 0ULL) {
-                        int pst = vxfec_vk_poll_status(ctx, pipe_enc_tkt);
-                        if (pst > 0)
-                            tx_enc_ns = now_ns() - pipe_enc_t0;
-                    }
-                    if (seq >= drop_beg && seq < drop_end)
-                        continue;
-                    if (cfg->loss_ppm > 0 && (splitmix64(&rng) % 1000000ULL) < cfg->loss_ppm)
-                        continue;
-                    uint64_t offset = seq * (uint64_t)T;
-                    const void *src = (const void *)(uintptr_t)(src_iova + offset);
-                    while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, (uint32_t)(seq % rails), src, T, lkey, region->iova + offset,
-                                                        region->rkey, (uint32_t)seq)) {
-                        vxfec_ibv_ep_drain_tx(ibv_ep);
-                        if (vxfec_ibv_ep_has_error(ibv_ep))
-                            break;
-                    }
-                    if (vxfec_ibv_ep_has_error(ibv_ep))
-                        break;
+                ibv_tx_worker_t base_w = {
+                    .ep = ibv_ep,
+                    .worker_idx = 0u,
+                    .num_workers = n_ibv_workers,
+                    .rails = rails,
+                    .T = T,
+                    .lkey = lkey,
+                    .src_iova = src_iova,
+                    .total_frames = total_frames,
+                    .drop_beg = drop_beg,
+                    .drop_end = drop_end,
+                    .loss_ppm = cfg->loss_ppm,
+                    .iter = it,
+                    .region = *region,
+                };
+                for (uint32_t w = 1u; w < n_ibv_workers; w++) {
+                    ibv_pool[w].cfg = base_w;
+                    ibv_pool[w].cfg.worker_idx = w;
+                    sem_post(&ibv_pool[w].work);
                 }
-                if (!vxfec_ibv_ep_has_error(ibv_ep)) {
-                    uint64_t tail_seqs[VXFEC_IBV_MAX_QPS] = {0};
+                uint64_t tail_seqs[VXFEC_IBV_MAX_QPS] = {0};
+                ibv_tx_worker_run_slice(&base_w, tail_seqs);
+                for (uint32_t w = 1u; w < n_ibv_workers; w++) {
+                    wait_for_work_signal(&ibv_pool[w].done);
                     for (uint32_t q = 0; q < rails; q++) {
-                        while (!vxfec_ibv_ep_rdma_write_imm(ibv_ep, q, NULL, 0u, lkey, region->iova, region->rkey, UINT32_MAX)) {
-                            vxfec_ibv_ep_drain_tx(ibv_ep);
-                            if (vxfec_ibv_ep_has_error(ibv_ep))
-                                break;
-                        }
-                        if (vxfec_ibv_ep_has_error(ibv_ep))
-                            break;
-                        vxfec_ibv_ep_record_qp_tail(ibv_ep, q, tail_seqs);
+                        if (ibv_pool[w].tail_seqs[q] > tail_seqs[q])
+                            tail_seqs[q] = ibv_pool[w].tail_seqs[q];
                     }
+                }
+                if (pipe_enc_tkt != 0ULL && tx_enc_ns == 0ULL && vxfec_vk_poll_status(ctx, pipe_enc_tkt) > 0)
+                    tx_enc_ns = now_ns() - pipe_enc_t0;
+                if (!vxfec_ibv_ep_has_error(ibv_ep)) {
                     if (gdr_pipeline) {
                         vxfec_ibv_ep_drain_tx(ibv_ep);
                     } else {
@@ -1955,8 +2172,8 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 if (bidir_wire_gbps > best_bidir_wire_gbps) {
                     best_bidir_wire_gbps = bidir_wire_gbps;
                     best_bidir_wall_gbps = bidir_wall_gbps;
-                    if (bidir_e2e_gbps > best_e2e_gbps)
-                        best_e2e_gbps = bidir_e2e_gbps;
+                    if (bidir_e2e_gbps > best_bidir_e2e_gbps)
+                        best_bidir_e2e_gbps = bidir_e2e_gbps;
                 }
             }
         }
@@ -2044,6 +2261,7 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
                 fprintf(fp, "%.3f,%.3f,", best_bidir_wire_gbps, best_bidir_wall_gbps);
             else
                 fprintf(fp, ",,");
+            (void)best_bidir_e2e_gbps;
             if (cfg->wire_only)
                 fprintf(fp, ",,,,%u\n", rx_hs.gdr_dmabuf);
             else
@@ -2053,6 +2271,13 @@ static int run_tx_client(vxfec_vk_ctx *ctx, const wire_cli_cfg_t *cfg, bool *out
     }
 
 tx_cleanup:
+    for (uint32_t w = 1u; w <= started_ibv_helpers; w++) {
+        ibv_pool[w].stop = true;
+        sem_post(&ibv_pool[w].work);
+        pthread_join(ibv_threads[w], NULL);
+        sem_destroy(&ibv_pool[w].done);
+        sem_destroy(&ibv_pool[w].work);
+    }
     if (bidir_fd >= 0)
         close(bidir_fd);
     for (uint32_t r = 0; r < open_tx_fds; r++)
@@ -2121,6 +2346,8 @@ int main(int argc, char **argv)
             cfg.base_port = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--ports-per-ip") == 0 && i + 1 < argc) {
             cfg.ports_per_ip = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if ((strcmp(argv[i], "--ibv-threads") == 0 || strcmp(argv[i], "--tx-threads") == 0) && i + 1 < argc) {
+            cfg.ibv_threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--codec") == 0 && i + 1 < argc) {
             const char *c = argv[++i];
             if (strcmp(c, "mds") == 0 || strcmp(c, "rs8") == 0)
@@ -2167,14 +2394,18 @@ int main(int argc, char **argv)
             printf("  %s --pipeline [--codec rateless-gf2|rateless|mds] [--csv out.csv]\n", argv[0]);
             printf("  %s --mode rx [--bind ip1,ip2] [--port 31500] [--ports-per-ip 4] [--gdr [--pipeline]]\n", argv[0]);
             printf("  %s --mode tx --peers ip1,ip2 [--port 31500] [--ports-per-ip 4] [--codec rateless-gf2|rateless|mds] "
-                   "[--z 64] [--k 200] [--p 48] [--sym-t bytes] [--blackout-pct 10] [--pipeline] [--ibv | --gdr [--pipeline]] "
-                   "[--csv out.csv]\n",
+                   "[--z 64] [--k 200] [--p 48] [--sym-t bytes] [--blackout-pct 10] [--tx-threads 4] [--pipeline] "
+                   "[--ibv | --gdr [--pipeline]] [--csv out.csv]\n",
                    argv[0]);
             printf("  --gdr        Require GPU DMA-BUF RDMA on both peers; use on TX and RX.\n");
             printf("  --pipeline   With --gdr on both peers, use two RX buffers to overlap transfer and recovery;\n"
                    "               standalone or on UDP TX, overlap GPU TX encode with multi-rail wire.\n");
-            printf("  --sym-t      Symbol size (default 4096 with --gdr, 8192 otherwise).\n");
+            printf("  --tx-threads Number of RDMA TX worker threads striping across QPs (alias: --ibv-threads).\n");
+            printf("  --sym-t      Symbol size (default 32768 with --ibv/--gdr, 8192 otherwise).\n");
             return 0;
+        } else {
+            fprintf(stderr, "Unknown or incomplete option: %s (try --help)\n", argv[i]);
+            return 1;
         }
     }
 
@@ -2189,9 +2420,9 @@ int main(int argc, char **argv)
             fprintf(stderr, "--gdr requires --mode tx or rx and cannot use --self-test, --wire-only, --bidir-*, or --rate-gbps\n");
             return 1;
         }
-        if (!sym_t_set)
-            cfg.T = 4096u;
     }
+    if ((cfg.gdr || cfg.use_ibv) && !sym_t_set)
+        cfg.T = 32768u;
 
     if (!cfg.self_test && cfg.mode) {
         if (cfg.base_port < 2u || (uint32_t)cfg.base_port + WIRE_NET_MAX_RAILS > 65535u || cfg.ports_per_ip == 0u ||
@@ -2275,8 +2506,8 @@ int main(int argc, char **argv)
         return can_skip ? 0 : 1;
     }
 
-    if (cfg.gdr && (!vxfec_vk_has_dmabuf_export(ctx) || !vxfec_ibv_has_dmabuf())) {
-        fprintf(stderr, "--gdr requires Vulkan GPU DMA-BUF export and ibverbs DMA-BUF registration (device: %s)\n",
+    if (cfg.gdr && (!vxfec_bench_can_alloc_gdr_buf(ctx) || !vxfec_ibv_has_dmabuf())) {
+        fprintf(stderr, "--gdr requires GPU DMA-BUF export and ibverbs DMA-BUF registration (device: %s)\n",
                 vxfec_vk_device_name(ctx));
         vxfec_vk_ctx_free(ctx);
         return 1;
@@ -2289,9 +2520,12 @@ int main(int argc, char **argv)
         bool ok_rq = !retain_gf2 && run_loopback_self_test_codec(ctx, VXFEC_WIRE_RATELESS, 16u, 128u, 36u, 4096u, &retain_rq);
         bool ok_rs =
             !retain_gf2 && !retain_rq && run_loopback_self_test_codec(ctx, VXFEC_WIRE_MDS, 16u, 128u, 24u, 4096u, &retain_rs);
-        if (!retain_gf2 && !retain_rq && !retain_rs)
+        bool ok_verify = false;
+        if (!retain_gf2 && !retain_rq && !retain_rs) {
+            ok_verify = test_gdr_rx_verification(ctx, 1024u) && test_gdr_rx_verification(ctx, 16384u);
             vxfec_vk_ctx_free(ctx);
-        return (ok_gf2 && ok_rq && ok_rs) ? 0 : 1;
+        }
+        return (ok_gf2 && ok_rq && ok_rs && ok_verify) ? 0 : 1;
     }
 
     bool retain_vk = false;

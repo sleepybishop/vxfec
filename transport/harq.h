@@ -101,12 +101,13 @@ static inline uint32_t harq_iid_parity(uint32_t K, double p, uint32_t rank_slack
 /* update EWMA packet loss estimate; snaps to 0.0 below 2e-6 on clean links */
 static inline double harq_ewma_update(double prev_ewma, uint32_t tx_pkts, uint32_t lost_pkts, double alpha)
 {
+    bool prev_valid = (prev_ewma > 0.0 && prev_ewma <= 1.0);
     if (tx_pkts == 0u)
-        return prev_ewma;
-    if (alpha <= 0.0 || alpha > 1.0)
+        return prev_valid ? prev_ewma : 0.0;
+    if (!(alpha > 0.0 && alpha <= 1.0))
         alpha = 0.125;
     double sample = (lost_pkts >= tx_pkts) ? 1.0 : ((double)lost_pkts / (double)tx_pkts);
-    double next = (prev_ewma <= 0.0) ? sample : ((1.0 - alpha) * prev_ewma + alpha * sample);
+    double next = !prev_valid ? sample : ((1.0 - alpha) * prev_ewma + alpha * sample);
     if (lost_pkts == 0u && next < 2e-6)
         return 0.0;
     return next;
@@ -264,8 +265,8 @@ static inline bool harq_pacer_on_ack(harq_pacer_t *p, uint64_t acked_bytes, uint
         return false;
 
     if (rtt_ns > 0u) {
-        bool expired = (p->min_rtt_stamp_ns > 0u && p->last_refill_ns > p->min_rtt_stamp_ns &&
-                        (p->last_refill_ns - p->min_rtt_stamp_ns) >= HARQ_MIN_RTT_WINDOW_NS);
+        bool expired =
+            (p->last_refill_ns >= p->min_rtt_stamp_ns && (p->last_refill_ns - p->min_rtt_stamp_ns) >= HARQ_MIN_RTT_WINDOW_NS);
         if (p->min_rtt_ns == 0u || rtt_ns <= p->min_rtt_ns || expired) {
             p->min_rtt_ns = rtt_ns;
             p->min_rtt_stamp_ns = p->last_refill_ns;
@@ -336,7 +337,7 @@ static inline bool harq_pacer_on_ack(harq_pacer_t *p, uint64_t acked_bytes, uint
 
 static inline uint32_t harq_clamp_proactive_parity(uint32_t raw_p0, double cong_level)
 {
-    if (raw_p0 == 0u || cong_level <= 0.05)
+    if (raw_p0 == 0u || !(cong_level > 0.05))
         return raw_p0;
     if (cong_level >= 0.45)
         return 0u;

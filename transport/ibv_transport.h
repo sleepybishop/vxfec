@@ -11,11 +11,36 @@ extern "C" {
 
 #define VXFEC_IBV_MAX_DEVS 16u
 #define VXFEC_IBV_MAX_QPS 16u
-#define VXFEC_IBV_TX_PER_QP 256u
+#define VXFEC_IBV_TX_PER_QP 512u
+#define VXFEC_IBV_BATCH_MAX 64u
+#define VXFEC_IBV_POLL_MAX 128u
+#define VXFEC_IBV_CTRL_MAX_BYTES 96u
+#define VXFEC_IBV_WIRE_RX_KIB_MASK 0x7fu
+#define VXFEC_IBV_WIRE_CTRL_RX 0x80u
+#define VXFEC_IBV_CTRL_SLOT_FLAG 0x80000000u
 
 typedef struct vxfec_ibv_ctx vxfec_ibv_ctx_t;
 typedef struct vxfec_ibv_mr vxfec_ibv_mr_t;
 typedef struct vxfec_ibv_ep vxfec_ibv_ep_t;
+
+typedef struct {
+    const void *src_addr;
+    uint64_t remote_addr;
+    uint32_t byte_len;
+    uint32_t lkey;
+    uint32_t rkey;
+    uint32_t imm_host_order;
+    bool force_signal;
+} vxfec_ibv_rdma_wr_t;
+
+typedef struct {
+    const void *hdr;
+    const void *payload;
+    uint32_t hdr_len;
+    uint32_t pay_len;
+    uint32_t pay_lkey;
+    bool force_signal;
+} vxfec_ibv_send_wr_desc_t;
 
 typedef struct {
     char dev_name[64];
@@ -55,7 +80,7 @@ typedef struct {
 
 static inline uint32_t vxfec_ibv_slot_qp(uint32_t slot_id)
 {
-    return (slot_id >> 16u) & 0xffffu;
+    return (slot_id >> 16u) & 0x7fffu;
 }
 
 /* probe dynamic libibverbs.so.1 availability and enumerate active RoCEv2/IB ports */
@@ -77,31 +102,48 @@ uint32_t vxfec_ibv_mr_lkey(const vxfec_ibv_mr_t *mr);
 uint32_t vxfec_ibv_mr_rkey(const vxfec_ibv_mr_t *mr);
 uint64_t vxfec_ibv_mr_iova(const vxfec_ibv_mr_t *mr);
 bool vxfec_ibv_mr_is_dmabuf(const vxfec_ibv_mr_t *mr);
+bool vxfec_ibv_mr_read_to_host(vxfec_ibv_ctx_t *ctx, const vxfec_ibv_mr_t *src_mr, size_t src_off, void *dst, size_t bytes);
+bool vxfec_ibv_mr_write_from_host(vxfec_ibv_ctx_t *ctx, vxfec_ibv_mr_t *dst_mr, size_t dst_off, const void *src, size_t bytes);
 
 /* multi-QP Unreliable Connection (IBV_QPT_UC) endpoint for ECMP spraying + zero-bounce RDMA */
-vxfec_ibv_ep_t *vxfec_ibv_ep_create(vxfec_ibv_ctx_t *ctx, uint32_t num_qps, uint32_t max_pkt_bytes,
-                                    vxfec_ibv_wire_info_t *out_local_info);
 vxfec_ibv_ep_t *vxfec_ibv_ep_create_ex(vxfec_ibv_ctx_t *ctx, uint32_t num_qps, uint32_t max_pkt_bytes, bool enable_tx,
                                        bool enable_rx, vxfec_ibv_wire_info_t *out_local_info);
 vxfec_ibv_ep_t *vxfec_ibv_ep_create_opts(vxfec_ibv_ctx_t *ctx, uint32_t num_qps, uint32_t max_pkt_bytes, bool enable_tx,
                                          bool enable_rx, bool header_only_tx, vxfec_ibv_wire_info_t *out_local_info);
+vxfec_ibv_ep_t *vxfec_ibv_ep_create_duplex(vxfec_ibv_ctx_t *ctx, uint32_t num_qps, uint32_t max_pkt_bytes, bool enable_tx,
+                                           bool enable_rx, bool header_only_tx, bool ctrl_duplex,
+                                           vxfec_ibv_wire_info_t *out_local_info);
 bool vxfec_ibv_ep_connect(vxfec_ibv_ep_t *ep, const vxfec_ibv_wire_info_t *peer_info, uint8_t traffic_class);
 bool vxfec_ibv_ep_destroy(vxfec_ibv_ep_t *ep);
 bool vxfec_ibv_ep_has_error(const vxfec_ibv_ep_t *ep);
 bool vxfec_ibv_ep_tx_is_hdr_only(const vxfec_ibv_ep_t *ep);
 uint32_t vxfec_ibv_ep_path_mtu(const vxfec_ibv_ep_t *ep);
+uint32_t vxfec_ibv_ep_num_qps(const vxfec_ibv_ep_t *ep);
+uint64_t vxfec_ibv_ep_max_msg_bytes(const vxfec_ibv_ep_t *ep);
+uint32_t vxfec_ibv_ep_peer_max_recv(const vxfec_ibv_ep_t *ep);
+uint32_t vxfec_ibv_ep_tx_stage_cap(const vxfec_ibv_ep_t *ep);
+bool vxfec_ibv_ep_peer_has_ctrl_rx(const vxfec_ibv_ep_t *ep);
 
-/* 2-SGE send (24B wire header + registered payload/VRAM buffer) or zero-bounce RDMA WRITE WITH IMM */
+/* 2-SGE send (wire header + registered payload/VRAM buffer) or zero-bounce RDMA WRITE WITH IMM (single or doorbell-batched) */
 bool vxfec_ibv_ep_send_pkt(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *hdr, uint32_t hdr_len, const void *payload,
                            uint32_t pay_len, uint32_t pay_lkey);
-bool vxfec_ibv_ep_send_pkt_ex(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *hdr, uint32_t hdr_len, const void *payload,
-                              uint32_t pay_len, uint32_t pay_lkey, bool force_signal);
+uint32_t vxfec_ibv_ep_send_pkt_batch(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const vxfec_ibv_send_wr_desc_t *pkts, uint32_t count);
+static inline bool vxfec_ibv_ep_send_pkt_ex(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *hdr, uint32_t hdr_len,
+                                            const void *payload, uint32_t pay_len, uint32_t pay_lkey, bool force_signal)
+{
+    vxfec_ibv_send_wr_desc_t d = {
+        .hdr = hdr, .payload = payload, .hdr_len = hdr_len, .pay_len = pay_len, .pay_lkey = pay_lkey, .force_signal = force_signal};
+    return vxfec_ibv_ep_send_pkt_batch(ep, qp_idx, &d, 1u) == 1u;
+}
+bool vxfec_ibv_ep_send_ctrl_inline(vxfec_ibv_ep_t *ep, const void *buf, uint32_t len);
 bool vxfec_ibv_ep_rdma_write_imm(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *src_addr, uint32_t byte_len, uint32_t lkey,
                                  uint64_t remote_addr, uint32_t rkey, uint32_t imm_host_order);
+uint32_t vxfec_ibv_ep_rdma_write_imm_batch(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const vxfec_ibv_rdma_wr_t *wrs, uint32_t count);
 
-/* drain RX completions and re-post consumed RX ring slots */
+/* drain RX completions and re-post consumed RX ring slots (single or per-QP doorbell-batched) */
 uint32_t vxfec_ibv_ep_poll_rx(vxfec_ibv_ep_t *ep, vxfec_ibv_rx_wc_t *out_wcs, uint32_t max_wcs);
 bool vxfec_ibv_ep_repost_rx(vxfec_ibv_ep_t *ep, uint32_t slot_id);
+bool vxfec_ibv_ep_repost_rx_batch(vxfec_ibv_ep_t *ep, const uint32_t *slot_ids, uint32_t count);
 void vxfec_ibv_ep_drain_tx(vxfec_ibv_ep_t *ep);
 void vxfec_ibv_ep_record_qp_tail(const vxfec_ibv_ep_t *ep, uint32_t qp_idx, uint64_t target_seq[VXFEC_IBV_MAX_QPS]);
 bool vxfec_ibv_ep_tx_done(vxfec_ibv_ep_t *ep, const uint64_t target_seq[VXFEC_IBV_MAX_QPS]);

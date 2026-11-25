@@ -13,6 +13,11 @@
 
 #define WIRE_RQ_FAST_OVERHEAD 16u
 #define WIRE_RQ_MAX_OVERHEAD 32u
+#define WIRE_MDS_MAX_TILES 32u
+#define WIRE_RQ_MAX_TILES 128u
+
+_Static_assert(WIRE_MDS_MAX_TILES * 8u >= 256u, "mds tile span capacity");
+_Static_assert(WIRE_RQ_MAX_TILES * 8u >= 1024u, "rq tile span capacity");
 
 typedef struct {
     vxfec_wire_ring *owner;
@@ -112,14 +117,14 @@ struct vxfec_wire_ring {
     uint32_t job_256_hdr_stride;
     uint32_t *job_gf2_stage;
     uint32_t *job_256_stage;
-    atomic_uint job_next_u;
-    atomic_uint job_gf2_blocks;
+    _Alignas(64) atomic_uint job_next_u;
+    _Alignas(64) atomic_uint job_gf2_blocks;
     atomic_uint job_gf2_cmd_cursor;
     atomic_uint job_gf2_active_tiles;
-    atomic_uint job_256_blocks;
+    _Alignas(64) atomic_uint job_256_blocks;
     atomic_uint job_256_cmd_cursor;
     atomic_uint job_256_active_tiles;
-    atomic_uint job_blocks_rep;
+    _Alignas(64) atomic_uint job_blocks_rep;
     atomic_uint job_blocks_failed;
     atomic_uint job_syms_rep;
 };
@@ -147,18 +152,23 @@ static uint32_t choose_wire_256_tile_e(uint32_t num_out, bool *out_forced)
                 *out_forced = true;
             return 16u;
         }
+        if (strcmp(env, "32") == 0) {
+            if (out_forced)
+                *out_forced = true;
+            return 32u;
+        }
     }
-    return (num_out <= 8u) ? 8u : 16u;
+    return (num_out <= 8u) ? 8u : ((num_out <= 16u) ? 16u : 32u);
 }
 
 static uint32_t wire_256_hdr_words(uint32_t tile_e)
 {
-    return (tile_e == 16u) ? 3u : 2u;
+    return (tile_e == 32u) ? 5u : ((tile_e == 16u) ? 3u : 2u);
 }
 
 static size_t wire_256_words_per_cmd(uint32_t tile_e)
 {
-    return (tile_e == 16u) ? 2u : 1u;
+    return (tile_e == 32u) ? 3u : ((tile_e == 16u) ? 2u : 1u);
 }
 
 static bool init_rq_core(bool gf2_h0_mode, uint32_t K, uint32_t overhead, nanorq_core *rq, bool *out_gf2_mode)
@@ -251,22 +261,6 @@ static void emit_gf2_tiles_local(const uint64_t *Y, size_t wpr, const uint32_t *
     *out_cmd_uvec4 = cmd_cnt;
 }
 
-static inline void pack_nib_octet(const uint8_t *yc, uint32_t rem, uint32_t *out_lo, uint32_t *out_hi)
-{
-    uint32_t lo = 0u, hi = 0u;
-    uint32_t lim = (rem > 8u) ? 8u : rem;
-    for (uint32_t b = 0; b < lim; b++) {
-        uint8_t c = yc[b];
-        if (c != 0u) {
-            uint32_t sh = 4u * b;
-            lo |= ((uint32_t)(c & 0x0fu)) << sh;
-            hi |= ((uint32_t)(c >> 4u)) << sh;
-        }
-    }
-    *out_lo = lo;
-    *out_hi = hi;
-}
-
 static void emit_gf256_tiles_local(const uint8_t *Y, size_t m_stride, const uint32_t *active_rows, const uint16_t *in_slots,
                                    uint32_t n_inputs, const uint16_t *out_slots, uint32_t num_out, uint32_t block_z,
                                    uint32_t tile_e, uint32_t hdr_words, uint32_t hdr_stride, uint32_t *hdr_dst,
@@ -292,12 +286,36 @@ static void emit_gf256_tiles_local(const uint8_t *Y, size_t m_stride, const uint
             uint32_t r = active_rows[i];
             const uint8_t *yc = Y + (size_t)r * m_stride + out_base;
             uint32_t lo0 = 0u, hi0 = 0u;
-            pack_nib_octet(yc, tile_len, &lo0, &hi0);
+            vxfec_vk__pack_nib_octet(yc, tile_len, &lo0, &hi0);
 
-            if (tile_e == 16u) {
+            if (tile_e == 32u) {
+                uint32_t lo1 = 0u, hi1 = 0u, lo2 = 0u, hi2 = 0u, lo3 = 0u, hi3 = 0u;
+                if (tile_len > 8u)
+                    vxfec_vk__pack_nib_octet(yc + 8u, tile_len - 8u, &lo1, &hi1);
+                if (tile_len > 16u)
+                    vxfec_vk__pack_nib_octet(yc + 16u, tile_len - 16u, &lo2, &hi2);
+                if (tile_len > 24u)
+                    vxfec_vk__pack_nib_octet(yc + 24u, tile_len - 24u, &lo3, &hi3);
+                if ((lo0 | lo1 | lo2 | lo3 | hi0 | hi1 | hi2 | hi3) != 0u) {
+                    uint32_t *w = cmd_scratch + (size_t)cmd_cnt * 4u;
+                    w[0] = in_slots[i];
+                    w[1] = lo0;
+                    w[2] = lo1;
+                    w[3] = lo2;
+                    w[4] = lo3;
+                    w[5] = hi0;
+                    w[6] = hi1;
+                    w[7] = hi2;
+                    w[8] = hi3;
+                    w[9] = 0u;
+                    w[10] = 0u;
+                    w[11] = 0u;
+                    cmd_cnt += 3u;
+                }
+            } else if (tile_e == 16u) {
                 uint32_t lo1 = 0u, hi1 = 0u;
                 if (tile_len > 8u)
-                    pack_nib_octet(yc + 8u, tile_len - 8u, &lo1, &hi1);
+                    vxfec_vk__pack_nib_octet(yc + 8u, tile_len - 8u, &lo1, &hi1);
                 if ((lo0 | lo1 | hi0 | hi1) != 0u) {
                     uint32_t *w = cmd_scratch + (size_t)cmd_cnt * 4u;
                     w[0] = in_slots[i];
@@ -544,7 +562,7 @@ static bool compile_rx_unique_mds(vxfec_wire_ring *wring, wire_worker_ctx *w, ui
     if (!vxfec_rs8__recovery_matrix(K, P, erased_k, parity_m, missing, w->y_256, m_stride))
         return false;
 
-    uint32_t spans[32][2];
+    uint32_t spans[WIRE_MDS_MAX_TILES][2];
     uint32_t n_tiles = 0, cmd_cnt = 0;
     uint32_t tile_e = wring->job_256_tile_e;
     uint32_t hdr_words = wring->job_256_hdr_words;
@@ -785,7 +803,7 @@ static bool compile_rx_unique_rateless(vxfec_wire_ring *wring, wire_worker_ctx *
     }
     uint32_t n_inputs = K + overhead;
 
-    uint32_t spans[128][2];
+    uint32_t spans[WIRE_RQ_MAX_TILES][2];
     uint32_t n_tiles = 0, cmd_cnt = 0;
     uint32_t rep_z = wring->uniq_rep_z[u];
     if (pure_gf2) {
@@ -983,7 +1001,7 @@ static uint32_t dedup_erased_blocks(vxfec_wire_ring *wring, const uint64_t *rx_b
         if (missing <= P) {
             if (missing > max_missing)
                 max_missing = missing;
-            uint32_t keep_par = (wring->codec == VXFEC_WIRE_MDS) ? missing : (missing + WIRE_RQ_MAX_OVERHEAD);
+            uint32_t keep_par = (wring->codec == VXFEC_WIRE_MDS) ? missing : (missing + wring->rx_max_overhead);
             if (keep_par < P)
                 mask_surplus_parities(cand, wpb, K, keep_par);
         }
@@ -1021,7 +1039,7 @@ vxfec_wire_ring *vxfec_wire_ring_new_ex(vxfec_vk_ctx *ctx, int codec, uint32_t Z
     bool is_rateless = (codec == VXFEC_WIRE_RATELESS || codec == VXFEC_WIRE_RATELESS_GF2);
     bool gf2_h0_mode = (codec == VXFEC_WIRE_RATELESS_GF2);
     if (!ctx || (!enable_tx && !enable_rx) || (!is_rateless && codec != VXFEC_WIRE_MDS) || Z == 0 || Z > (1u << 28u) || K == 0 ||
-        P == 0 || K + P > 65535u || stride < 16u || (stride & 15u) != 0)
+        P == 0 || (uint64_t)K + (uint64_t)P > 65535u || stride < 16u || (stride & 15u) != 0)
         return NULL;
     if (codec == VXFEC_WIRE_MDS && (K > 255u || P > 256u - K || P > 256u))
         return NULL;
@@ -1035,9 +1053,10 @@ vxfec_wire_ring *vxfec_wire_ring_new_ex(vxfec_vk_ctx *ctx, int codec, uint32_t Z
     if (is_rateless)
         nanorq_core_init();
 
-    vxfec_wire_ring *wring = (vxfec_wire_ring *)calloc(1, sizeof(*wring));
-    if (!wring)
+    vxfec_wire_ring *wring = NULL;
+    if (posix_memalign((void **)&wring, 64u, sizeof(*wring)) != 0 || !wring)
         return NULL;
+    memset(wring, 0, sizeof(*wring));
 
     wring->ctx = ctx;
     wring->codec = codec;
@@ -1146,8 +1165,12 @@ vxfec_wire_ring *vxfec_wire_ring_new_ex(vxfec_vk_ctx *ctx, int codec, uint32_t Z
 
         size_t max_wpr = ((size_t)P + 63u) / 64u;
         size_t max_m_stride = ((size_t)P + 63u) & ~(size_t)63u;
-        size_t hdr_scratch_uvec4 = ((size_t)wring->rx_gf2_hdr_stride + wring->rx_256_hdr_stride) * 5u + 8u;
-        size_t cmd_scratch_uvec4 = (size_t)wring->rx_256_hdr_stride * 3u * max_in_rq + 16u;
+        size_t gf2_hdr_uvec4 = is_rateless ? ((size_t)wring->rx_gf2_hdr_stride * wring->rx_gf2_hdr_words) : 0u;
+        size_t m256_hdr_uvec4 = (size_t)wring->rx_256_hdr_stride * wring->rx_256_hdr_words;
+        size_t hdr_scratch_uvec4 = ((gf2_hdr_uvec4 > m256_hdr_uvec4) ? gf2_hdr_uvec4 : m256_hdr_uvec4) + 1u;
+        size_t gf2_cmd_uvec4 = is_rateless ? ((size_t)wring->rx_gf2_hdr_stride * ((max_in_rq + 1u) / 2u)) : 0u;
+        size_t m256_cmd_uvec4 = (size_t)wring->rx_256_hdr_stride * wpc_256 * max_in_256;
+        size_t cmd_scratch_uvec4 = ((gf2_cmd_uvec4 > m256_cmd_uvec4) ? gf2_cmd_uvec4 : m256_cmd_uvec4) + 1u;
 
         wring->workers = (wire_worker_ctx *)calloc(num_threads, sizeof(*wring->workers));
         if (!wring->workers)
@@ -1171,18 +1194,19 @@ vxfec_wire_ring *vxfec_wire_ring_new_ex(vxfec_vk_ctx *ctx, int codec, uint32_t Z
                 w->rq_sched_cap = rq_sched_cap;
                 w->rq_prep = (uint8_t *)malloc(rq_prep_cap);
                 w->rq_retry_prep = (uint8_t *)malloc(rq_prep_cap);
-                w->rq_prep_tmpl16 = (uint8_t *)malloc(rq_prep_cap);
-                w->rq_prep_tmpl32 = (uint8_t *)malloc(rq_prep_cap);
+                w->rq_prep_tmpl16 = (P > WIRE_RQ_FAST_OVERHEAD) ? (uint8_t *)malloc(rq_prep_cap) : NULL;
+                w->rq_prep_tmpl32 = (P > WIRE_RQ_MAX_OVERHEAD) ? (uint8_t *)malloc(rq_prep_cap) : NULL;
                 w->rq_work = (uint8_t *)malloc(rq_work_cap);
                 w->rq_sched_mem = malloc(rq_sched_cap);
                 w->rq_retry_sched = malloc(rq_sched_cap);
                 w->y_gf2 = (uint64_t *)malloc(max_rows * max_wpr * sizeof(uint64_t));
                 w->miss_esis = (uint32_t *)malloc((size_t)P * sizeof(uint32_t));
                 w->rep_ps = (uint32_t *)malloc((size_t)P * sizeof(uint32_t));
-                if (!w->rq_prep || !w->rq_retry_prep || !w->rq_prep_tmpl16 || !w->rq_prep_tmpl32 || !w->rq_work ||
-                    !w->rq_sched_mem || !w->rq_retry_sched || !w->y_gf2 || !w->miss_esis || !w->rep_ps)
+                if (!w->rq_prep || !w->rq_retry_prep || (P > WIRE_RQ_FAST_OVERHEAD && !w->rq_prep_tmpl16) ||
+                    (P > WIRE_RQ_MAX_OVERHEAD && !w->rq_prep_tmpl32) || !w->rq_work || !w->rq_sched_mem || !w->rq_retry_sched ||
+                    !w->y_gf2 || !w->miss_esis || !w->rep_ps)
                     goto fail;
-                if (init_rq_core(gf2_h0_mode, K, WIRE_RQ_FAST_OVERHEAD, &w->rq_tmpl16_dec, NULL)) {
+                if (w->rq_prep_tmpl16 && init_rq_core(gf2_h0_mode, K, WIRE_RQ_FAST_OVERHEAD, &w->rq_tmpl16_dec, NULL)) {
                     size_t tplen = nanorq_core_calculate_prepare_memory(&w->rq_tmpl16_dec);
                     if (tplen > 0 && tplen <= rq_prep_cap && nanorq_core_generate(&w->rq_tmpl16_dec, w->rq_prep, tplen)) {
                         w->rq_tmpl16_bytes = (size_t)(w->rq_tmpl16_dec.W.prep_mem.beg - w->rq_prep);
@@ -1190,7 +1214,7 @@ vxfec_wire_ring *vxfec_wire_ring_new_ex(vxfec_vk_ctx *ctx, int codec, uint32_t Z
                         w->rq_tmpl16_valid = true;
                     }
                 }
-                if (init_rq_core(gf2_h0_mode, K, WIRE_RQ_MAX_OVERHEAD, &w->rq_tmpl32_dec, NULL)) {
+                if (w->rq_prep_tmpl32 && init_rq_core(gf2_h0_mode, K, WIRE_RQ_MAX_OVERHEAD, &w->rq_tmpl32_dec, NULL)) {
                     size_t tplen = nanorq_core_calculate_prepare_memory(&w->rq_tmpl32_dec);
                     if (tplen > 0 && tplen <= rq_prep_cap && nanorq_core_generate(&w->rq_tmpl32_dec, w->rq_prep, tplen)) {
                         w->rq_tmpl32_bytes = (size_t)(w->rq_tmpl32_dec.W.prep_mem.beg - w->rq_prep);
@@ -1404,10 +1428,16 @@ static void compile_rx_superframe_slot(vxfec_wire_ring *wring, uint32_t slot, co
         return;
     }
 
-    /* dynamically downshift GF(256) tile width to 8 when max_missing <= 8 */
-    uint32_t cur_256_tile_e = (!wring->rx_256_tile_forced && max_missing > 0u && max_missing <= 8u) ? 8u : wring->rx_256_tile_e;
+    /* dynamically downshift GF(256) tile width to 8 or 16 when max_missing fits in a single narrower tile */
+    uint32_t cur_256_tile_e = wring->rx_256_tile_e;
+    if (!wring->rx_256_tile_forced && max_missing > 0u) {
+        if (max_missing <= 8u)
+            cur_256_tile_e = 8u;
+        else if (max_missing <= 16u && wring->rx_256_tile_e > 16u)
+            cur_256_tile_e = 16u;
+    }
     uint32_t cur_256_hdr_words = wire_256_hdr_words(cur_256_tile_e);
-    uint32_t cur_256_hdr_stride = (cur_256_tile_e == 8u && wring->rx_256_tile_e != 8u) ? 1u : wring->rx_256_hdr_stride;
+    uint32_t cur_256_hdr_stride = (cur_256_tile_e < wring->rx_256_tile_e) ? 1u : wring->rx_256_hdr_stride;
     wring->job_256_tile_e = cur_256_tile_e;
     wring->job_256_hdr_words = cur_256_hdr_words;
     wring->job_256_hdr_stride = cur_256_hdr_stride;

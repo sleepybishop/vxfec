@@ -84,11 +84,11 @@ static inline void vxfec_wire_mark_seq(uint64_t *rx_block_bits, uint32_t Z, size
     if (!rx_block_bits || Z == 0 || words_per_blk == 0)
         return;
     uint32_t z = (uint32_t)(wire_seq % (uint64_t)Z);
-    uint32_t esi = (uint32_t)(wire_seq / (uint64_t)Z);
-    size_t word_idx = (esi >> 6u);
-    if (word_idx >= words_per_blk)
+    uint64_t esi = wire_seq / (uint64_t)Z;
+    uint64_t word_idx = esi >> 6u;
+    if (word_idx >= (uint64_t)words_per_blk)
         return;
-    rx_block_bits[(size_t)z * words_per_blk + word_idx] |= (1ULL << (esi & 63u));
+    rx_block_bits[(size_t)z * words_per_blk + (size_t)word_idx] |= (1ULL << (esi & 63u));
 }
 
 bool vxfec_wire_encode_vram(vxfec_wire_ring *wring, vxfec_vk_buf *wire_vram, uint64_t *gpu_ns_out);

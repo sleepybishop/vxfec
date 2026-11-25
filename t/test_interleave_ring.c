@@ -708,6 +708,76 @@ out:
     return ok;
 }
 
+static bool test_wire_rq_tile_widths(vxfec_vk_ctx *ctx)
+{
+    static const struct {
+        uint32_t K;
+        uint32_t P;
+    } shapes[2] = {{96u, 36u}, {256u, 40u}};
+    static const char *tiles[3] = {"8", "16", "32"};
+    const uint32_t Z = 4u, stride = 256u;
+
+    for (size_t si = 0; si < 2u; si++) {
+        uint32_t K = shapes[si].K, P = shapes[si].P;
+        size_t sys_bytes = (size_t)Z * K * stride;
+        size_t wire_bytes = (size_t)Z * (K + P) * stride;
+
+        unsetenv("VXFEC_WIRE_TILE_E");
+        vxfec_wire_ring *auto_ring = vxfec_wire_ring_new(ctx, VXFEC_WIRE_RATELESS, Z, K, P, stride, 1u);
+        vxfec_vk_buf *vram = vxfec_vk_buf_new(ctx, wire_bytes, true);
+        uint8_t *ref_wire = (uint8_t *)malloc(wire_bytes);
+        if (!auto_ring || !vram || !ref_wire) {
+            free(ref_wire);
+            vxfec_vk_buf_free(ctx, vram);
+            vxfec_wire_ring_free(auto_ring);
+            return false;
+        }
+
+        uint8_t *stage = (uint8_t *)vxfec_vk_buf_staging_ptr(vram);
+        memset(stage, 0, wire_bytes);
+        for (size_t i = 0; i < sys_bytes; i++)
+            stage[i] = (uint8_t)((i * 107u + (i >> 7) * 43u + 29u) & 0xffu);
+        bool ok = vxfec_vk_buf_upload(ctx, vram, wire_bytes) && vxfec_wire_encode_vram(auto_ring, vram, NULL) &&
+                  vxfec_vk_buf_download(ctx, vram, wire_bytes);
+        memcpy(ref_wire, stage, wire_bytes);
+
+        /* also exercise async vxfec_wire_encode_submit on the default tile path */
+        if (ok) {
+            memset(stage + sys_bytes, 0xa5, wire_bytes - sys_bytes);
+            uint64_t tk = vxfec_vk_buf_upload(ctx, vram, wire_bytes) ? vxfec_wire_encode_submit(auto_ring, vram) : 0u;
+            ok = tk != 0u && vxfec_vk_wait(ctx, tk, UINT64_MAX) && vxfec_vk_buf_download(ctx, vram, wire_bytes) &&
+                 memcmp(stage, ref_wire, wire_bytes) == 0;
+        }
+        vxfec_wire_ring_free(auto_ring);
+
+        for (size_t ti = 0; ti < 3u && ok; ti++) {
+            setenv("VXFEC_WIRE_TILE_E", tiles[ti], 1);
+            vxfec_wire_ring *dir_ring = vxfec_wire_ring_new(ctx, VXFEC_WIRE_RATELESS, Z, K, P, stride, 1u);
+            memset(stage + sys_bytes, 0x5a, wire_bytes - sys_bytes);
+            ok = dir_ring && vxfec_vk_buf_upload(ctx, vram, wire_bytes) && vxfec_wire_encode_vram(dir_ring, vram, NULL) &&
+                 vxfec_vk_buf_download(ctx, vram, wire_bytes) && memcmp(stage, ref_wire, wire_bytes) == 0;
+            if (ok) {
+                /* Poison parity again so async encoding must produce every output. */
+                memset(stage + sys_bytes, 0xa5, wire_bytes - sys_bytes);
+                uint64_t tk = vxfec_vk_buf_upload(ctx, vram, wire_bytes) ? vxfec_wire_encode_submit(dir_ring, vram) : 0u;
+                ok = tk != 0u && vxfec_vk_wait(ctx, tk, UINT64_MAX) && vxfec_vk_buf_download(ctx, vram, wire_bytes) &&
+                     memcmp(stage, ref_wire, wire_bytes) == 0;
+            }
+            vxfec_wire_ring_free(dir_ring);
+        }
+        unsetenv("VXFEC_WIRE_TILE_E");
+        free(ref_wire);
+        vxfec_vk_buf_free(ctx, vram);
+        if (!ok) {
+            fprintf(stderr, "FAIL: wire_rq_lds vs tile_e=8/16/32 mismatch at K=%u P=%u\n", K, P);
+            return false;
+        }
+    }
+
+    printf("PASS: wire_ring tile_e={8,16,32} sync+async bit-exact across K=96 and K=256\n");
+    return true;
+}
+
 int main(void)
 {
     int status = VXFEC_VK_ERROR;
@@ -820,7 +890,7 @@ int main(void)
 
     if (!test_opportunistic_gf2_fallback_safety(ctx) || !test_explicit_rfc6330_vs_gf2_mode(ctx) ||
         !test_fresh_lossless_async_recover() || !test_directional_wire_rings(ctx) || !test_rq_101_missing_and_exact_p(ctx) ||
-        !test_partial_recovery_and_dynamic_tile_dedup(ctx) ||
+        !test_partial_recovery_and_dynamic_tile_dedup(ctx) || !test_wire_rq_tile_widths(ctx) ||
         !test_wire_ring_codec(ctx, VXFEC_WIRE_RATELESS, "Rateless (GF2 fast-path)", false) ||
         !test_wire_ring_codec(ctx, VXFEC_WIRE_RATELESS, "Rateless (0-slack GF256 fallback)", true) ||
         !test_wire_ring_codec(ctx, VXFEC_WIRE_MDS, "Strict MDS (GF256 nibble)", false))

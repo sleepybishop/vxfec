@@ -168,6 +168,10 @@ $(OUT_PREFIX)t/test_nccl_plugin: $(BUILD_DIR)/t/test_nccl_plugin.o $(CORE_STATIC
 	$(CC) $(CFLAGS) $(LDFLAGS) -rdynamic \
 		-o $@ $(BUILD_DIR)/t/test_nccl_plugin.o $(CORE_STATIC_LIB) $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
 
+# The fixture includes the protocol translation unit to test private RX handlers.
+$(BUILD_DIR)/t/test_nccl_direct_repair: $(BUILD_DIR)/t/test_nccl_direct_repair.o $(filter-out $(BUILD_DIR)/plugins/nccl_net_proto.o,$(NCCL_PLUGIN_OBJ)) $(CORE_STATIC_LIB)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(VULKAN_LIBS) -ldl -pthread $(LDLIBS)
+
 shaders:
 	python3 vk/shaders/gen_spv.py
 
@@ -177,9 +181,16 @@ check-vk: $(OUT_PREFIX)t/test_vk_codecs
 check-interleave: $(OUT_PREFIX)t/test_interleave_ring
 	./$(OUT_PREFIX)t/test_interleave_ring
 
-check-nccl: $(OUT_PREFIX)t/test_nccl_plugin $(OUT_PREFIX)bench_nccl $(NCCL_SO)
+check-nccl: $(OUT_PREFIX)t/test_nccl_plugin $(OUT_PREFIX)bench_nccl $(NCCL_SO) $(BUILD_DIR)/t/test_nccl_direct_repair
+	$(BUILD_DIR)/t/test_nccl_direct_repair
 	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin --wide-udp-fallback
 	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin --rq-async
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin --rail-workers
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" VXFEC_NCCL_RAIL_WORKERS=auto VXFEC_NCCL_PASSIVE_RX_WORKER=1 ./$(OUT_PREFIX)t/test_nccl_plugin --passive-worker 1
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" VXFEC_NCCL_RAIL_WORKERS=0 VXFEC_NCCL_PASSIVE_RX_WORKER=1 ./$(OUT_PREFIX)t/test_nccl_plugin --passive-worker 1
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" VXFEC_NCCL_RAIL_WORKERS=0 VXFEC_NCCL_PASSIVE_RX_WORKER=0 ./$(OUT_PREFIX)t/test_nccl_plugin --passive-worker 0
+	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin --gpu-rt
 	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)t/test_nccl_plugin --ibv-mock
 	VXFEC_NCCL_SO_PATH="$(abspath $(NCCL_SO))" ./$(OUT_PREFIX)bench_nccl --self-test
 

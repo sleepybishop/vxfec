@@ -2,6 +2,7 @@
 #define VXFEC_NCCL_NET_INTERNAL_H
 
 #include "nccl_net_vxfec.h"
+#include "nccl_gpu_rt.h"
 #include "../../transport/harq.h"
 #include "../../transport/ibv_transport.h"
 #include "vxfec_fec.h"
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -54,11 +56,18 @@
 #define VXFEC_MAX_PORTS 32u
 #define VXFEC_DEF_PORTS 16u
 #define VXFEC_DEF_SYM_T 1280u
-#define VXFEC_MAX_SYM_T 8192u
+#define VXFEC_UDP_MAX_SYM_T 8192u
+#define VXFEC_MAX_SYM_T 32768u
+#define VXFEC_IBV_MAX_PKT_BYTES 33792u
+#define VXFEC_IBV_REP_RING 1024u
+#define VXFEC_RX_IBV_REP_SLOTS 256u
+_Static_assert(VXFEC_RX_IBV_REP_SLOTS <= 256u, "VXFEC_RX_IBV_REP_SLOTS must fit in 8-bit RDMA imm_data rep_slot");
+#define VXFEC_RDMA_HOST_CTS_MIN 65537u
 #define VXFEC_SACK_MAX 64u
 #define VXFEC_DONE_RING 4096u
 #define VXFEC_BATCH_PKTS 512u
 #define VXFEC_UDP_TX_BATCH 128u
+#define VXFEC_UDP_SYS_TX_BATCH 512u
 #define VXFEC_RX_BATCH 64u
 #define VXFEC_DELAY_RING 4096u
 #define VXFEC_WIN_ACK_PKTS 16u
@@ -74,11 +83,14 @@
 #define VXFEC_HELLO_GF2 0x01u
 #define VXFEC_HELLO_IBV 0x02u
 #define VXFEC_HELLO_SLICE 0x04u
+#define VXFEC_HELLO_CONFIRM 0x08u
+#define VXFEC_HELLO_RDMA_REPAIR 0x10u
 #ifdef NANORQ_HAS_GF2_MODE
 #define VXFEC_LOCAL_FEATURES (VXFEC_HELLO_GF2 | VXFEC_HELLO_SLICE)
 #else
 #define VXFEC_LOCAL_FEATURES VXFEC_HELLO_SLICE
 #endif
+#define VXFEC_VERBS_FEATURES (VXFEC_LOCAL_FEATURES | VXFEC_HELLO_RDMA_REPAIR)
 #define VXFEC_CONN_TIMEOUT_NS (30ULL * 1000000000ULL)
 
 /* sub-block generation slicing (K <= 128 Cauchy RS8 windows, ir_slack = 0) */
@@ -90,10 +102,12 @@
 #define VXFEC_RX_WIRE_SLOTS 128u
 #define VXFEC_RX_HASH_SLOTS 256u
 #define VXFEC_ABORT_RING 64u
-#define VXFEC_CTS_RING 32u
+#define VXFEC_CTS_RING 128u
 #define VXFEC_LISTEN_TOMBSTONES 256u
 
 _Static_assert(NCCL_NET_MAX_REQUESTS <= 64, "NCCL_NET_MAX_REQUESTS must fit in 6-bit RDMA imm_data rslot");
+_Static_assert((VXFEC_CTS_RING & (VXFEC_CTS_RING - 1u)) == 0u && VXFEC_CTS_RING >= NCCL_NET_MAX_REQUESTS,
+               "VXFEC_CTS_RING must be a power of two >= NCCL_NET_MAX_REQUESTS");
 
 enum {
     PKT_HELLO = 1,
@@ -192,6 +206,9 @@ typedef struct {
     uint64_t remote_iova;
     uint32_t remote_rkey;
     uint32_t max_bytes;
+    uint64_t rep_iova;
+    uint32_t rep_rkey;
+    uint16_t rep_slots;
     uint8_t rslot;
     uint8_t token;
 } vxfec_cts_entry_t;
@@ -218,7 +235,7 @@ typedef struct {
     uint32_t cookie;
     uint16_t tx_ctrl_port_be;
     uint8_t features;
-    uint8_t pad0;
+    uint8_t confirm;
     uint64_t conn_id;
     uint16_t tx_ports_be[VXFEC_MAX_PORTS];
     vxfec_ibv_wire_info_t ibv_info;
@@ -232,7 +249,7 @@ typedef struct {
     uint32_t cookie;
     uint16_t rx_ctrl_port_be;
     uint8_t features;
-    uint8_t pad0;
+    uint8_t confirm;
     uint64_t conn_id;
     uint16_t rx_ports_be[VXFEC_MAX_PORTS];
     vxfec_ibv_wire_info_t ibv_info;
@@ -254,6 +271,7 @@ typedef struct {
 typedef struct {
     atomic_uint refcnt;
     void *base_ptr;
+    void *gpu_dev_ptr;
     size_t size;
     uint64_t offset;
     int ptr_type;
@@ -291,7 +309,7 @@ typedef struct {
 typedef struct {
     uint64_t deliver_ns;
     uint16_t len;
-    uint8_t data[sizeof(vxfec_ctrl_pkt_t) + VXFEC_SACK_MAX * sizeof(uint32_t)];
+    uint8_t data[sizeof(vxfec_ctrl_pkt_t) + VXFEC_SACK_MAX * sizeof(uint32_t) + VXFEC_MAX_PORTS * sizeof(uint16_t)];
 } vxfec_delay_ctrl_t;
 
 typedef struct {
@@ -321,6 +339,8 @@ typedef struct vxfec_accept_node {
     uint32_t peer_ip_be;
     uint16_t peer_port_be;
     size_t ack_len;
+    bool awaiting_confirm;
+    uint64_t confirm_since_ns;
     vxfec_hello_payload_t hello;
     vxfec_hello_ack_t ack;
     vxfec_recv_comm_t *rc;
@@ -357,10 +377,16 @@ typedef struct vxfec_gpu_job {
     vxfec_gpu_job_kind_t kind;
     int vk_idx;
     int pool_idx;
+    vxf_gpurt_kind_t gpurt_kind;
+    bool has_out_dmabuf;
     vxfec_rq_sched *rq_sched;
+    schedule rq_saved_sched;
+    sched_op *rq_saved_ops;
     vxfec_vk_buf *in_buf;
     vxfec_vk_buf *out_buf;
     vxfec_vk_buf *out_dmabuf;
+    void *in_stage_ptr;
+    void *out_stage_ptr;
     uint32_t out_ibv_lkey;
     uint64_t out_ibv_iova;
     bool used_vram_out;
@@ -372,12 +398,19 @@ typedef struct vxfec_gpu_job {
     uint8_t *rs8_parity_m;
     uint64_t ticket;
     struct vxfec_gpu_job *next;
+    /* Direct submissions stay linked to the NCCL request until GPU access ends. */
+    struct vxfec_gpu_job **user_jobs;
+    struct vxfec_gpu_job *user_next;
+    bool retired;
 } vxfec_gpu_job_t;
 
 typedef struct {
-    vxfec_wire_hdr_ext_t hdrs[VXFEC_UDP_TX_BATCH];
-    struct iovec iovs[VXFEC_UDP_TX_BATCH][2];
-    struct mmsghdr msgs[VXFEC_UDP_TX_BATCH];
+    uint64_t gso_datagrams;
+    uint32_t capacity;
+    bool gso_disabled;
+    vxfec_wire_hdr_ext_t *hdrs;
+    struct iovec (*iovs)[2];
+    struct mmsghdr msgs[];
 } vxfec_tx_udp_batch_t;
 
 typedef struct {
@@ -390,11 +423,11 @@ typedef struct {
 
 struct vxfec_tx_user_req {
     vxfec_req_kind_t kind;
-    bool in_use;
+    atomic_bool in_use;
     bool failed;
     bool completion_ready;
     bool ibv_zc_pending;
-    bool done;
+    atomic_bool done;
     vxfec_send_comm_t *comm;
     uint32_t tag;
     uint32_t tag_seq;
@@ -402,6 +435,10 @@ struct vxfec_tx_user_req {
     uint16_t sym_T;
     uint16_t num_gens;
     uint16_t next_gen_to_spawn;
+#if VXFEC_ENABLE_SIM
+    uint64_t paired_fault_key;
+    uint32_t paired_fault_epoch;
+#endif
     uint16_t gens_completed;
     uint16_t active_gens;
     ncclResult_t status;
@@ -412,12 +449,20 @@ struct vxfec_tx_user_req {
     uint32_t src_ibv_lkey;
     bool src_ibv_dmabuf;
     bool has_rdma_cts;
+    bool cts_resolved;
+    uint64_t cts_wait_until_ns;
     uint64_t rdma_iova;
     uint32_t rdma_rkey;
+    uint64_t rdma_rep_iova;
+    uint32_t rdma_rep_rkey;
+    uint16_t rdma_rep_slots;
+    uint16_t rdma_rep_sent;
+    uint64_t rdma_rep_slot_mask[4];
     uint8_t rdma_rslot;
     uint8_t rdma_token;
     uint8_t *bounce_buf;
     vxfec_gpu_job_t *zc_gpu_head;
+    vxfec_gpu_job_t *direct_jobs;
     uint64_t ibv_target_seq[VXFEC_IBV_MAX_QPS];
 };
 
@@ -449,8 +494,14 @@ typedef struct vxfec_tx_req_impl {
     bool src_ibv_dmabuf;
     bool use_rdma_write;
     bool rdma_gen_hdr_sent;
+    bool codec_promoted;
     uint64_t rdma_gen_iova;
     uint32_t rdma_rkey;
+    uint64_t rdma_rep_iova;
+    uint32_t rdma_rep_rkey;
+    uint16_t rdma_rep_slots;
+    uint16_t rdma_rep_sent;
+    uint64_t rdma_rep_slot_mask[4];
     uint8_t rdma_rslot;
     uint8_t rdma_token;
     uint8_t *bounce_buf;
@@ -475,6 +526,7 @@ typedef struct vxfec_tx_req_impl {
     bool tx_gpu_proactive;
     bool tx_gpu_ready;
     bool tx_gpu_failed;
+    bool tx_gpu_ibv_posted;
 
     uint32_t tx_sys_cursor;
     uint32_t proactive_target;
@@ -507,6 +559,8 @@ typedef struct vxfec_tx_req_impl {
     uint32_t gbn_cursor;
     uint32_t gbn_rem;
     bool need_recovery_tail;
+    uint16_t tx_qp_pkts[VXFEC_MAX_PORTS];
+    uint16_t win_qp_lost[VXFEC_MAX_PORTS];
 } vxfec_tx_slot_t;
 
 typedef struct {
@@ -518,12 +572,29 @@ typedef struct {
     bool acked;
 } vxfec_abort_entry_t;
 
+#define VXFEC_COMM_MAGIC 0x5658434du
+
+typedef struct {
+    uint32_t comm_magic;
+    int comm_dev_idx;
+} vxfec_comm_hdr_t;
+
+typedef struct {
+    vxfec_ibv_rdma_wr_t rdma[VXFEC_IBV_MAX_QPS][VXFEC_IBV_BATCH_MAX];
+    vxfec_ibv_send_wr_desc_t send[VXFEC_IBV_MAX_QPS][VXFEC_IBV_BATCH_MAX];
+    vxfec_wire_hdr_ext_t ihdrs[VXFEC_UDP_TX_BATCH];
+    uint32_t orig_idx[VXFEC_IBV_MAX_QPS][VXFEC_IBV_BATCH_MAX];
+} vxfec_tx_ibv_batch_t;
+
 struct vxfec_send_comm {
+    uint32_t comm_magic;
+    int comm_dev_idx;
     pthread_mutex_t mtx;
     bool mtx_ready;
-    bool tx_bg_registered;
+    atomic_bool tx_bg_registered;
     vxfec_send_comm_t *tx_bg_next;
-    uint32_t unacked_aborts;
+    atomic_uint active_reqs;
+    atomic_uint unacked_aborts;
     int dev_idx;
     uint32_t bind_ip_be;
     int ctrl_fd;
@@ -534,7 +605,14 @@ struct vxfec_send_comm {
     uint32_t slice_min_bytes;
     vxfec_ibv_dev_ref_t *ibv_ref;
     vxfec_ibv_ep_t *ibv_ep;
-    bool ibv_failed;
+    uint8_t *ibv_rep_buf;
+    vxfec_ibv_mr_t *ibv_rep_mr;
+    uint32_t ibv_rep_cursor;
+    uint32_t rx_rep_ring_cursor;
+    uint32_t rx_rep_inflight;
+    uint64_t rx_rep_slot_mask[4];
+    uint64_t rx_rep_ready_ns[256];
+    atomic_bool ibv_failed;
     struct sockaddr_in peer_ctrl;
     struct sockaddr_in peer_rx_ctrl;
     struct sockaddr_in peer_data[VXFEC_MAX_PORTS];
@@ -542,14 +620,23 @@ struct vxfec_send_comm {
     bool data_connected;
     int32_t swrr_cur[VXFEC_MAX_PORTS];
     int32_t port_weights[VXFEC_MAX_PORTS];
+    uint32_t loss_evicted_mask;
     bool has_nonuniform_weights;
     uint32_t cookie;
     vxfec_hello_payload_t hello;
+    uint64_t first_hello_ns;
     uint64_t last_hello_ns;
+    uint64_t hs_rtt_ns;
+    uint32_t hello_tx_count;
     uint32_t empty_hello_polls;
     bool connected;
+    bool connect_failed;
     uint32_t next_msg_seq;
     uint32_t spawn_rr_cursor;
+#if VXFEC_ENABLE_SIM
+    uint32_t paired_fault_epoch;
+    uint32_t paired_fault_request_index;
+#endif
     vxfec_tag_map_t tag_map;
     uint32_t cfg_epoch;
     double loss_ewma;
@@ -580,6 +667,7 @@ struct vxfec_send_comm {
 #endif
 
     vxfec_tx_udp_batch_t *tx_udp;
+    vxfec_tx_ibv_batch_t *tx_ibv;
     _Alignas(struct cmsghdr) uint8_t tx_cmsg_ce[CMSG_SPACE(sizeof(uint8_t))];
     size_t tx_cmsg_ce_len;
 };
@@ -602,7 +690,9 @@ typedef struct {
     bool tail_seen;
     bool stage_failed;
     bool fec_repaired;
+    bool cuda_repaired;
     bool direct_vram;
+    bool codec_promoted;
 
     vxfec_rx_req_t *bound_req;
 
@@ -610,6 +700,7 @@ typedef struct {
     uint32_t initial_missing_sys;
     uint32_t sack_cursor;
     uint8_t *sys_bitmap;
+    uint8_t inline_bitmap[32];
     uint8_t *sys_stage;
 
     uint32_t rx_rep_cnt;
@@ -629,6 +720,7 @@ typedef struct {
     uint32_t max_init_esi_plus1;
     uint32_t rx_ecn_ce_cnt;
     uint32_t ecn_port_mask;
+    uint16_t rx_qp_pkts[VXFEC_MAX_PORTS];
 
     uint32_t ir_slack;
     uint64_t probe_rx_ns;
@@ -644,9 +736,9 @@ typedef struct {
 
 struct vxfec_rx_req {
     vxfec_req_kind_t kind;
-    bool in_use;
+    atomic_bool in_use;
     bool any_gen_used_fec;
-    bool done;
+    atomic_bool done;
     vxfec_recv_comm_t *comm;
     uint32_t expected_tag_seq;
     uint32_t tag;
@@ -659,14 +751,23 @@ struct vxfec_rx_req {
     uint16_t bound_sym_T;
     ncclResult_t status;
     vxfec_mr_t *mr;
+    vxfec_gpu_job_t *direct_jobs;
     uint8_t rslot_idx;
     uint8_t cts_token;
     bool rdma_cts_sent;
-    uint32_t *early_rdma_syms;
+    bool cts_sent_any;
+    uint16_t cts_rep_slots;
+    uint32_t cts_remote_rkey;
+    uint32_t cts_rep_rkey;
+    uint64_t cts_remote_iova;
+    uint64_t cts_rep_iova;
+    uint64_t cts_last_tx_ns;
+    uint64_t *early_rdma_syms;
     uint32_t early_rdma_cnt;
     uint32_t early_rdma_cap;
     uint64_t inline_gen_bits;
     uint64_t *heap_gen_bits;
+    int16_t gen_to_slot[64];
 };
 
 typedef struct vxfec_done_range {
@@ -682,10 +783,13 @@ typedef struct {
 } vxfec_stage_slot_t;
 
 struct vxfec_recv_comm {
+    uint32_t comm_magic;
+    int comm_dev_idx;
     pthread_mutex_t mtx;
     bool mtx_ready;
-    bool bg_registered;
+    atomic_bool bg_registered;
     vxfec_recv_comm_t *bg_next;
+    atomic_uint active_reqs;
     uint8_t features;
     int dev_idx;
     int ctrl_fd;
@@ -697,7 +801,9 @@ struct vxfec_recv_comm {
     uint32_t num_ports;
     vxfec_ibv_dev_ref_t *ibv_ref;
     vxfec_ibv_ep_t *ibv_ep;
-    bool ibv_failed;
+    uint8_t *ibv_rep_buf;
+    vxfec_ibv_mr_t *ibv_rep_mr;
+    atomic_bool ibv_failed;
     struct sockaddr_in peer_data[VXFEC_MAX_PORTS];
     int32_t swrr_cur[VXFEC_MAX_PORTS];
     uint32_t cookie;
@@ -720,6 +826,7 @@ struct vxfec_recv_comm {
     vxfec_delay_ctrl_t *header_delay_q;
     uint32_t header_delay_head;
     uint32_t header_delay_cnt;
+    uint64_t port_last_deliver_ns[VXFEC_MAX_PORTS];
 #endif
 
     vxfec_stage_slot_t stage_pool[VXFEC_STAGE_POOL_SLOTS];
@@ -742,7 +849,7 @@ struct vxfec_recv_comm {
 /* shared globals across plugin compilation units (hidden symbol visibility) */
 extern ncclDebugLogger_t vxf_logger;
 extern vxfec_nic_dev_t vxf_devs[VXFEC_MAX_DEVS];
-extern uint32_t vxf_num_devs;
+extern atomic_uint vxf_num_devs;
 extern atomic_uint vxf_leaked_ibv_eps;
 
 extern atomic_uint vxf_cfg_ports;
@@ -750,7 +857,18 @@ extern atomic_uint vxf_cfg_mtu_sym;
 extern atomic_uint vxf_cfg_bind_ip_be;
 extern atomic_uint vxf_cfg_busy_poll_us;
 extern atomic_uint vxf_cfg_slice_min_bytes;
+extern atomic_uint vxf_cfg_rail_workers;
 extern atomic_uint vxf_granted_rcvbuf;
+extern atomic_bool vxf_cfg_strict_pix_mr;
+extern _Atomic uint64_t vxf_cfg_cwnd_kb;
+extern _Atomic uint64_t vxf_cfg_max_rate_mbps;
+extern _Atomic int64_t vxf_cfg_target_qdelay_us;
+
+static inline bool vxf_rail_workers_active(void)
+{
+    uint32_t m = atomic_load_explicit(&vxf_cfg_rail_workers, memory_order_relaxed);
+    return (m >= 2u) || (m == 1u && atomic_load_explicit(&vxf_num_devs, memory_order_acquire) > 1u);
+}
 extern atomic_int vxf_env_codec_ovr;
 extern atomic_int vxf_codec_override;
 
@@ -765,6 +883,7 @@ extern _Atomic uint64_t vxf_st_tx_harq_ir_pkts;
 extern _Atomic uint64_t vxf_st_rx_messages;
 extern _Atomic uint64_t vxf_st_rx_fast_completions;
 extern _Atomic uint64_t vxf_st_rx_fec_decodes;
+extern _Atomic uint64_t vxf_st_rx_cuda_repair_completions;
 extern _Atomic uint64_t vxf_st_rx_rs8_decodes;
 extern _Atomic uint64_t vxf_st_rx_rq_decodes;
 extern _Atomic uint64_t vxf_st_rx_ooo_pkts;
@@ -775,7 +894,17 @@ extern _Atomic uint64_t vxf_st_tx_cnp_events;
 extern _Atomic uint64_t vxf_st_tx_paced_slices;
 extern _Atomic uint64_t vxf_st_tx_fec_clamped_pkts;
 extern _Atomic uint64_t vxf_st_ibv_direct_pkts;
+extern _Atomic uint64_t vxf_st_tx_sys_ibv_pkts;
+extern _Atomic uint64_t vxf_st_tx_sys_gpu_direct_pkts;
+extern _Atomic uint64_t vxf_st_rx_sys_pkts;
+extern _Atomic uint64_t vxf_st_rx_sys_gpu_direct_pkts;
+extern _Atomic uint64_t vxf_st_rail_tx_gpu_direct_pkts[VXFEC_MAX_DEVS];
+extern _Atomic uint64_t vxf_st_rail_rx_gpu_direct_pkts[VXFEC_MAX_DEVS];
+extern _Atomic uint64_t vxf_st_tx_udp_payload_pkts;
 extern _Atomic uint64_t vxf_st_vk_async_polls;
+
+extern _Atomic uint64_t vxf_send_histogram_epoch;
+void vxf_record_send_size(uint64_t epoch, uint32_t size);
 
 #define VXF_LOG_WARN(...)                                                                                                          \
     do {                                                                                                                           \
@@ -811,6 +940,7 @@ void vxf_sim_init_from_env(void);
 
 #if VXFEC_ENABLE_SIM
 extern atomic_bool vxf_sim_active;
+extern atomic_bool vxf_sim_asym_active;
 extern atomic_uint vxf_sim_cfg_epoch;
 extern atomic_bool vxf_sim_reorder;
 extern _Atomic uint64_t vxf_sim_max_rate_mbps;
@@ -823,8 +953,35 @@ extern atomic_uint vxf_sim_fail_gpu_rx_writes;
 
 uint32_t vxf_fast_rand32(void);
 bool vxf_sim_should_drop_data_slow(void);
+bool vxf_sim_should_drop_port_data_slow(uint32_t port_idx);
+uint64_t vxf_sim_port_delay_ns_slow(uint32_t port_idx);
 bool vxf_sim_should_drop_counter_slow(atomic_uint *counter);
 bool vxf_sim_should_mark_ecn_slow(uint32_t port_idx);
+void vxf_sim_bind_paired_fault(vxfec_tx_user_req_t *req);
+bool vxf_sim_should_drop_first_sys(const vxfec_tx_slot_t *req, uint32_t esi);
+
+static inline bool vxf_sim_asym_enabled(void)
+{
+    return atomic_load_explicit(&vxf_sim_asym_active, memory_order_relaxed);
+}
+
+static inline uint64_t vxf_sim_port_delay_ns(uint32_t port_idx)
+{
+    if (!atomic_load_explicit(&vxf_sim_active, memory_order_relaxed))
+        return 0u;
+    if (atomic_load_explicit(&vxf_sim_asym_active, memory_order_relaxed))
+        return vxf_sim_port_delay_ns_slow(port_idx);
+    return atomic_load_explicit(&vxf_sim_link_delay_ns, memory_order_relaxed);
+}
+
+static inline bool vxf_sim_should_drop_port_data(uint32_t port_idx)
+{
+    if (!atomic_load_explicit(&vxf_sim_active, memory_order_relaxed))
+        return false;
+    if (atomic_load_explicit(&vxf_sim_asym_active, memory_order_relaxed))
+        return vxf_sim_should_drop_port_data_slow(port_idx);
+    return vxf_sim_should_drop_data_slow();
+}
 
 static inline bool vxf_sim_should_drop_data(void)
 {
@@ -951,6 +1108,20 @@ static inline uint64_t vxf_sim_delay_ns(void)
 {
     return 0u;
 }
+static inline bool vxf_sim_asym_enabled(void)
+{
+    return false;
+}
+static inline uint64_t vxf_sim_port_delay_ns(uint32_t port_idx)
+{
+    (void)port_idx;
+    return 0u;
+}
+static inline bool vxf_sim_should_drop_port_data(uint32_t port_idx)
+{
+    (void)port_idx;
+    return false;
+}
 static inline uint64_t vxf_sim_rate_cap_mbps(void)
 {
     return 0u;
@@ -961,34 +1132,57 @@ static inline uint32_t vxf_sim_epoch(void)
 }
 #endif
 
+static inline bool vxf_mr_has_gpu_buf(const vxfec_mr_t *mr)
+{
+    return mr && (mr->gpu_dev_ptr != NULL || mr->vk_buf != NULL);
+}
+
+static inline void *vxf_gpu_job_in_ptr(vxfec_gpu_job_t *job)
+{
+    if (!job)
+        return NULL;
+    return job->in_stage_ptr ? job->in_stage_ptr : vxfec_vk_buf_staging_ptr(job->in_buf);
+}
+
+static inline void *vxf_gpu_job_out_ptr(vxfec_gpu_job_t *job)
+{
+    if (!job)
+        return NULL;
+    return job->out_stage_ptr ? job->out_stage_ptr : vxfec_vk_buf_staging_ptr(job->out_buf);
+}
+
 /* device, MR, and GPU offload APIs (nccl_net_dev.c) */
 void vxf_ibv_ref_retain(vxfec_ibv_dev_ref_t *ref);
+vxfec_ibv_dev_ref_t *vxf_acquire_dev_ibv_ref(int dev_idx, uint32_t *out_mtu);
 void vxf_ibv_ref_release(vxfec_ibv_dev_ref_t *ref);
 void vxf_mr_retain(vxfec_mr_t *mr);
 void vxf_mr_release(vxfec_mr_t *mr);
+bool vxf_mr_can_gpu_rw(const vxfec_mr_t *mr);
 bool vxf_mr_vk_read(vxfec_mr_t *mr, size_t byte_offset, void *dst, size_t bytes);
 bool vxf_mr_vk_write(vxfec_mr_t *mr, size_t byte_offset, const void *src, size_t bytes);
 uint32_t vxf_get_dev_ip_be(int dev_idx);
 uint32_t vxf_parse_slice_min_env(uint32_t fallback);
 
-vxfec_gpu_job_t *vxf_rq_gpu_job_new(vxfec_vk_ctx *prefer_vk, nanorq_core *rq, const schedule *ops, size_t input_bytes,
+vxfec_gpu_job_t *vxf_rq_gpu_job_new(const vxfec_mr_t *prefer_mr, nanorq_core *rq, const schedule *ops, size_t input_bytes,
                                     size_t output_bytes);
 bool vxf_gpu_job_prepare_ibv_out(vxfec_gpu_job_t *job, int dev_idx, size_t out_bytes);
 bool vxf_rq_gpu_job_submit(vxfec_gpu_job_t *job, nanorq_core *rq, uint32_t stride, const uint32_t *esis, uint32_t count);
-bool vxf_rq_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, nanorq_core *rq, vxfec_vk_buf *src_vram, size_t src_offset,
+bool vxf_rq_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, nanorq_core *rq, vxfec_mr_t *src_mr, size_t src_offset,
                                     size_t valid_bytes, uint32_t sym_T, uint32_t stride, const uint32_t *esis, uint32_t count,
                                     bool use_ibv_out);
 bool vxf_rq_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, nanorq_core *rq, const uint8_t *sys_bitmap, uint32_t K, uint32_t sym_T,
-                                    vxfec_vk_buf *target_vram, size_t target_offset, size_t total_bytes, uint32_t stride,
+                                    vxfec_mr_t *target_mr, size_t target_offset, size_t total_bytes, uint32_t stride,
                                     const uint32_t *missing_esis, uint32_t count, uint32_t overhead);
-vxfec_gpu_job_t *vxf_rs8_gpu_job_new(vxfec_vk_ctx *prefer_vk, bool is_decode, uint32_t K, uint32_t rs_m, const uint8_t *erased_k,
-                                     const uint8_t *parity_m, uint32_t count, uint32_t sym_T);
+vxfec_gpu_job_t *vxf_rs8_gpu_job_new(const vxfec_mr_t *prefer_mr, bool is_decode, uint32_t K, uint32_t rs_m,
+                                     const uint8_t *erased_k, const uint8_t *parity_m, uint32_t count, uint32_t sym_T);
 bool vxf_rs8_gpu_job_submit(vxfec_gpu_job_t *job, uint32_t sym_T);
-bool vxf_rs8_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes,
+bool vxf_rs8_gpu_job_submit_vram_enc(vxfec_gpu_job_t *job, vxfec_mr_t *src_mr, size_t src_offset, size_t valid_bytes,
                                      uint32_t sym_T, bool use_ibv_out);
-bool vxf_rs8_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, const uint8_t *sys_bitmap, vxfec_vk_buf *target_vram,
-                                     size_t target_offset, size_t total_bytes, uint32_t sym_T);
+bool vxf_rs8_gpu_job_submit_vram_rep(vxfec_gpu_job_t *job, const uint8_t *sys_bitmap, vxfec_mr_t *target_mr, size_t target_offset,
+                                     size_t total_bytes, uint32_t sym_T);
 int vxf_gpu_job_poll(vxfec_gpu_job_t *job);
+void vxf_gpu_track_direct_job(vxfec_gpu_job_t *job, vxfec_gpu_job_t **head);
+bool vxf_gpu_finish_direct_jobs(vxfec_gpu_job_t **head, bool wait);
 void vxf_gpu_job_free(vxfec_gpu_job_t *job);
 
 ncclResult_t vxf_init(ncclDebugLogger_t logFunction);
@@ -999,14 +1193,16 @@ ncclResult_t vxf_reg_mr_dmabuf(void *comm, void *data, size_t size, int type, ui
 ncclResult_t vxf_dereg_mr(void *comm, void *mhandle);
 ncclResult_t vxf_get_device_mr(void *comm, void *mhandle, void **dptr_mhandle);
 void vxf_dev_shutdown(void);
+void vxf_register_gpu_atexit(bool is_gpurt);
 
-/* connection & background epoll APIs (nccl_net_conn.c) */
+/* connection & per-rail background worker APIs (nccl_net_conn.c) */
 uint64_t vxf_next_unique_u64(void);
 uint32_t vxf_next_unique_u32(void);
 void vxf_accept_node_release(vxfec_accept_node_t *node);
+void vxf_rail_wake(int dev_idx);
 void vxf_rx_bg_wake(void);
 #if VXFEC_ENABLE_SIM
-void vxf_rx_bg_schedule_delay(void);
+void vxf_rx_bg_schedule_delay(int dev_idx);
 uint64_t vxf_rx_deliver_due_headers(vxfec_recv_comm_t *comm, uint64_t now_ns);
 #endif
 void vxf_rx_bg_register(vxfec_recv_comm_t *rc);
@@ -1034,10 +1230,10 @@ void vxf_free_tx_req_resources(vxfec_tx_slot_t *req);
 void vxf_free_ureq_zc_jobs(vxfec_tx_user_req_t *ureq);
 void vxf_reset_rx_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *s);
 void vxf_rx_done_range_discard(vxfec_done_range_t **head, uint64_t through);
-void vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns);
+bool vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns);
 void vxf_rx_bg_peek_data_ports(vxfec_recv_comm_t *comm);
-void vxf_progress_send_comm(vxfec_send_comm_t *comm);
-void vxf_progress_recv_comm(vxfec_recv_comm_t *comm);
+bool vxf_progress_send_comm(vxfec_send_comm_t *comm);
+bool vxf_progress_recv_comm(vxfec_recv_comm_t *comm);
 
 ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhandle, void **request);
 ncclResult_t vxf_irecv(void *recvComm, int n, void **data, int *sizes, int *tags, void **mhandles, void **request);

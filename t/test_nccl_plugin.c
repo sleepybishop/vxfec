@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "../plugins/nccl/nccl_gpu_rt.h"
 #include "../plugins/nccl/nccl_net_v8.h"
 #include "../plugins/nccl/nccl_net_vxfec.h"
 #include "../transport/harq.h"
@@ -11,11 +12,14 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef VXFEC_HAVE_IBVERBS
+#include "../plugins/nccl/nccl_net_internal.h"
 #include <infiniband/verbs.h>
 #endif
 #include <vulkan/vulkan.h>
@@ -61,6 +66,12 @@ static int test_real_sendmmsg(int fd, struct mmsghdr *msgs, unsigned int count, 
 static int test_path_mtu;
 static int test_wire_mtu;
 static unsigned test_mtu_rejections;
+static bool test_reject_udp_gso;
+static unsigned test_gso_rejections;
+#ifdef UDP_SEGMENT
+static bool test_wide_udp;
+static int test_wide_sendmmsg(int fd, struct mmsghdr *msgs, unsigned count, int flags, size_t segment);
+#endif
 static int test_rq_drop_tag;
 static unsigned test_rq_drop_cnt;
 static int test_rq_send_with_loss(int fd, struct mmsghdr *msgs, unsigned count, int flags);
@@ -78,6 +89,29 @@ __attribute__((visibility("default"))) int getsockopt(int fd, int level, int opt
 
 __attribute__((visibility("default"))) int sendmmsg(int fd, struct mmsghdr *msgs, unsigned count, int flags)
 {
+    size_t segment = 0;
+#ifdef UDP_SEGMENT
+    if (count && (test_rq_drop_tag || test_path_mtu || test_wide_udp)) {
+        struct msghdr *hdr = &msgs[0].msg_hdr;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(hdr); c; c = CMSG_NXTHDR(hdr, c)) {
+            if (c->cmsg_level == IPPROTO_UDP && c->cmsg_type == UDP_SEGMENT && c->cmsg_len == CMSG_LEN(sizeof(uint16_t))) {
+                uint16_t size;
+                memcpy(&size, CMSG_DATA(c), sizeof(size));
+                segment = size;
+                break;
+            }
+        }
+    }
+    if (test_wide_udp && count)
+        return test_wide_sendmmsg(fd, msgs, count, flags, segment);
+    /* The asynchronous repair fixture injects faults into individual datagrams. */
+    if (segment && (test_reject_udp_gso || test_rq_drop_tag)) {
+        if (test_reject_udp_gso)
+            test_gso_rejections++;
+        errno = ENOPROTOOPT;
+        return -1;
+    }
+#endif
     if (test_rq_drop_tag)
         return test_rq_send_with_loss(fd, msgs, count, flags);
     int mtu_cap = test_wire_mtu ? test_wire_mtu : test_path_mtu;
@@ -85,8 +119,9 @@ __attribute__((visibility("default"))) int sendmmsg(int fd, struct mmsghdr *msgs
         size_t bytes = 28u;
         for (size_t i = 0; i < msgs[0].msg_hdr.msg_iovlen; i++)
             bytes += msgs[0].msg_hdr.msg_iov[i].iov_len;
-        if (bytes > (size_t)mtu_cap) {
-            test_mtu_rejections++;
+        if ((segment ? 28u + segment : bytes) > (size_t)mtu_cap) {
+            if (!segment)
+                test_mtu_rejections++; /* Count a rejected datagram after any aggregate fallback. */
             errno = EMSGSIZE;
             return -1;
         }
@@ -311,7 +346,7 @@ static bool test_stats_abi_versioning(test_get_stats_v1_fn get_v1, test_get_stat
         return false;
     reset_stats();
 
-    uint8_t buf[sizeof(vxfec_nccl_stats_t) + 32u];
+    _Alignas(vxfec_nccl_stats_t) uint8_t buf[sizeof(vxfec_nccl_stats_t) + 32u];
     memset(buf, 0xa5, sizeof(buf));
     get_v1((vxfec_nccl_stats_t *)buf);
     for (size_t i = 0; i < VXFEC_NCCL_STATS_V1_BYTES; i++) {
@@ -338,6 +373,16 @@ static bool test_stats_abi_versioning(test_get_stats_v1_fn get_v1, test_get_stat
             return false;
     }
 
+    const size_t old_sizes[] = {VXFEC_NCCL_STATS_V2_BYTES, VXFEC_NCCL_STATS_V3_BYTES};
+    for (size_t v = 0; v < sizeof(old_sizes) / sizeof(old_sizes[0]); v++) {
+        memset(buf, 0x5a, sizeof(buf));
+        get_ex((vxfec_nccl_stats_t *)buf, old_sizes[v]);
+        for (size_t i = 0; i < sizeof(buf); i++) {
+            if (buf[i] != (i < old_sizes[v] ? 0u : 0x5au))
+                return false;
+        }
+    }
+
     memset(buf, 0x3c, sizeof(buf));
     get_ex((vxfec_nccl_stats_t *)buf, sizeof(vxfec_nccl_stats_t));
     for (size_t i = 0; i < sizeof(vxfec_nccl_stats_t); i++) {
@@ -349,7 +394,7 @@ static bool test_stats_abi_versioning(test_get_stats_v1_fn get_v1, test_get_stat
             return false;
     }
 
-    printf("PASS: Versioned stats ABI (v1 136-byte canary intact, v2 get_stats_ex size-bounded)\n");
+    printf("PASS: Versioned stats ABI (v1 through v3 canaries intact, v4 get_stats_ex size-bounded)\n");
     return true;
 }
 
@@ -397,7 +442,7 @@ static void teardown_ring(const ncclNet_v8_t *net, ring_comms_t *ring)
     }
 }
 
-static bool test_path_mtu_limits(const ncclNet_v8_t *net)
+static bool test_path_mtu_limits(const ncclNet_v8_t *net, bool reject_gso)
 {
     const int bytes = 1024 * 1024;
     unsigned char *src = malloc((size_t)bytes), *dst = calloc(1, (size_t)bytes);
@@ -410,6 +455,8 @@ static bool test_path_mtu_limits(const ncclNet_v8_t *net)
 
     test_path_mtu = 1500;
     test_mtu_rejections = 0;
+    test_reject_udp_gso = reject_gso;
+    test_gso_rejections = 0;
     if (!setup_ring(net, &ring))
         goto out;
 
@@ -428,7 +475,8 @@ static bool test_path_mtu_limits(const ncclNet_v8_t *net)
             (!rdone && net->test(rq, &rdone, &received) != ncclSuccess))
             goto out;
     }
-    if (test_mtu_rejections || received != bytes || memcmp(src, dst, (size_t)bytes) != 0)
+    if (test_mtu_rejections || (reject_gso && test_gso_rejections != 1u) || received != bytes ||
+        memcmp(src, dst, (size_t)bytes) != 0)
         goto out;
 
     /* route or IP-option shrink after connect surfaces as error and steps sym_T down */
@@ -461,11 +509,13 @@ static bool test_path_mtu_limits(const ncclNet_v8_t *net)
 out:
     test_wire_mtu = 0;
     test_path_mtu = 0;
+    test_reject_udp_gso = false;
     teardown_ring(net, &ring);
     free(dst);
     free(src);
     if (ok)
-        printf("PASS: 1 MiB transfer respects 1500-byte PMTU and reports a later shrink\n");
+        printf("PASS: 1 MiB transfer respects 1500-byte PMTU and reports a later shrink%s\n",
+               reject_gso ? " with UDP segmentation rejected" : "");
     else
         fprintf(stderr, "FAIL: PMTU sizing or EMSGSIZE propagation\n");
     return ok;
@@ -1994,6 +2044,7 @@ static struct {
     bool poll_failed;
     bool force_device_lost_idle;
     bool fail_fence_wait;
+    bool fail_ticket_wait;
     bool fail_device_idle;
     VkSemaphore semaphore;
     uint64_t ticket;
@@ -2124,6 +2175,9 @@ __attribute__((visibility("default"))) VKAPI_ATTR VkResult VKAPI_CALL vkWaitSema
         if (test_rq_vk.dispatched)
             test_rq_vk.post_dispatch_waits++;
     }
+    if (test_rq_vk.fail_ticket_wait && timeout && info->semaphoreCount == 1 && info->pSemaphores[0] == test_rq_vk.semaphore &&
+        info->pValues[0] == test_rq_vk.ticket)
+        return VK_ERROR_UNKNOWN;
     return test_vk_wait_semaphores(dev, info, timeout);
 }
 
@@ -2184,6 +2238,231 @@ static bool progress_rq_test_transfer(const ncclNet_v8_t *net, rq_test_transfer 
     return ok;
 }
 
+static bool test_send_histogram(void *dl, const ncclNet_v8_t *net, ring_comms_t *ring)
+{
+    int (*begin)(void) = dlsym(dl, "vxfec_nccl_send_histogram_begin");
+    int (*end)(vxfec_nccl_send_size_bin_t *, size_t) = dlsym(dl, "vxfec_nccl_send_histogram_end");
+    vxfec_nccl_send_size_bin_t bins[3];
+    if (!begin || !end || begin() != 0 || begin() != -EBUSY)
+        return false;
+
+    /* The preceding ring reduction ran outside the window. Count user
+     * messages even when they span several coding generations. */
+    if (!run_host_ring_allreduce(net, ring, 131072, 1001))
+        return false;
+    rq_test_transfer pending[NCCL_NET_MAX_REQUESTS];
+    uint8_t src[37] = {1}, dst[NCCL_NET_MAX_REQUESTS][sizeof(src)];
+    for (int i = 0; i < NCCL_NET_MAX_REQUESTS; i++) {
+        int size = i == 0 ? 0 : (int)sizeof(src);
+        if (!post_rq_test_transfer(net, ring->send_comm[0], ring->recv_comm[1], src, dst[i], size, 2000 + i, &pending[i]))
+            return false;
+    }
+    /* A full send pool returns success with a null request. That retry must
+     * not create a 1-byte bin. */
+    void *retry = src;
+    if (net->isend(ring->send_comm[0], src, 1, 3000, NULL, &retry) != ncclSuccess || retry)
+        return false;
+    uint64_t deadline = test_rq_now_ns() + 5000000000ULL;
+    for (int i = 0; i < NCCL_NET_MAX_REQUESTS; i++) {
+        while (!pending[i].tx_done || !pending[i].rx_done) {
+            if (test_rq_now_ns() >= deadline || !progress_rq_test_transfer(net, &pending[i]))
+                return false;
+        }
+    }
+    if (end(bins, 3) != 3)
+        return false;
+    const uint64_t ring_sends = 2 * NUM_RANKS * (NUM_RANKS - 1);
+    bool saw_zero = false, saw_small = false, saw_ring = false;
+    for (size_t i = 0; i < 3; i++) {
+        if (bins[i].bytes != bins[i].size_bytes * bins[i].requests)
+            return false;
+        if (bins[i].size_bytes == 0 && bins[i].requests == 1)
+            saw_zero = true;
+        if (bins[i].size_bytes == sizeof(src) && bins[i].requests == NCCL_NET_MAX_REQUESTS - 1)
+            saw_small = true;
+        if (bins[i].size_bytes == 524288 && bins[i].requests == ring_sends)
+            saw_ring = true;
+    }
+    if (!saw_zero || !saw_small || !saw_ring || begin() != 0 || end(bins, 3) != 0)
+        return false;
+    puts("PASS: timed send histogram counts accepted requests across comms, including zero-byte sends and excluding retries");
+    return true;
+}
+
+#ifdef UDP_SEGMENT
+enum { WIDE_WARMUP_TAG = 986, WIDE_TEST_TAG = 987, WIDE_LEGACY_PER_PORT = 8 };
+static struct {
+    unsigned wide_success, rejected, partial, eagain, max_fallback;
+    uint32_t expected_esi, last_gso_esi;
+    int partial_fd, accepted_fd;
+    bool wrong_suffix, replayed_prefix, emulation_failed;
+} wide_test;
+
+static int test_wide_sendmmsg(int fd, struct mmsghdr *msgs, unsigned count, int flags, size_t segment)
+{
+    struct msghdr *msg = &msgs[0].msg_hdr;
+    if (!msg->msg_iovlen || msg->msg_iov[0].iov_len != sizeof(test_wire_hdr_t))
+        return test_real_sendmmsg(fd, msgs, count, flags);
+    test_wire_hdr_t header;
+    memcpy(&header, msg->msg_iov[0].iov_base, sizeof(header));
+    if (header.pkt_type != 3u || (header.tag != WIDE_TEST_TAG && header.tag != WIDE_WARMUP_TAG))
+        return test_real_sendmmsg(fd, msgs, count, flags);
+    if (segment) {
+        /* Emulate UDP_SEGMENT using ordinary datagrams, including a final short symbol. */
+        struct mmsghdr packets[64] = {0};
+        size_t n = msg->msg_iovlen / 2u;
+        if (count != 1 || msg->msg_iovlen != 2u * n || !n || n > 64u) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (wide_test.rejected || (header.tag == WIDE_TEST_TAG && n > WIDE_LEGACY_PER_PORT && wide_test.wide_success)) {
+            wide_test.rejected++;
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+        if (header.tag == WIDE_TEST_TAG && n > WIDE_LEGACY_PER_PORT) {
+            test_wire_hdr_t tail;
+            memcpy(&tail, msg->msg_iov[2u * (n - 1u)].iov_base, sizeof(tail));
+            wide_test.accepted_fd = fd;
+            wide_test.last_gso_esi = tail.esi;
+            wide_test.wide_success++;
+        }
+        for (size_t i = 0; i < n; i++) {
+            packets[i].msg_hdr = *msg;
+            packets[i].msg_hdr.msg_control = NULL;
+            packets[i].msg_hdr.msg_controllen = 0;
+            packets[i].msg_hdr.msg_iov = &msg->msg_iov[2u * i];
+            packets[i].msg_hdr.msg_iovlen = 2;
+            size_t len = msg->msg_iov[2u * i].iov_len + msg->msg_iov[2u * i + 1].iov_len;
+            if (len > segment || (i + 1u < n && len != segment)) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        for (unsigned sent = 0; sent < n;) {
+            int accepted = test_real_sendmmsg(fd, packets + sent, (unsigned)n - sent, flags);
+            if (accepted <= 0) {
+                wide_test.emulation_failed = true;
+                return -1;
+            }
+            sent += (unsigned)accepted;
+        }
+        return 1;
+    }
+    if (header.tag == WIDE_TEST_TAG && wide_test.rejected) {
+        if (!wide_test.eagain && fd == wide_test.accepted_fd && header.esi <= wide_test.last_gso_esi)
+            wide_test.replayed_prefix = true;
+        if (count > wide_test.max_fallback)
+            wide_test.max_fallback = count;
+        if (!wide_test.partial && count > 1u) {
+            int sent = test_real_sendmmsg(fd, msgs, 1u, flags);
+            if (sent == 1) {
+                memcpy(&header, msgs[1].msg_hdr.msg_iov[0].iov_base, sizeof(header));
+                wide_test.expected_esi = header.esi;
+                wide_test.partial_fd = fd;
+                wide_test.partial++;
+            }
+            return sent;
+        }
+        if (wide_test.partial && !wide_test.eagain) {
+            wide_test.wrong_suffix = header.esi != wide_test.expected_esi || fd != wide_test.partial_fd;
+            wide_test.eagain++;
+            errno = EAGAIN;
+            return -1;
+        }
+    }
+    return test_real_sendmmsg(fd, msgs, count, flags);
+}
+
+static bool test_wide_fallback(const ncclNet_v8_t *net)
+{
+    const int bytes = 512 * 1024;
+    unsigned char *src = malloc(bytes), *dst = malloc(bytes);
+    ring_comms_t ring = {0};
+    bool ok = src && dst && setup_ring(net, &ring);
+    if (ok)
+        for (int i = 0; i < bytes; i++)
+            src[i] = (unsigned char)(i * 37 + (i >> 12));
+    for (int tag = WIDE_WARMUP_TAG; ok && tag <= WIDE_TEST_TAG; tag++) {
+        int size = tag == WIDE_WARMUP_TAG ? 128 * 1280 : bytes;
+        memset(dst, 0, size);
+        rq_test_transfer transfer;
+        ok = post_rq_test_transfer(net, ring.send_comm[0], ring.recv_comm[1], src, dst, size, tag, &transfer);
+        uint64_t deadline = test_rq_now_ns() + 3000000000ULL;
+        while (ok && (!transfer.tx_done || !transfer.rx_done))
+            ok = test_rq_now_ns() < deadline && progress_rq_test_transfer(net, &transfer);
+        ok = ok && transfer.got == size && memcmp(src, dst, size) == 0;
+    }
+    teardown_ring(net, &ring);
+    free(src);
+    free(dst);
+    ok = ok && wide_test.wide_success == 1 && wide_test.rejected == 1 && wide_test.partial == 1 && wide_test.eagain == 1 &&
+         !wide_test.wrong_suffix && !wide_test.replayed_prefix && !wide_test.emulation_failed &&
+         wide_test.max_fallback == WIDE_LEGACY_PER_PORT;
+    if (!ok)
+        fprintf(stderr,
+                "FAIL: wide UDP fallback: wide=%u reject=%u partial=%u EAGAIN=%u wrong_suffix=%d replay=%d mock_error=%d max=%u\n",
+                wide_test.wide_success, wide_test.rejected, wide_test.partial, wide_test.eagain, wide_test.wrong_suffix,
+                wide_test.replayed_prefix, wide_test.emulation_failed, wide_test.max_fallback);
+    else
+        puts("PASS: wide UDP sends fall back to 8-datagram port windows and recover after partial send and EAGAIN");
+    return ok;
+}
+#endif
+
+static bool test_paired_systematic_loss(void *dl, const ncclNet_v8_t *net, void (*reset_stats)(void),
+                                        void (*set_codec)(const char *))
+{
+    bool (*set_paired)(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t) = dlsym(dl, "vxfec_nccl_set_paired_fault");
+    void (*read_trace)(vxfec_nccl_paired_fault_stats_t *) = dlsym(dl, "vxfec_nccl_get_paired_fault_stats");
+    enum { bytes = 512 * 1024 };
+    uint8_t *src = malloc(bytes), *dst = malloc(bytes);
+    ring_comms_t ring = {0};
+    bool ok = src && dst && set_paired && read_trace && setup_ring(net, &ring);
+    const char *codecs[] = {"sack", "auto", "sack"};
+    const uint64_t seeds[] = {101, 101, 102};
+    vxfec_nccl_paired_fault_stats_t traces[3] = {0};
+    uint64_t drops[3] = {0};
+    for (size_t arm = 0; ok && arm < 3; arm++) {
+        set_codec(codecs[arm]);
+        reset_stats();
+        for (unsigned it = 1; ok && it <= 24; it++) {
+            for (size_t i = 0; i < bytes; i++)
+                src[i] = (uint8_t)(i * 17u + (i >> 8) + it);
+            memset(dst, 0, bytes);
+            rq_test_transfer transfer;
+            ok = set_paired(20000, 6, seeds[arm], 0, it) &&
+                 post_rq_test_transfer(net, ring.send_comm[0], ring.recv_comm[1], src, dst, bytes, 8600, &transfer);
+            uint64_t deadline = test_rq_now_ns() + 5000000000ULL;
+            while (ok && (!transfer.tx_done || !transfer.rx_done))
+                ok = test_rq_now_ns() < deadline && progress_rq_test_transfer(net, &transfer);
+            ok = ok && transfer.got == bytes && memcmp(dst, src, bytes) == 0;
+        }
+        read_trace(&traces[arm]);
+        vxfec_nccl_stats_t stats;
+        test_query_stats(&stats);
+        drops[arm] = stats.sim_dropped_pkts;
+    }
+    teardown_ring(net, &ring);
+    set_codec(NULL);
+    if (set_paired)
+        set_paired(0, 1, 0, 0, 0);
+    free(src);
+    free(dst);
+    if (!ok || !drops[0] || drops[0] != drops[1] || !traces[0].systematic_trials ||
+        traces[0].systematic_trials != traces[1].systematic_trials || traces[0].drop_fingerprint != traces[1].drop_fingerprint ||
+        traces[0].drop_fingerprint == traces[2].drop_fingerprint) {
+        fprintf(stderr, "FAIL: paired loss replay (transfers=%d)\n", ok);
+        for (size_t arm = 0; arm < 3; arm++)
+            fprintf(stderr, "  %s seed=%lu trials=%lu drops=%lu fingerprint=%016lx\n", codecs[arm], (unsigned long)seeds[arm],
+                    (unsigned long)traces[arm].systematic_trials, (unsigned long)drops[arm],
+                    (unsigned long)traces[arm].drop_fingerprint);
+        return false;
+    }
+    printf("PASS: SACK and FEC replay the same seeded first-transmission losses on real plugin sends\n");
+    return true;
+}
+
 static bool test_cold_sack_recovery(const ncclNet_v8_t *net, ring_comms_t *ring, void (*get_stats)(vxfec_nccl_stats_t *),
                                     void (*reset_stats)(void))
 {
@@ -2217,21 +2496,26 @@ static bool test_cold_sack_recovery(const ncclNet_v8_t *net, ring_comms_t *ring,
         while (ok && (!xfer.tx_done || !xfer.rx_done)) {
             uint64_t now = test_rq_now_ns();
             if (!late_sent && test_rq_late.len && now - t0 >= 400000ULL) {
-                if (test_rq_late.peer_len)
-                    (void)sendto(test_rq_late.fd, test_rq_late.bytes, test_rq_late.len, MSG_DONTWAIT,
-                                 (const struct sockaddr *)&test_rq_late.peer, test_rq_late.peer_len);
-                else
-                    (void)send(test_rq_late.fd, test_rq_late.bytes, test_rq_late.len, MSG_DONTWAIT);
-                test_rq_late.len = 0u;
-                late_sent = true;
+                const struct sockaddr *peer = test_rq_late.peer_len ? (const struct sockaddr *)&test_rq_late.peer : NULL;
+                ssize_t sent =
+                    sendto(test_rq_late.fd, test_rq_late.bytes, test_rq_late.len, MSG_DONTWAIT, peer, test_rq_late.peer_len);
+                if (sent == (ssize_t)test_rq_late.len) {
+                    test_rq_late.len = 0u;
+                    late_sent = true;
+                } else if (sent >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    ok = false;
+                    break;
+                }
             }
             ok = now < deadline && progress_rq_test_transfer(net, &xfer);
         }
         vxfec_nccl_stats_t st;
         get_stats(&st);
+        /* a late original can arrive before the sender retransmits that symbol */
+        uint64_t min_retx = drops - (subset_late ? 1u : 0u);
         uint64_t max_retx = subset_late ? 2u : 3u;
-        if (!ok || xfer.got != bytes || memcmp(src, dst, bytes) || test_rq_drop_mask != exp_mask || test_rq_drop_budget ||
-            st.tx_sack_retx_pkts < drops || st.tx_sack_retx_pkts > max_retx) {
+        if (!ok || !late_sent || xfer.got != bytes || memcmp(src, dst, bytes) || test_rq_drop_mask != exp_mask ||
+            test_rq_drop_budget || st.tx_sack_retx_pkts < min_retx || st.tx_sack_retx_pkts > max_retx) {
             fprintf(stderr, "FAIL: cold 10 ms RTT SACK generation %d (drops=%u/%u retx=%lu)\n", gen + 1,
                     drops - test_rq_drop_budget, drops, (unsigned long)st.tx_sack_retx_pkts);
             ok = false;
@@ -4427,7 +4711,7 @@ static bool test_rs8_subblock_slicing_and_multichannel(const ncclNet_v8_t *net, 
 
 #ifdef VXFEC_HAVE_IBVERBS
 /* in-process mock ibverbs provider for end-to-end 240B RDMA handshakes, zero-copy sends, and partial QP teardown */
-enum { MOCK_CQ_RING = 8192, MOCK_RQ_RING = 1024, MOCK_MAX_QPS = 256 };
+enum { MOCK_CQ_RING = 8192, MOCK_RQ_RING = 4096, MOCK_MAX_QPS = 256 };
 
 typedef struct {
     struct ibv_cq cq;
@@ -4444,6 +4728,7 @@ typedef struct {
     struct ibv_sge rq_sge[MOCK_RQ_RING];
     uint32_t rq_head;
     uint32_t rq_cnt;
+    bool is_loopback_dma;
 } mock_ibv_qp_t;
 
 typedef struct {
@@ -4458,14 +4743,28 @@ typedef struct {
 
 static pthread_mutex_t g_mock_ibv_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct ibv_device g_mock_ibv_dev;
+static struct ibv_device g_mock_ibv_earlier_dev = {.name = "mock_earlier"};
+static bool g_mock_ibv_reverse_inventory;
 static mock_ibv_qp_t *g_mock_qps[MOCK_MAX_QPS];
 static mock_ibv_mr_entry_t g_mock_mrs[MOCK_MAX_MRS];
 static struct {
     uint32_t next_qpn;
     uint32_t next_key;
     uint32_t post_sends;
+    uint32_t post_send_calls;
+    uint32_t systematic_rdma_wrs;
+    uint32_t systematic_rdma_posts;
+    uint32_t post_recvs;
+    uint32_t post_recv_calls;
+    uint32_t fail_send_after_wrs;
+    bool fail_gpu_repair_suffix;
+    uint32_t pending_repair_lkey;
+    uint32_t fail_rtr_qpn;
+    bool fail_loopback_send;
+    uint64_t max_msg_sz;
     uint32_t max_send_bytes;
     uint32_t active_mrs;
+    bool fail_next_dereg_mr;
     uint32_t busy_qpn;
     uint32_t busy_budget;
     uint32_t drop_tag;
@@ -4474,7 +4773,12 @@ static struct {
     uint32_t dropped_uc_pkts;
     uint32_t repair_uc_pkts;
     uint32_t rdma_write_imm_pkts;
+    uint32_t rdma_repair_imm_pkts;
+    uint32_t max_rdma_sge_seen;
     uint32_t drop_rdma_rem;
+    uint32_t drop_rdma_qpn;
+    uint32_t drop_rdma_every;
+    uint32_t qp_rdma_wrs[MOCK_MAX_QPS];
     uint32_t dropped_rdma_pkts;
     uint32_t recv_wqes_consumed;
     vxfec_vk_ctx *vk_ctx;
@@ -4560,6 +4864,9 @@ static int mock_ibv_post_recv(struct ibv_qp *raw_qp, struct ibv_recv_wr *wr, str
 {
     mock_ibv_qp_t *mqp = (mock_ibv_qp_t *)raw_qp;
     pthread_mutex_lock(&g_mock_ibv_mtx);
+    bool is_self = (mqp && mqp->is_loopback_dma);
+    if (!is_self)
+        g_mock_ibv.post_recv_calls++;
     for (struct ibv_recv_wr *it = wr; it != NULL; it = it->next) {
         if (!mqp || mqp->rq_cnt >= MOCK_RQ_RING || (it->num_sge > 0 && !it->sg_list)) {
             if (bad_wr)
@@ -4567,6 +4874,8 @@ static int mock_ibv_post_recv(struct ibv_qp *raw_qp, struct ibv_recv_wr *wr, str
             pthread_mutex_unlock(&g_mock_ibv_mtx);
             return ENOMEM;
         }
+        if (!is_self)
+            g_mock_ibv.post_recvs++;
         uint32_t dst = (mqp->rq_head + mqp->rq_cnt++) % MOCK_RQ_RING;
         mqp->rq_wr_id[dst] = it->wr_id;
         memset(&mqp->rq_sge[dst], 0, sizeof(mqp->rq_sge[dst]));
@@ -4581,15 +4890,42 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
 {
     mock_ibv_qp_t *mqp = (mock_ibv_qp_t *)raw_qp;
     pthread_mutex_lock(&g_mock_ibv_mtx);
+    bool is_self = (mqp && mqp->is_loopback_dma);
+    if (is_self && g_mock_ibv.fail_loopback_send) {
+        g_mock_ibv.fail_loopback_send = false;
+        if (bad_wr)
+            *bad_wr = wr;
+        pthread_mutex_unlock(&g_mock_ibv_mtx);
+        return EIO;
+    }
+    if (!is_self)
+        g_mock_ibv.post_send_calls++;
+    uint32_t accepted_in_call = 0u;
+    bool posted_systematic = false;
     for (struct ibv_send_wr *it = wr; it != NULL; it = it->next) {
+        if (g_mock_ibv.fail_gpu_repair_suffix && g_mock_ibv.pending_repair_lkey != 0u) {
+            g_mock_ibv.fail_gpu_repair_suffix = false;
+            *bad_wr = it;
+            pthread_mutex_unlock(&g_mock_ibv_mtx);
+            return EIO;
+        }
         if (!mqp || mqp->state != IBV_QPS_RTS) {
             if (bad_wr)
                 *bad_wr = it;
             pthread_mutex_unlock(&g_mock_ibv_mtx);
             return EINVAL;
         }
-        g_mock_ibv.post_sends++;
-        if (g_mock_ibv.inject_wc_err) {
+        if (!is_self && g_mock_ibv.fail_send_after_wrs > 0u && accepted_in_call >= g_mock_ibv.fail_send_after_wrs) {
+            g_mock_ibv.fail_send_after_wrs = 0u;
+            if (bad_wr)
+                *bad_wr = it;
+            pthread_mutex_unlock(&g_mock_ibv_mtx);
+            return ENOMEM;
+        }
+        accepted_in_call++;
+        if (!is_self)
+            g_mock_ibv.post_sends++;
+        if (!is_self && g_mock_ibv.inject_wc_err) {
             g_mock_ibv.inject_wc_err = false;
             struct ibv_wc err_wc;
             memset(&err_wc, 0, sizeof(err_wc));
@@ -4603,7 +4939,7 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
         uint32_t total_len = 0u;
         for (int s = 0; s < it->num_sge; s++)
             total_len += it->sg_list[s].length;
-        if (total_len > g_mock_ibv.max_send_bytes)
+        if (!is_self && total_len > g_mock_ibv.max_send_bytes)
             g_mock_ibv.max_send_bytes = total_len;
 
         if (mqp->dest_qpn != 0u && it->opcode == IBV_WR_SEND) {
@@ -4656,8 +4992,40 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
                 }
             }
         } else if (mqp->dest_qpn != 0u && it->opcode == IBV_WR_RDMA_WRITE_WITH_IMM) {
-            if (g_mock_ibv.drop_rdma_rem > 0u) {
-                g_mock_ibv.drop_rdma_rem--;
+            if (!is_self && (uint32_t)it->num_sge > g_mock_ibv.max_rdma_sge_seen)
+                g_mock_ibv.max_rdma_sge_seen = (uint32_t)it->num_sge;
+            uint32_t imm_h = ntohl(it->imm_data);
+            bool is_rep_imm = ((imm_h >> 31u) != 0u) && (((imm_h >> 20u) & 1u) != 0u);
+            if (g_mock_ibv.fail_gpu_repair_suffix && is_rep_imm && it->next && it->num_sge == 1) {
+                const mock_ibv_mr_entry_t *mr = mock_find_mr_locked(it->sg_list[0].lkey);
+                if (mr && mr->vk_buf) {
+                    g_mock_ibv.pending_repair_lkey = mr->key;
+                    g_mock_ibv.busy_qpn = raw_qp->qp_num;
+                    g_mock_ibv.busy_budget = UINT32_MAX;
+                }
+            }
+            if (!is_self && !is_rep_imm) {
+                if (!posted_systematic)
+                    g_mock_ibv.systematic_rdma_posts++;
+                posted_systematic = true;
+                g_mock_ibv.systematic_rdma_wrs++;
+            }
+            bool drop_this_qp = false;
+            if (!is_self) {
+                for (int qi = 0; qi < MOCK_MAX_QPS; qi++) {
+                    if (g_mock_qps[qi] == mqp) {
+                        uint32_t seq = ++g_mock_ibv.qp_rdma_wrs[qi];
+                        if (g_mock_ibv.drop_rdma_qpn != 0u && raw_qp->qp_num == g_mock_ibv.drop_rdma_qpn &&
+                            g_mock_ibv.drop_rdma_every > 0u && ((seq - 1u) % g_mock_ibv.drop_rdma_every) == 0u) {
+                            drop_this_qp = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (!is_self && (drop_this_qp || g_mock_ibv.drop_rdma_rem > 0u)) {
+                if (!drop_this_qp)
+                    g_mock_ibv.drop_rdma_rem--;
                 g_mock_ibv.dropped_rdma_pkts++;
             } else {
                 mock_ibv_qp_t *peer = NULL;
@@ -4671,8 +5039,12 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
                     uint32_t ridx = peer->rq_head;
                     peer->rq_head = (peer->rq_head + 1u) % MOCK_RQ_RING;
                     peer->rq_cnt--;
-                    g_mock_ibv.recv_wqes_consumed++;
-                    g_mock_ibv.rdma_write_imm_pkts++;
+                    if (!is_self) {
+                        g_mock_ibv.recv_wqes_consumed++;
+                        g_mock_ibv.rdma_write_imm_pkts++;
+                        if (is_rep_imm)
+                            g_mock_ibv.rdma_repair_imm_pkts++;
+                    }
 
                     bool copy_ok = true;
                     if (total_len > 0u) {
@@ -4707,6 +5079,37 @@ static int mock_ibv_post_send(struct ibv_qp *raw_qp, struct ibv_send_wr *wr, str
                     mock_cq_push_locked(peer->qp.recv_cq, rwc);
                 }
             }
+        } else if (mqp->dest_qpn != 0u && it->opcode == IBV_WR_RDMA_WRITE) {
+            bool copy_ok = true;
+            if (total_len > 0u) {
+                uint8_t *tmp = (uint8_t *)malloc(total_len);
+                if (!tmp) {
+                    copy_ok = false;
+                } else {
+                    size_t off = 0u;
+                    for (int s = 0; s < it->num_sge; s++) {
+                        if (it->sg_list[s].length > 0u) {
+                            if (!mock_mr_read_locked(it->sg_list[s].lkey, it->sg_list[s].addr, tmp + off, it->sg_list[s].length)) {
+                                copy_ok = false;
+                                break;
+                            }
+                            off += it->sg_list[s].length;
+                        }
+                    }
+                    if (copy_ok)
+                        copy_ok = mock_mr_write_locked(it->wr.rdma.rkey, it->wr.rdma.remote_addr, tmp, total_len);
+                    free(tmp);
+                }
+            }
+            if (!copy_ok && (it->send_flags & IBV_SEND_SIGNALED)) {
+                struct ibv_wc err_wc;
+                memset(&err_wc, 0, sizeof(err_wc));
+                err_wc.wr_id = it->wr_id;
+                err_wc.status = IBV_WC_REM_ACCESS_ERR;
+                err_wc.opcode = IBV_WC_RDMA_WRITE;
+                mock_cq_push_locked(raw_qp->send_cq, err_wc);
+                continue;
+            }
         }
 
         if (it->send_flags & IBV_SEND_SIGNALED) {
@@ -4735,6 +5138,7 @@ static int mock_ibv_query_port(struct ibv_context *context, uint8_t port_num, st
     port_attr->state = IBV_PORT_ACTIVE;
     port_attr->max_mtu = IBV_MTU_4096;
     port_attr->active_mtu = IBV_MTU_4096;
+    port_attr->max_msg_sz = g_mock_ibv.max_msg_sz ? (uint32_t)g_mock_ibv.max_msg_sz : (1u << 30);
     port_attr->gid_tbl_len = g_mock_ibv.rocev2_gid_matrix ? 4 : 2;
     port_attr->lid = port_num;
     port_attr->active_width = 2u;
@@ -4750,13 +5154,16 @@ static int mock_ibv_query_port(struct ibv_context *context, uint8_t port_num, st
 
 __attribute__((visibility("default"))) struct ibv_device **vxfec_test_ibv_get_device_list(int *num_devices)
 {
-    struct ibv_device **list = (struct ibv_device **)calloc(2, sizeof(*list));
+    int count = g_mock_ibv_reverse_inventory ? 2 : 1;
+    struct ibv_device **list = (struct ibv_device **)calloc((size_t)count + 1u, sizeof(*list));
     if (!list)
         return NULL;
     snprintf(g_mock_ibv_dev.name, sizeof(g_mock_ibv_dev.name), "mock_rxe0");
     list[0] = &g_mock_ibv_dev;
+    if (g_mock_ibv_reverse_inventory)
+        list[1] = &g_mock_ibv_earlier_dev;
     if (num_devices)
-        *num_devices = 1;
+        *num_devices = count;
     return list;
 }
 
@@ -4797,6 +5204,17 @@ __attribute__((visibility("default"))) int vxfec_test_ibv_close_device(struct ib
         return 0;
     struct verbs_context *vctx = verbs_get_ctx(context);
     free(vctx);
+    return 0;
+}
+
+__attribute__((visibility("default"))) int vxfec_test_ibv_query_device(struct ibv_context *context,
+                                                                       struct ibv_device_attr *device_attr)
+{
+    (void)context;
+    if (!device_attr)
+        return EINVAL;
+    memset(device_attr, 0, sizeof(*device_attr));
+    device_attr->max_qp_wr = 4096;
     return 0;
 }
 
@@ -4911,6 +5329,11 @@ __attribute__((visibility("default"))) int vxfec_test_ibv_dereg_mr(struct ibv_mr
     if (!mr)
         return 0;
     pthread_mutex_lock(&g_mock_ibv_mtx);
+    if (g_mock_ibv.fail_next_dereg_mr) {
+        g_mock_ibv.fail_next_dereg_mr = false;
+        pthread_mutex_unlock(&g_mock_ibv_mtx);
+        return EBUSY;
+    }
     for (int i = 0; i < MOCK_MAX_MRS; i++) {
         if (g_mock_mrs[i].used && g_mock_mrs[i].key == mr->lkey) {
             if (g_mock_mrs[i].vk_buf && g_mock_ibv.vk_ctx)
@@ -4972,6 +5395,7 @@ __attribute__((visibility("default"))) struct ibv_qp *vxfec_test_ibv_create_qp(s
     mqp->qp.qp_type = qp_init_attr->qp_type;
     mqp->qp.qp_num = ++g_mock_ibv.next_qpn;
     mqp->state = IBV_QPS_RESET;
+    mqp->is_loopback_dma = (qp_init_attr->cap.max_send_wr == 16u && qp_init_attr->cap.max_recv_wr == 4u);
     g_mock_qps[slot] = mqp;
     pthread_mutex_unlock(&g_mock_ibv_mtx);
     return &mqp->qp;
@@ -4984,6 +5408,11 @@ __attribute__((visibility("default"))) int vxfec_test_ibv_modify_qp(struct ibv_q
         return EINVAL;
     pthread_mutex_lock(&g_mock_ibv_mtx);
     if (attr_mask & IBV_QP_STATE) {
+        if (attr->qp_state == IBV_QPS_RTR && qp->qp_num == g_mock_ibv.fail_rtr_qpn) {
+            g_mock_ibv.fail_rtr_qpn = 0u;
+            pthread_mutex_unlock(&g_mock_ibv_mtx);
+            return EIO;
+        }
         mqp->state = attr->qp_state;
         qp->state = attr->qp_state;
     }
@@ -5050,6 +5479,20 @@ static bool test_ibv_transport_direct_contracts(void)
     }
     unsetenv("VXFEC_IBV_DEVS");
 
+    g_mock_ibv_reverse_inventory = true;
+    vxfec_ibv_dev_info_t first;
+    bool order_ok = vxfec_ibv_enumerate(&first, 1u) == 1u && vxfec_ibv_enumerate(infos, 4u) == 2u &&
+                    strcmp(first.dev_name, "mock_earlier") == 0 && strcmp(first.dev_name, infos[0].dev_name) == 0;
+    vxfec_ibv_ctx_t *first_ctx = vxfec_ibv_ctx_open(0u);
+    order_ok = order_ok && first_ctx && strcmp(vxfec_ibv_ctx_info(first_ctx)->dev_name, first.dev_name) == 0;
+    if (first_ctx)
+        vxfec_ibv_ctx_close(first_ctx);
+    g_mock_ibv_reverse_inventory = false;
+    if (!order_ok) {
+        fprintf(stderr, "FAIL: stable IB device ordering before enumeration truncation\n");
+        return false;
+    }
+
     /* 2) verify sysfs RoCEv2 GID selection prefers RoCE v2 over v1 and skips 169.254.x.x link-local */
     char tmpl[] = "/tmp/vxfec_gid_XXXXXX";
     if (!mkdtemp(tmpl))
@@ -5104,8 +5547,10 @@ static bool test_ibv_transport_direct_contracts(void)
         return false;
     }
 
-    /* 3) verify header_only_tx + vxfec_ibv_ep_tx_done consumes 0 remote UC Receive WQEs */
+    /* 3) verify header_only_tx + vxfec_ibv_ep_tx_done consumes 0 remote UC Receive WQEs + max_msg_sz bounds */
+    g_mock_ibv.max_msg_sz = 65536ULL;
     vxfec_ibv_ctx_t *ictx = vxfec_ibv_ctx_open(0u);
+    g_mock_ibv.max_msg_sz = 0ULL;
     if (!ictx)
         return false;
     vxfec_ibv_wire_info_t tx_wi, rx_wi;
@@ -5114,7 +5559,7 @@ static bool test_ibv_transport_direct_contracts(void)
     uint8_t zc_buf[256] = {0x42};
     vxfec_ibv_mr_t *zmr = vxfec_ibv_mr_reg_host(ictx, zc_buf, sizeof(zc_buf), false);
     bool ep_ok = tx_ep && rx_ep && zmr && vxfec_ibv_ep_tx_is_hdr_only(tx_ep) && vxfec_ibv_ep_connect(tx_ep, &rx_wi, 0u) &&
-                 vxfec_ibv_ep_connect(rx_ep, &tx_wi, 0u);
+                 vxfec_ibv_ep_connect(rx_ep, &tx_wi, 0u) && (vxfec_ibv_ep_max_msg_bytes(tx_ep) == 65536ULL);
     if (ep_ok) {
         uint8_t hdr[24] = {1};
         uint64_t target_seq[VXFEC_IBV_MAX_QPS] = {0};
@@ -5124,17 +5569,439 @@ static bool test_ibv_transport_direct_contracts(void)
         uint32_t rq_after_data = g_mock_ibv.recv_wqes_consumed;
         ep_ok = ep_ok && (rq_after_data == 1u) && vxfec_ibv_ep_tx_done(tx_ep, target_seq) &&
                 (g_mock_ibv.recv_wqes_consumed == rq_after_data) &&
-                !vxfec_ibv_ep_rdma_write_imm(tx_ep, 0u, zc_buf, 8192u, vxfec_ibv_mr_lkey(zmr), 0x1000ULL, 1u, 0u);
+                !vxfec_ibv_ep_rdma_write_imm(tx_ep, 0u, zc_buf, 131072u, vxfec_ibv_mr_lkey(zmr), 0x1000ULL, 1u, 0u);
     }
     vxfec_ibv_mr_dereg(zmr);
     (void)vxfec_ibv_ep_destroy(rx_ep);
     (void)vxfec_ibv_ep_destroy(tx_ep);
     vxfec_ibv_ctx_close(ictx);
     if (!ep_ok) {
-        fprintf(stderr, "FAIL: header_only_tx / 0-RQE UC fence / MTU bounds check failed\n");
+        fprintf(stderr, "FAIL: header_only_tx / 0-RQE UC fence / max_msg_sz bounds check failed\n");
+        return false;
+    }
+
+    /* 4) verify 32 KiB multi-MTU UC RDMA_WRITE_WITH_IMM + 32x doorbell batching + repost_rx_batch + ctrl_duplex + bad_wr */
+    ictx = vxfec_ibv_ctx_open(0u);
+    if (!ictx)
+        return false;
+    const size_t sym_sz = 32768u;
+    const uint32_t n_syms = 64u;
+    const size_t total_sz = sym_sz * n_syms;
+    uint8_t *btx = (uint8_t *)malloc(total_sz);
+    uint8_t *brx = (uint8_t *)calloc(1, total_sz);
+    uint32_t mrs_before = g_mock_ibv.active_mrs;
+    tx_ep = vxfec_ibv_ep_create_duplex(ictx, 2u, 33792u, true, false, true, true, &tx_wi);
+    rx_ep = vxfec_ibv_ep_create_duplex(ictx, 2u, 33792u, false, true, false, true, &rx_wi);
+    uint32_t ep_mrs = g_mock_ibv.active_mrs - mrs_before;
+    vxfec_ibv_mr_t *bt_mr = btx ? vxfec_ibv_mr_reg_host(ictx, btx, total_sz, false) : NULL;
+    vxfec_ibv_mr_t *br_mr = brx ? vxfec_ibv_mr_reg_host(ictx, brx, total_sz, true) : NULL;
+    bool batch_ok = btx && brx && tx_ep && rx_ep && bt_mr && br_mr && (ep_mrs == 2u) && vxfec_ibv_ep_connect(tx_ep, &rx_wi, 0u) &&
+                    vxfec_ibv_ep_connect(rx_ep, &tx_wi, 0u) && !vxfec_ibv_ep_peer_has_ctrl_rx(tx_ep) &&
+                    vxfec_ibv_ep_peer_has_ctrl_rx(rx_ep) && (vxfec_ibv_ep_peer_max_recv(tx_ep) >= 33792u);
+    if (batch_ok) {
+        for (size_t i = 0; i < total_sz; i++)
+            btx[i] = (uint8_t)((i * 131u + 29u) & 0xffu);
+        vxfec_ibv_rdma_wr_t wrs0[32], wrs1[32];
+        for (uint32_t i = 0; i < 32u; i++) {
+            size_t o0 = (size_t)(2u * i) * sym_sz;
+            size_t o1 = (size_t)(2u * i + 1u) * sym_sz;
+            wrs0[i] = (vxfec_ibv_rdma_wr_t){
+                .src_addr = btx + o0,
+                .remote_addr = vxfec_ibv_mr_iova(br_mr) + o0,
+                .byte_len = (uint32_t)sym_sz,
+                .lkey = vxfec_ibv_mr_lkey(bt_mr),
+                .rkey = vxfec_ibv_mr_rkey(br_mr),
+                .imm_host_order = 2u * i,
+            };
+            wrs1[i] = (vxfec_ibv_rdma_wr_t){
+                .src_addr = btx + o1,
+                .remote_addr = vxfec_ibv_mr_iova(br_mr) + o1,
+                .byte_len = (uint32_t)sym_sz,
+                .lkey = vxfec_ibv_mr_lkey(bt_mr),
+                .rkey = vxfec_ibv_mr_rkey(br_mr),
+                .imm_host_order = 2u * i + 1u,
+            };
+        }
+        g_mock_ibv.post_sends = 0u;
+        g_mock_ibv.post_send_calls = 0u;
+        uint32_t s0 = vxfec_ibv_ep_rdma_write_imm_batch(tx_ep, 0u, wrs0, 32u);
+        uint32_t s1 = vxfec_ibv_ep_rdma_write_imm_batch(tx_ep, 1u, wrs1, 32u);
+        uint64_t tseq[VXFEC_IBV_MAX_QPS] = {0};
+        vxfec_ibv_ep_record_qp_tail(tx_ep, 0u, tseq);
+        vxfec_ibv_ep_record_qp_tail(tx_ep, 1u, tseq);
+        vxfec_ibv_rx_wc_t wcs[VXFEC_IBV_POLL_MAX];
+        uint32_t slots[VXFEC_IBV_POLL_MAX];
+        uint32_t nr = vxfec_ibv_ep_poll_rx(rx_ep, wcs, VXFEC_IBV_POLL_MAX);
+        for (uint32_t i = 0; i < nr; i++)
+            slots[i] = wcs[i].slot_id;
+        g_mock_ibv.post_recv_calls = 0u;
+        g_mock_ibv.post_recvs = 0u;
+        bool rep_ok = (nr == 64u) && vxfec_ibv_ep_repost_rx_batch(rx_ep, slots, nr);
+        batch_ok = (s0 == 32u) && (s1 == 32u) && (g_mock_ibv.post_sends == 64u) && (g_mock_ibv.post_send_calls == 2u) && rep_ok &&
+                   (g_mock_ibv.post_recvs == 64u) && (g_mock_ibv.post_recv_calls == 2u) && vxfec_ibv_ep_tx_done(tx_ep, tseq) &&
+                   (memcmp(btx, brx, total_sz) == 0);
+    }
+    if (batch_ok) {
+        /* partial bad_wr mid-batch backpressure + 16 KiB send_pkt_batch + reverse inline ctrl */
+        vxfec_ibv_send_wr_desc_t pkts[8];
+        uint8_t phdr[24] = {0x77};
+        for (uint32_t i = 0; i < 8u; i++) {
+            pkts[i] = (vxfec_ibv_send_wr_desc_t){
+                .hdr = phdr,
+                .payload = btx + (size_t)i * 16384u,
+                .hdr_len = sizeof(phdr),
+                .pay_len = 16384u,
+                .pay_lkey = vxfec_ibv_mr_lkey(bt_mr),
+                .force_signal = false,
+            };
+        }
+        g_mock_ibv.fail_send_after_wrs = 5u;
+        uint32_t first_n = vxfec_ibv_ep_send_pkt_batch(tx_ep, 0u, pkts, 8u);
+        uint32_t rem_n = (!vxfec_ibv_ep_has_error(tx_ep) && first_n == 5u)
+                             ? vxfec_ibv_ep_send_pkt_batch(tx_ep, 0u, &pkts[first_n], 8u - first_n)
+                             : 0u;
+        vxfec_ibv_rx_wc_t wcs[16];
+        uint32_t slots[16];
+        uint32_t nr = vxfec_ibv_ep_poll_rx(rx_ep, wcs, 16u);
+        for (uint32_t i = 0; i < nr; i++)
+            slots[i] = wcs[i].slot_id;
+        uint8_t ctrl_msg[48];
+        for (size_t i = 0; i < sizeof(ctrl_msg); i++)
+            ctrl_msg[i] = (uint8_t)(0xa0u + i);
+        bool ctrl_sent = vxfec_ibv_ep_send_ctrl_inline(rx_ep, ctrl_msg, sizeof(ctrl_msg));
+        vxfec_ibv_rx_wc_t cwc;
+        uint32_t nc = vxfec_ibv_ep_poll_rx(tx_ep, &cwc, 1u);
+        batch_ok = (first_n == 5u) && (rem_n == 3u) && (nr == 8u) && (wcs[7].byte_len == sizeof(phdr) + 16384u) &&
+                   (memcmp(wcs[7].data + sizeof(phdr), btx + 7u * 16384u, 16384u) == 0) &&
+                   vxfec_ibv_ep_repost_rx_batch(rx_ep, slots, nr) && ctrl_sent && (nc == 1u) &&
+                   ((cwc.slot_id & VXFEC_IBV_CTRL_SLOT_FLAG) != 0u) && (cwc.byte_len == sizeof(ctrl_msg)) &&
+                   (memcmp(cwc.data, ctrl_msg, sizeof(ctrl_msg)) == 0) && vxfec_ibv_ep_repost_rx(tx_ep, cwc.slot_id);
+    }
+    vxfec_ibv_mr_dereg(br_mr);
+    vxfec_ibv_mr_dereg(bt_mr);
+    (void)vxfec_ibv_ep_destroy(rx_ep);
+    (void)vxfec_ibv_ep_destroy(tx_ep);
+    vxfec_ibv_ctx_close(ictx);
+    free(brx);
+    free(btx);
+    if (!batch_ok) {
+        fprintf(stderr, "FAIL: 32 KiB UC batching / repost_rx_batch / partial bad_wr / ctrl_duplex check failed\n");
+        return false;
+    }
+
+    /* 5) verify 0-SGE rx_imm_only endpoint allocates 0 RX slab MRs and handles unsignaled RDMA_WRITE_WITH_IMM batches */
+    ictx = vxfec_ibv_ctx_open(0u);
+    if (!ictx)
+        return false;
+    uint32_t mrs_pre_imm = g_mock_ibv.active_mrs;
+    tx_ep = vxfec_ibv_ep_create_opts(ictx, 4u, 0u, true, false, true, &tx_wi);
+    rx_ep = vxfec_ibv_ep_create_ex(ictx, 4u, 0u, false, true, &rx_wi);
+    uint32_t imm_ep_mrs = g_mock_ibv.active_mrs - mrs_pre_imm;
+    uint8_t imm_src[4096] = {0x5cu}, imm_dst[4096] = {0};
+    vxfec_ibv_mr_t *is_mr = vxfec_ibv_mr_reg_host(ictx, imm_src, sizeof(imm_src), false);
+    vxfec_ibv_mr_t *id_mr = vxfec_ibv_mr_reg_host(ictx, imm_dst, sizeof(imm_dst), true);
+    bool imm0_ok = tx_ep && rx_ep && is_mr && id_mr && (imm_ep_mrs == 1u) && vxfec_ibv_ep_connect(tx_ep, &rx_wi, 0u) &&
+                   vxfec_ibv_ep_connect(rx_ep, &tx_wi, 0u);
+    if (imm0_ok) {
+        uint64_t iseq[VXFEC_IBV_MAX_QPS] = {0};
+        for (uint32_t q = 0; q < 4u; q++) {
+            imm0_ok =
+                imm0_ok && vxfec_ibv_ep_rdma_write_imm(tx_ep, q, imm_src + q * 1024u, 1024u, vxfec_ibv_mr_lkey(is_mr),
+                                                       vxfec_ibv_mr_iova(id_mr) + q * 1024u, vxfec_ibv_mr_rkey(id_mr), 0x100u + q);
+            vxfec_ibv_ep_record_qp_tail(tx_ep, q, iseq);
+        }
+        vxfec_ibv_rx_wc_t iwcs[8];
+        uint32_t islots[8];
+        uint32_t inr = vxfec_ibv_ep_poll_rx(rx_ep, iwcs, 8u);
+        for (uint32_t i = 0; i < inr; i++)
+            islots[i] = iwcs[i].slot_id;
+        imm0_ok = imm0_ok && (inr == 4u) && (iwcs[0].data == NULL) && iwcs[0].is_rdma_imm &&
+                  vxfec_ibv_ep_repost_rx_batch(rx_ep, islots, inr) && vxfec_ibv_ep_tx_done(tx_ep, iseq) &&
+                  (memcmp(imm_src, imm_dst, sizeof(imm_src)) == 0);
+    }
+    vxfec_ibv_mr_dereg(id_mr);
+    vxfec_ibv_mr_dereg(is_mr);
+    (void)vxfec_ibv_ep_destroy(rx_ep);
+    (void)vxfec_ibv_ep_destroy(tx_ep);
+    vxfec_ibv_ctx_close(ictx);
+    if (!imm0_ok) {
+        fprintf(stderr, "FAIL: 0-SGE rx_imm_only / 0-MR RX endpoint check failed\n");
+        return false;
+    }
+
+    /* A failed loopback copy retains staging until the provider releases each resource. */
+    ictx = vxfec_ibv_ctx_open(0u);
+    uint32_t dma_mrs_before = g_mock_ibv.active_mrs;
+    uint8_t dma_src[] = {1u, 2u, 3u}, dma_dst[sizeof(dma_src)] = {0};
+    vxfec_ibv_mr_t *dma_mr = vxfec_ibv_mr_reg_host(ictx, dma_src, sizeof(dma_src), false);
+    bool dma_ok = vxfec_ibv_mr_read_to_host(ictx, dma_mr, 0, dma_dst, sizeof(dma_dst));
+    uint32_t dma_qpn = g_mock_ibv.next_qpn;
+    int dma_slot = -1;
+    for (int i = 0; i < MOCK_MAX_QPS; i++) {
+        if (g_mock_qps[i] && g_mock_qps[i]->qp.qp_num == dma_qpn)
+            dma_slot = i;
+    }
+    if (dma_ok && dma_slot >= 0) {
+        g_mock_ibv.fail_poll_cq = g_mock_qps[dma_slot]->qp.send_cq;
+        g_mock_ibv.busy_qpn = dma_qpn;
+        g_mock_ibv.busy_budget = 2u;
+        dma_ok = !vxfec_ibv_mr_read_to_host(ictx, dma_mr, 0, dma_dst, sizeof(dma_dst)) &&
+                 g_mock_ibv.active_mrs == dma_mrs_before + 2u && g_mock_qps[dma_slot] &&
+                 g_mock_qps[dma_slot]->state == IBV_QPS_RESET;
+        dma_ok = dma_ok && !vxfec_ibv_mr_read_to_host(ictx, dma_mr, 0, dma_dst, sizeof(dma_dst)) && g_mock_ibv.busy_budget == 0u &&
+                 g_mock_ibv.next_qpn == dma_qpn;
+        g_mock_ibv.fail_next_dereg_mr = true;
+        dma_ok = dma_ok && !vxfec_ibv_mr_read_to_host(ictx, dma_mr, 0, dma_dst, sizeof(dma_dst)) &&
+                 g_mock_ibv.active_mrs == dma_mrs_before + 2u && g_mock_ibv.next_qpn == dma_qpn;
+        memset(dma_dst, 0, sizeof(dma_dst));
+        dma_ok = dma_ok && vxfec_ibv_mr_read_to_host(ictx, dma_mr, 0, dma_dst, sizeof(dma_dst)) &&
+                 memcmp(dma_src, dma_dst, sizeof(dma_dst)) == 0 && g_mock_ibv.next_qpn == dma_qpn + 1u;
+    } else {
+        dma_ok = false;
+    }
+    g_mock_ibv.fail_next_dereg_mr = false;
+    vxfec_ibv_mr_dereg(dma_mr);
+    g_mock_ibv.busy_qpn = g_mock_ibv.next_qpn;
+    g_mock_ibv.busy_budget = 1u;
+    vxfec_ibv_ctx_close(ictx);
+    dma_ok = dma_ok && g_mock_ibv.active_mrs == dma_mrs_before + 1u;
+    ictx = vxfec_ibv_ctx_open(0u);
+    dma_ok = dma_ok && ictx && g_mock_ibv.active_mrs == dma_mrs_before;
+    vxfec_ibv_ctx_close(ictx);
+    g_mock_ibv.busy_qpn = 0u;
+    g_mock_ibv.busy_budget = 0u;
+    if (!dma_ok) {
+        fprintf(stderr, "FAIL: loopback DMA teardown lost a busy resource or failed to recover\n");
         return false;
     }
     return true;
+}
+
+typedef size_t (*test_get_rail_stats_fn)(vxfec_nccl_rail_stats_t *, size_t);
+
+static bool check_payload_stats(const vxfec_nccl_stats_t *st, test_get_rail_stats_fn get_rails, bool ibv, bool tx_gpu, bool rx_gpu)
+{
+    vxfec_nccl_rail_stats_t rail = {0};
+    if (get_rails(&rail, 1) != 1 || strcmp(rail.name, "vxfec-ibv-mock_rxe0:1") != 0 ||
+        rail.tx_sys_gpu_direct_pkts != st->tx_sys_gpu_direct_pkts || rail.rx_sys_gpu_direct_pkts != st->rx_sys_gpu_direct_pkts) {
+        fprintf(stderr, "FAIL: per-port GPU-direct counters disagree with the single-port totals\n");
+        return false;
+    }
+    if ((st->tx_sys_ibv_pkts > 0) == ibv && (st->tx_udp_payload_pkts > 0) == !ibv && st->rx_sys_pkts > 0 &&
+        st->tx_sys_gpu_direct_pkts == (tx_gpu ? st->tx_sys_ibv_pkts : 0) &&
+        st->rx_sys_gpu_direct_pkts == (rx_gpu ? st->rx_sys_pkts : 0))
+        return true;
+    fprintf(stderr, "FAIL: payload counters for ibv=%d tx_gpu=%d rx_gpu=%d (ibv=%lu udp=%lu tx_gdr=%lu rx=%lu rx_gdr=%lu)\n", ibv,
+            tx_gpu, rx_gpu, (unsigned long)st->tx_sys_ibv_pkts, (unsigned long)st->tx_udp_payload_pkts,
+            (unsigned long)st->tx_sys_gpu_direct_pkts, (unsigned long)st->rx_sys_pkts, (unsigned long)st->rx_sys_gpu_direct_pkts);
+    return false;
+}
+
+static bool test_ibv_asymmetric_fallback(const ncclNet_v8_t *net)
+{
+    uint8_t handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
+    void *lc = NULL, *sc = NULL, *rc = NULL, *extra_rc = NULL;
+    bool ok = false;
+    if (net->listen(0, handle, &lc) != ncclSuccess || !lc)
+        return false;
+
+    /* connect() creates the sender's QPs first; let the receiver connect all its QPs successfully */
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    g_mock_ibv.fail_rtr_qpn = g_mock_ibv.next_qpn + 1u;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+    uint64_t deadline = test_rq_now_ns() + 2000000000ULL;
+    while ((!sc || !rc) && test_rq_now_ns() < deadline) {
+        if (!sc && net->connect(0, handle, &sc, NULL) != ncclSuccess)
+            goto out;
+        if (!rc && net->accept(lc, &rc, NULL) != ncclSuccess)
+            goto out;
+    }
+    if (!sc || !rc || net->accept(lc, &extra_rc, NULL) != ncclSuccess || extra_rc)
+        goto out;
+
+    uint8_t src[4096], dst[sizeof(src)] = {0};
+    for (size_t i = 0; i < sizeof(src); i++)
+        src[i] = (uint8_t)(i * 17u + 5u);
+    rq_test_transfer xfer;
+    if (!post_rq_test_transfer(net, sc, rc, src, dst, sizeof(src), 823, &xfer))
+        goto out;
+    while ((!xfer.tx_done || !xfer.rx_done) && test_rq_now_ns() < deadline) {
+        if (!progress_rq_test_transfer(net, &xfer))
+            goto out;
+    }
+    ok = xfer.tx_done && xfer.rx_done && xfer.got == sizeof(src) && memcmp(src, dst, sizeof(src)) == 0;
+out:
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    ok = ok && g_mock_ibv.fail_rtr_qpn == 0u;
+    g_mock_ibv.fail_rtr_qpn = 0u;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+    if (extra_rc)
+        net->closeRecv(extra_rc);
+    if (sc)
+        net->closeSend(sc);
+    if (rc)
+        net->closeRecv(rc);
+    net->closeListen(lc);
+    return ok;
+}
+
+static bool test_ibv_dmabuf_flush(const ncclNet_v8_t *net, void *rc, void *mr, void *data)
+{
+    int size = 4, done = 0;
+    void *request = NULL;
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    g_mock_ibv.fail_loopback_send = true;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+    ncclResult_t status = net->iflush(rc, 1, &data, &size, &mr, &request);
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    bool injected = !g_mock_ibv.fail_loopback_send;
+    g_mock_ibv.fail_loopback_send = false;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+    if (!injected || status != ncclSystemError || request)
+        return false;
+    request = NULL;
+    return net->iflush(rc, 1, &data, &size, &mr, &request) == ncclSuccess &&
+           (!request || (net->test(request, &done, NULL) == ncclSuccess && done));
+}
+
+/* Exercise a close retry with a live direct submission. Both a failed timeline
+ * wait and an unconfirmed device idle must leave the communicator intact. */
+static bool test_close_direct_gpu(const ncclNet_v8_t *net, void **comm, unsigned side)
+{
+    ncclResult_t (*close_comm)(void *) = side == RQ_TX ? net->closeSend : net->closeRecv;
+    test_rq_vk.side = side;
+    test_rq_vk.fail_ticket_wait = true;
+    test_rq_vk.fail_device_idle = true;
+    unsigned before = test_rq_vk.waits;
+    ncclResult_t first = close_comm(*comm);
+    if (first == ncclSuccess) {
+        *comm = NULL;
+        return false;
+    }
+    if (first != ncclSystemError || test_rq_vk.waits == before)
+        return false;
+
+    /* DEVICE_LOST from the idle fence confirms all queues have stopped. */
+    test_rq_vk.fail_device_idle = false;
+    test_rq_vk.force_device_lost_idle = true;
+    if (close_comm(*comm) != ncclSuccess)
+        return false;
+    *comm = NULL;
+    return true;
+}
+
+/* A failed poll cannot return the direct buffer to NCCL until the ticket
+ * signals. Exercise both a read of the send buffer and an in-place repair. */
+static bool test_direct_gpu_fence(const ncclNet_v8_t *net, void *sc, void *rc, void *tx, void *rx, void *tmr, void *rmr, int size,
+                                  unsigned side, void **close_pending)
+{
+    memset(&test_rq_vk, 0, sizeof(test_rq_vk));
+    test_rq_vk.hold_side = side;
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    g_mock_ibv.drop_rdma_rem = 4u;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+    int tag = 875 + (int)side, sd = 0, rd = 0;
+    void *sr = NULL, *rr = NULL;
+    test_rq_vk.side = RQ_RX;
+    bool ok = net->irecv(rc, 1, &rx, &size, &tag, &rmr, &rr) == ncclSuccess && rr;
+    test_rq_vk.side = RQ_TX;
+    ok = ok && net->isend(sc, tx, size, tag, tmr, &sr) == ncclSuccess && sr;
+    ncclResult_t ss = ncclSuccess, rs = ncclSuccess;
+    bool fenced = false;
+    uint64_t deadline = test_rq_now_ns() + 5000000000ULL;
+    while (ok && test_rq_now_ns() < deadline && (ss == ncclSuccess || rs == ncclSuccess)) {
+        if (test_rq_vk.ticket && test_rq_vk.hold_side) {
+            test_rq_vk.hold_side = 0;
+            if (close_pending) {
+                ok = test_close_direct_gpu(net, close_pending, side);
+                goto out;
+            }
+            test_rq_vk.poll_fail_after = test_rq_vk.pending_polls + 1u;
+        }
+        test_rq_vk.side = RQ_TX;
+        if (ss == ncclSuccess)
+            ss = net->test(sr, &sd, NULL);
+        test_rq_vk.side = RQ_RX;
+        if (rs == ncclSuccess)
+            rs = net->test(rr, &rd, NULL);
+        ok = !sd && !rd;
+        if (!fenced && test_rq_vk.quarantine_ticket) {
+            ncclResult_t held = side == RQ_TX ? ss : rs;
+            ok = ok && held == ncclSuccess;
+            atomic_bool *wire_done = side == RQ_TX ? &((vxfec_tx_user_req_t *)sr)->done : &((vxfec_rx_req_t *)rr)->done;
+            if (ok && atomic_load(wire_done)) {
+                int done = 0;
+                fenced = net->test(side == RQ_TX ? sr : rr, &done, NULL) == ncclSuccess && !done;
+                ok = fenced;
+                test_rq_vk.quarantine_ticket = 0;
+            }
+        }
+    }
+    ok = ok && fenced && ss == (side == RQ_TX ? ncclSystemError : ncclRemoteError) &&
+         rs == (side == RQ_RX ? ncclSystemError : ncclRemoteError);
+out:
+    test_rq_vk.side = 0;
+    if (!ok)
+        fprintf(stderr, "FAIL: direct GPU error fence (side=%u fenced=%d send=%d recv=%d ticket=%lu poll_failed=%d)\n", side,
+                fenced, ss, rs, (unsigned long)test_rq_vk.ticket, test_rq_vk.poll_failed);
+    memset(&test_rq_vk, 0, sizeof(test_rq_vk));
+    return ok;
+}
+
+static bool test_gpu_repair_partial_post(const ncclNet_v8_t *net, vxfec_send_comm_t *sc, void *rc, void *tx, void *rx, void *tmr,
+                                         void *rmr, int size)
+{
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    g_mock_ibv.drop_rdma_rem = 24u;
+    g_mock_ibv.pending_repair_lkey = 0u;
+    g_mock_ibv.fail_gpu_repair_suffix = true;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+    int tag = 872, sd = 0, rd = 0;
+    void *sr = NULL, *rr = NULL;
+    bool ok = net->irecv(rc, 1, &rx, &size, &tag, &rmr, &rr) == ncclSuccess && rr &&
+              net->isend(sc, tx, size, tag, tmr, &sr) == ncclSuccess && sr;
+    uint32_t lkey = 0;
+    uint64_t deadline = test_rq_now_ns() + 5000000000ULL;
+    ncclResult_t rs = ncclSuccess;
+    while (ok && !lkey && test_rq_now_ns() < deadline) {
+        ok = net->test(sr, &sd, NULL) == ncclSuccess && !sd;
+        if (!rd && rs == ncclSuccess)
+            rs = net->test(rr, &rd, NULL);
+        pthread_mutex_lock(&g_mock_ibv_mtx);
+        lkey = g_mock_ibv.pending_repair_lkey;
+        pthread_mutex_unlock(&g_mock_ibv_mtx);
+    }
+
+    /* An accepted repair still owns the GPU output while QP teardown reports EBUSY. */
+    pthread_mutex_lock(&sc->mtx);
+    vxfec_tx_user_req_t *ureq = sr;
+    bool retained = false;
+    if (ureq && ureq->failed && ureq->ibv_zc_pending && !ureq->done && lkey) {
+        for (vxfec_gpu_job_t *job = ureq->zc_gpu_head; job; job = job->next)
+            if (job->out_ibv_lkey == lkey)
+                retained = true;
+    }
+    pthread_mutex_unlock(&sc->mtx);
+    pthread_mutex_lock(&g_mock_ibv_mtx);
+    g_mock_ibv.busy_budget = 0;
+    g_mock_ibv.busy_qpn = 0;
+    g_mock_ibv.drop_rdma_rem = 0;
+    g_mock_ibv.fail_gpu_repair_suffix = false;
+    g_mock_ibv.pending_repair_lkey = 0;
+    pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+    ncclResult_t ss = ncclSuccess;
+    deadline = test_rq_now_ns() + 2000000000ULL;
+    while (sr && !sd && ss == ncclSuccess && test_rq_now_ns() < deadline)
+        ss = net->test(sr, &sd, NULL);
+    while (rr && !rd && rs == ncclSuccess && test_rq_now_ns() < deadline)
+        rs = net->test(rr, &rd, NULL);
+    if (ok && retained && ss == ncclSystemError && rs == ncclRemoteError)
+        return true;
+    fprintf(stderr, "FAIL: partial GPU repair post (lkey=%u retained=%d send=%d recv=%d)\n", lkey, retained, ss, rs);
+    return false;
 }
 
 static int run_ibv_mock_tests(void)
@@ -5158,6 +6025,7 @@ static int run_ibv_mock_tests(void)
     }
     const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
     test_get_stats_ex_fn get_stats_ex = (test_get_stats_ex_fn)dlsym(dl, "vxfec_nccl_get_stats_ex");
+    test_get_rail_stats_fn get_rails = (test_get_rail_stats_fn)dlsym(dl, "vxfec_nccl_get_rail_stats");
     void (*reset_stats)(void) = (void (*)(void))dlsym(dl, "vxfec_nccl_reset_stats");
     void (*set_codec)(const char *) = (void (*)(const char *))dlsym(dl, "vxfec_nccl_set_codec_override");
     void (*set_done_fault)(uint32_t) = (void (*)(uint32_t))dlsym(dl, "vxfec_nccl_set_done_fault");
@@ -5167,8 +6035,8 @@ static int run_ibv_mock_tests(void)
     void *lc = NULL, *sc = NULL, *rc = NULL, *tmr = NULL, *rmr = NULL;
     void *rc_fork = NULL, *rc_reconciled = NULL, *sc_raw = NULL, *sc_udp_fb = NULL;
     int ctrl_fd = -1, raw_lc_fd = -1;
-    uint8_t *tx = (uint8_t *)malloc(65536u), *rx = (uint8_t *)calloc(1, 65536u);
-    if (!net || !get_stats_ex || !reset_stats || !set_codec || !set_done_fault || !set_abort_fault || !tx || !rx)
+    uint8_t *tx = (uint8_t *)malloc(65536u), *rx = (uint8_t *)calloc(1, VXFEC_RDMA_HOST_CTS_MIN);
+    if (!net || !get_stats_ex || !get_rails || !reset_stats || !set_codec || !set_done_fault || !set_abort_fault || !tx || !rx)
         goto out;
 
     if (!test_ibv_transport_direct_contracts())
@@ -5192,6 +6060,12 @@ static int run_ibv_mock_tests(void)
         mp0.speed != 100000 || mp1.speed != 400000) {
         fprintf(stderr, "FAIL: dual-port props mismatch: dev0=(%s,guid=%#lx,port=%d,spd=%d) dev1=(%s,guid=%#lx,port=%d,spd=%d)\n",
                 mp0.name, (unsigned long)mp0.guid, mp0.port, mp0.speed, mp1.name, (unsigned long)mp1.guid, mp1.port, mp1.speed);
+        goto out;
+    }
+    vxfec_nccl_rail_stats_t rails[2] = {0};
+    if (get_rails(rails, 1) != 2 || strcmp(rails[0].name, mp0.name) != 0 || rails[1].name[0] || get_rails(rails, 2) != 2 ||
+        strcmp(rails[1].name, mp1.name) != 0) {
+        fprintf(stderr, "FAIL: per-port statistics lost a device identity or exceeded their output capacity\n");
         goto out;
     }
     /* unmatched explicit interface filter on RDMA must expose 0 devices rather than falling back */
@@ -5230,6 +6104,15 @@ static int run_ibv_mock_tests(void)
     g_mock_ibv.ipv6_only_gid = false;
     if (setenv("VXFEC_NCCL_BIND_IP", "127.0.0.1", 1) != 0 || net->init(dummy_nccl_logger) != ncclSuccess)
         goto out;
+    reset_stats();
+    if (!test_ibv_asymmetric_fallback(net)) {
+        fprintf(stderr, "FAIL: TX-only verbs connect failure did not preserve the accepted receiver and UDP feedback\n");
+        goto out;
+    }
+    vxfec_nccl_stats_t st;
+    get_stats_ex(&st, sizeof(st));
+    if (!check_payload_stats(&st, get_rails, false, false, false))
+        goto out;
 
     uint8_t handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
     if (net->listen(0, handle, &lc) != ncclSuccess || !lc)
@@ -5256,7 +6139,7 @@ static int run_ibv_mock_tests(void)
     for (size_t i = 0; i < 65536u; i++)
         tx[i] = (uint8_t)((i * 73u + 19u) & 0xffu);
     if (net->regMr(sc, tx, 65536u, NCCL_PTR_HOST, &tmr) != ncclSuccess ||
-        net->regMr(rc, rx, 65536u, NCCL_PTR_HOST, &rmr) != ncclSuccess)
+        net->regMr(rc, rx, VXFEC_RDMA_HOST_CTS_MIN, NCCL_PTR_HOST, &rmr) != ncclSuccess)
         goto out;
     reset_stats();
     void *sreq = NULL, *rreq = NULL, *rptr = rx;
@@ -5270,9 +6153,9 @@ static int run_ibv_mock_tests(void)
         if (!rdone && net->test(rreq, &rdone, &got) != ncclSuccess)
             goto out;
     }
-    vxfec_nccl_stats_t st;
     get_stats_ex(&st, sizeof(st));
-    if (!sdone || !rdone || got != 65536 || memcmp(tx, rx, 65536u) != 0 || st.ibv_direct_pkts == 0u) {
+    if (!sdone || !rdone || got != 65536 || memcmp(tx, rx, 65536u) != 0 || st.ibv_direct_pkts == 0u ||
+        !check_payload_stats(&st, get_rails, true, false, false)) {
         fprintf(stderr, "FAIL: zero-copy RDMA transfer failed (sdone=%d rdone=%d got=%d ibv_pkts=%lu)\n", sdone, rdone, got,
                 (unsigned long)st.ibv_direct_pkts);
         goto out;
@@ -5321,7 +6204,8 @@ static int run_ibv_mock_tests(void)
         }
         net->deregMr(sc, dmr);
         get_stats_ex(&st, sizeof(st));
-        if (!dsd || !drd || dgot != 16384 || memcmp(tx + 2048u, rx, 16384u) != 0 || st.ibv_direct_pkts == 0u) {
+        if (!dsd || !drd || dgot != 16384 || memcmp(tx + 2048u, rx, 16384u) != 0 || st.ibv_direct_pkts == 0u ||
+            !check_payload_stats(&st, get_rails, true, true, false)) {
             fprintf(stderr, "FAIL: GPUDirect RDMA DMA-BUF zero-copy send with VXFEC_NCCL_VULKAN=0 failed\n");
             goto out;
         }
@@ -5387,7 +6271,7 @@ static int run_ibv_mock_tests(void)
         g_mock_ibv.drop_tag = 0u;
         get_stats_ex(&st, sizeof(st));
         if (!sdone || !rdone || got != 65536 || memcmp(tx, rx, 65536u) != 0 || g_mock_ibv.dropped_uc_pkts != exp_drops ||
-            g_mock_ibv.repair_uc_pkts < exp_drops || st.tx_sack_retx_pkts != 0u) {
+            g_mock_ibv.repair_uc_pkts < exp_drops || st.tx_sack_retx_pkts != 0u || st.rx_cuda_repair_completions != 0u) {
             fprintf(stderr, "FAIL: verbs UC FEC case %d failed (dropped=%u/%u rep_uc=%u sack=%lu)\n", fcase,
                     g_mock_ibv.dropped_uc_pkts, exp_drops, g_mock_ibv.repair_uc_pkts, (unsigned long)st.tx_sack_retx_pkts);
             goto out;
@@ -5408,6 +6292,258 @@ static int run_ibv_mock_tests(void)
         }
     }
     set_codec(NULL);
+
+    /* 1c.2) verify headless SXM TX+RX DMA-BUF (VXFEC_NCCL_VULKAN=0, mr->vk_buf == NULL) under 0% & RDMA drop FEC repair */
+    {
+        enum { CTS_BURST_N = NCCL_NET_MAX_REQUESTS, CTS_BURST_SZ = 4096 };
+        const size_t h_sz = 262144u;
+        uint8_t *h_tx = (uint8_t *)malloc(h_sz);
+        uint8_t *h_rx = (uint8_t *)calloc(1, h_sz);
+        int tfd2 = memfd_create("vxfec_headless_tx", MFD_CLOEXEC);
+        int rfd2 = memfd_create("vxfec_headless_rx", MFD_CLOEXEC);
+        if (!h_tx || !h_rx || tfd2 < 0 || rfd2 < 0 || ftruncate(tfd2, (off_t)h_sz) != 0 || ftruncate(rfd2, (off_t)h_sz) != 0) {
+            if (tfd2 >= 0)
+                close(tfd2);
+            if (rfd2 >= 0)
+                close(rfd2);
+            free(h_rx);
+            free(h_tx);
+            goto out;
+        }
+        /* Tag each CTS slice so a permuted receive address fails the payload check. */
+        for (size_t i = 0; i < h_sz; i++)
+            h_tx[i] = (uint8_t)(i * 97u + 13u + i / CTS_BURST_SZ);
+        void *h_tmr = NULL, *h_rmr = NULL;
+        if (net->regMrDmaBuf(sc, h_tx, h_sz, NCCL_PTR_CUDA, 0u, tfd2, &h_tmr) != ncclSuccess ||
+            net->regMrDmaBuf(rc, h_rx, h_sz, NCCL_PTR_CUDA, 0u, rfd2, &h_rmr) != ncclSuccess) {
+            close(tfd2);
+            close(rfd2);
+            if (h_tmr)
+                net->deregMr(sc, h_tmr);
+            if (h_rmr)
+                net->deregMr(rc, h_rmr);
+            free(h_rx);
+            free(h_tx);
+            fprintf(stderr, "FAIL: headless TX+RX regMrDmaBuf failed\n");
+            goto out;
+        }
+        close(tfd2);
+        close(rfd2);
+        for (int loss_case = 0; loss_case < 2; loss_case++) {
+            memset(h_rx, 0x5au, h_sz);
+            reset_stats();
+            set_codec("rs8");
+            g_mock_ibv.rdma_write_imm_pkts = 0u;
+            g_mock_ibv.drop_rdma_rem = (loss_case == 1) ? 3u : 0u;
+            void *hsreq = NULL, *hrreq = NULL;
+            void *hrptr = h_rx;
+            int hcap = (int)h_sz, htag = 810 + loss_case, hsd = 0, hrd = 0, hgot = 0;
+            if (net->irecv(rc, 1, &hrptr, &hcap, &htag, &h_rmr, &hrreq) != ncclSuccess || !hrreq ||
+                net->isend(sc, h_tx, (int)h_sz, htag, h_tmr, &hsreq) != ncclSuccess || !hsreq) {
+                set_codec(NULL);
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                goto out;
+            }
+            for (int spin = 0; spin < 100000 && (!hsd || !hrd); spin++) {
+                if (!hsd && net->test(hsreq, &hsd, NULL) != ncclSuccess)
+                    break;
+                if (!hrd && net->test(hrreq, &hrd, &hgot) != ncclSuccess)
+                    break;
+                if (!hsd && !hrd && (spin & 63) == 63)
+                    usleep(100);
+            }
+            set_codec(NULL);
+            get_stats_ex(&st, sizeof(st));
+            if (!hsd || !hrd || hgot != (int)h_sz || memcmp(h_tx, h_rx, h_sz) != 0 || g_mock_ibv.rdma_write_imm_pkts == 0u ||
+                (loss_case == 1 && st.rx_rs8_decodes == 0u) || !check_payload_stats(&st, get_rails, true, true, true)) {
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                fprintf(stderr, "FAIL: headless SXM TX+RX DMA-BUF case=%d failed (hsd=%d hrd=%d got=%d rdma_imm=%u rs8=%lu)\n",
+                        loss_case, hsd, hrd, hgot, g_mock_ibv.rdma_write_imm_pkts, (unsigned long)st.rx_rs8_decodes);
+                goto out;
+            }
+        }
+        /* regression: late irecv (>2.5 ms skew) and full-pool pre-posted irecvs must preserve 100% GPUDirect RDMA_WRITE */
+        {
+            memset(h_rx, 0xa5u, 65536u);
+            reset_stats();
+            g_mock_ibv.rdma_write_imm_pkts = 0u;
+            void *lsreq = NULL, *lrreq = NULL, *lrptr = h_rx;
+            int lcap = 65536, ltag = 813, lsd = 0, lrd = 0, lgot = 0;
+            if (net->isend(sc, h_tx, lcap, ltag, h_tmr, &lsreq) != ncclSuccess || !lsreq) {
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                goto out;
+            }
+            for (int w = 0; w < 10 && !lsd; w++) {
+                if (net->test(lsreq, &lsd, NULL) != ncclSuccess)
+                    break;
+                usleep(250);
+            }
+            if (lsd || net->irecv(rc, 1, &lrptr, &lcap, &ltag, &h_rmr, &lrreq) != ncclSuccess || !lrreq) {
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                goto out;
+            }
+            for (int spin = 0; spin < 100000 && (!lsd || !lrd); spin++) {
+                if (!lsd && net->test(lsreq, &lsd, NULL) != ncclSuccess)
+                    break;
+                if (!lrd && net->test(lrreq, &lrd, &lgot) != ncclSuccess)
+                    break;
+                if (!lsd && !lrd && (spin & 63) == 63)
+                    usleep(100);
+            }
+            get_stats_ex(&st, sizeof(st));
+            if (!lsd || !lrd || lgot != lcap || memcmp(h_tx, h_rx, (size_t)lcap) != 0 ||
+                !check_payload_stats(&st, get_rails, true, true, true)) {
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                fprintf(stderr, "FAIL: late irecv (>2.5 ms skew) fell back from GPUDirect RDMA_WRITE\n");
+                goto out;
+            }
+
+            memset(h_rx, 0x3cu, CTS_BURST_N * CTS_BURST_SZ);
+            reset_stats();
+            void *brreqs[CTS_BURST_N] = {0}, *bsreqs[CTS_BURST_N] = {0};
+            bool burst_ok = true;
+            for (int b = 0; b < CTS_BURST_N && burst_ok; b++) {
+                void *bp = h_rx + (size_t)b * CTS_BURST_SZ;
+                int bsz = CTS_BURST_SZ, btag = 900 + b;
+                if (net->irecv(rc, 1, &bp, &bsz, &btag, &h_rmr, &brreqs[b]) != ncclSuccess || !brreqs[b])
+                    burst_ok = false;
+            }
+            for (int b = 0; b < CTS_BURST_N && burst_ok; b++) {
+                int btag = 900 + b;
+                if (net->isend(sc, h_tx + (size_t)b * CTS_BURST_SZ, CTS_BURST_SZ, btag, h_tmr, &bsreqs[b]) != ncclSuccess ||
+                    !bsreqs[b])
+                    burst_ok = false;
+            }
+            int bdone = 0;
+            for (int spin = 0; burst_ok && spin < 200000 && bdone < 2 * CTS_BURST_N; spin++) {
+                for (int b = 0; b < CTS_BURST_N; b++) {
+                    int d = 0, g = 0;
+                    if (bsreqs[b]) {
+                        if (net->test(bsreqs[b], &d, NULL) != ncclSuccess) {
+                            burst_ok = false;
+                            break;
+                        }
+                        if (d) {
+                            bsreqs[b] = NULL;
+                            bdone++;
+                        }
+                    }
+                    if (brreqs[b]) {
+                        if (net->test(brreqs[b], &d, &g) != ncclSuccess || (d && g != CTS_BURST_SZ)) {
+                            burst_ok = false;
+                            break;
+                        }
+                        if (d) {
+                            brreqs[b] = NULL;
+                            bdone++;
+                        }
+                    }
+                }
+            }
+            get_stats_ex(&st, sizeof(st));
+            if (!burst_ok || bdone != 2 * CTS_BURST_N || memcmp(h_tx, h_rx, CTS_BURST_N * CTS_BURST_SZ) != 0 ||
+                !check_payload_stats(&st, get_rails, true, true, true)) {
+                net->deregMr(rc, h_rmr);
+                net->deregMr(sc, h_tmr);
+                free(h_rx);
+                free(h_tx);
+                fprintf(stderr, "FAIL: %d pre-posted irecvs evicted CTS entries or lost GPUDirect RDMA_WRITE\n", CTS_BURST_N);
+                goto out;
+            }
+        }
+        bool flush_ok = test_ibv_dmabuf_flush(net, rc, h_rmr, h_rx + 16u);
+        net->deregMr(rc, h_rmr);
+        net->deregMr(sc, h_tmr);
+        free(h_rx);
+        free(h_tx);
+        if (!flush_ok) {
+            fprintf(stderr, "FAIL: DMA-BUF flush did not propagate a readback failure or recover on retry\n");
+            goto out;
+        }
+
+        /* regression: >128 32 KiB CPU repair symbols via ibv_rep_mr must stay within ihdrs[VXFEC_UDP_TX_BATCH] */
+        const size_t big_h_sz = 8u * 1024u * 1024u;
+        uint8_t *bh_tx = (uint8_t *)malloc(big_h_sz);
+        uint8_t *bh_rx = (uint8_t *)calloc(1, big_h_sz);
+        int btfd2 = memfd_create("vxfec_headless_tx8m", MFD_CLOEXEC);
+        int brfd2 = memfd_create("vxfec_headless_rx8m", MFD_CLOEXEC);
+        void *bh_tmr = NULL, *bh_rmr = NULL;
+        bool big_rep_ok = false;
+        if (bh_tx && bh_rx && btfd2 >= 0 && brfd2 >= 0 && ftruncate(btfd2, (off_t)big_h_sz) == 0 &&
+            ftruncate(brfd2, (off_t)big_h_sz) == 0 &&
+            net->regMrDmaBuf(sc, bh_tx, big_h_sz, NCCL_PTR_CUDA, 0u, btfd2, &bh_tmr) == ncclSuccess &&
+            net->regMrDmaBuf(rc, bh_rx, big_h_sz, NCCL_PTR_CUDA, 0u, brfd2, &bh_rmr) == ncclSuccess) {
+            for (size_t i = 0; i < big_h_sz; i++)
+                bh_tx[i] = (uint8_t)((i * 53u + 17u) & 0xffu);
+            memset(bh_rx, 0x5au, big_h_sz);
+            reset_stats();
+            set_codec("rq-gf2");
+            g_mock_ibv.drop_rdma_rem = 170u;
+            void *bhsreq = NULL, *bhrreq = NULL, *bhrptr = bh_rx;
+            int bhcap = (int)big_h_sz, bhtag = 815, bhsd = 0, bhrd = 0, bhgot = 0;
+            if (net->irecv(rc, 1, &bhrptr, &bhcap, &bhtag, &bh_rmr, &bhrreq) == ncclSuccess && bhrreq &&
+                net->isend(sc, bh_tx, (int)big_h_sz, bhtag, bh_tmr, &bhsreq) == ncclSuccess && bhsreq) {
+                for (int spin = 0; spin < 200000 && (!bhsd || !bhrd); spin++) {
+                    if (!bhsd && net->test(bhsreq, &bhsd, NULL) != ncclSuccess)
+                        break;
+                    if (!bhrd && net->test(bhrreq, &bhrd, &bhgot) != ncclSuccess)
+                        break;
+                    if ((spin & 63) == 63)
+                        usleep(100);
+                }
+                get_stats_ex(&st, sizeof(st));
+                big_rep_ok = bhsd && bhrd && bhgot == (int)big_h_sz && memcmp(bh_tx, bh_rx, big_h_sz) == 0 &&
+                             st.tx_harq_ir_pkts >= 135u && st.rx_rq_decodes >= 1u;
+                /* decay sc->loss_ewma after 55% synthetic erasure test */
+                for (int d = 0; big_rep_ok && d < 64; d++) {
+                    void *ds = NULL, *dr = NULL, *dp = bh_rx;
+                    int dcap = 64, dtag = 816, dsd = 0, drd = 0, dgot = 0;
+                    if (net->irecv(rc, 1, &dp, &dcap, &dtag, &bh_rmr, &dr) != ncclSuccess ||
+                        net->isend(sc, bh_tx, 64, dtag, bh_tmr, &ds) != ncclSuccess) {
+                        big_rep_ok = false;
+                        break;
+                    }
+                    while (!dsd || !drd) {
+                        if (!dsd)
+                            (void)net->test(ds, &dsd, NULL);
+                        if (!drd)
+                            (void)net->test(dr, &drd, &dgot);
+                    }
+                }
+            }
+            g_mock_ibv.drop_rdma_rem = 0u;
+            set_codec(NULL);
+        }
+        if (btfd2 >= 0)
+            close(btfd2);
+        if (brfd2 >= 0)
+            close(brfd2);
+        if (bh_rmr)
+            net->deregMr(rc, bh_rmr);
+        if (bh_tmr)
+            net->deregMr(sc, bh_tmr);
+        free(bh_rx);
+        free(bh_tx);
+        if (!big_rep_ok) {
+            fprintf(stderr, "FAIL: >128 32 KiB CPU repair batch via ibv_rep_mr failed\n");
+            goto out;
+        }
+    }
 
     /* 1d) verify lost PKT_DONE on RDMA completes sreq even when caller stops polling rc after rreq finishes */
     set_done_fault(4u);
@@ -5471,6 +6607,7 @@ static int run_ibv_mock_tests(void)
         full_hello.base.magic = h.magic;
         full_hello.base.pkt_type = 1u;
         full_hello.base.has_ibv = (dialect == 0) ? 1u : (uint8_t)(0x02u | 0x04u | exp_gf2);
+        full_hello.base.pad0 = 1u; /* older peers leave this byte unspecified */
         full_hello.base.num_ports = h.num_ports;
         full_hello.base.cookie = h.cookie;
         full_hello.base.tx_ctrl_port_be = csin.sin_port;
@@ -5512,6 +6649,20 @@ static int run_ibv_mock_tests(void)
         }
     }
 
+    /* An old sender may take any repair arena offered, even without the feature bit. */
+    void *legacy_dst = rx, *legacy_req = NULL;
+    int legacy_size = VXFEC_RDMA_HOST_CTS_MIN, legacy_tag = 807;
+    if (net->irecv(rc_reconciled, 1, &legacy_dst, &legacy_size, &legacy_tag, &rmr, &legacy_req) != ncclSuccess || !legacy_req)
+        goto out;
+    vxfec_rx_req_t *legacy_rx = legacy_req;
+    if (!legacy_rx->rdma_cts_sent || legacy_rx->cts_rep_rkey || legacy_rx->cts_rep_slots) {
+        fprintf(stderr, "FAIL: legacy peer must receive a systematic-only RDMA CTS\n");
+        goto out;
+    }
+    if (net->closeRecv(rc_reconciled) != ncclSuccess)
+        goto out;
+    rc_reconciled = NULL;
+
     /* 3) verify sender emits 240B RDMA HELLO (has_ibv = 0x02|features) and accepts 240B reconciled RDMA HELLO_ACK */
     raw_lc_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     struct sockaddr_in rsin = {.sin_family = AF_INET, .sin_addr.s_addr = h.ip_be};
@@ -5534,7 +6685,8 @@ static int run_ibv_mock_tests(void)
             (ssize_t)sizeof(full_hello))
             continue;
         uint8_t exp_local = (uint8_t)(0x04u | exp_gf2);
-        if (full_hello.base.has_ibv != (uint8_t)(0x02u | exp_local) || full_hello.base.features != exp_local ||
+        if (full_hello.base.has_ibv != (uint8_t)(0x02u | exp_local) ||
+            full_hello.base.features != (uint8_t)(VXFEC_HELLO_RDMA_REPAIR | VXFEC_HELLO_CONFIRM | exp_local) ||
             full_hello.ibv_info.num_qps != h.num_ports) {
             fprintf(stderr, "FAIL: sender 240B RDMA HELLO unexpected flags (b5=%#x feat=%#x qps=%u)\n", full_hello.base.has_ibv,
                     full_hello.base.features, full_hello.ibv_info.num_qps);
@@ -5545,6 +6697,7 @@ static int run_ibv_mock_tests(void)
         full_ack.base.pkt_type = 2u;
         full_ack.base.has_ibv = (uint8_t)(0x02u | exp_local);
         full_ack.base.features = 0u; /* reconciled 0235844 / 7e0b2c9 RDMA HELLO_ACK */
+        full_ack.base.pad0 = 1u;
         full_ack.base.num_ports = raw_h.num_ports;
         full_ack.base.cookie = raw_h.cookie;
         full_ack.base.rx_ctrl_port_be = rsin.sin_port;
@@ -5555,7 +6708,7 @@ static int run_ibv_mock_tests(void)
         full_ack.ibv_info.mtu_enum = IBV_MTU_1024; /* peer advertises smaller 1024B verbs MTU */
         (void)sendto(raw_lc_fd, &full_ack, sizeof(full_ack), 0, (struct sockaddr *)&peer, plen);
     }
-    if (!sc_raw) {
+    if (!sc_raw || (((vxfec_send_comm_t *)sc_raw)->features & VXFEC_HELLO_RDMA_REPAIR)) {
         fprintf(stderr, "FAIL: sender rejected full-frame 240B reconciled RDMA HELLO_ACK\n");
         goto out;
     }
@@ -5615,6 +6768,144 @@ static int run_ibv_mock_tests(void)
     if (fb_sym_t == 0u || fb_sym_t > 1424u) {
         fprintf(stderr, "FAIL: UDP fallback on verbs device used oversized sym_T=%u\n", fb_sym_t);
         goto out;
+    }
+
+    /* 3a2) verify RoCEv2 IBV_QPT_UC per-QP loss attribution deflects SWRR traffic off a congested spine QP */
+    {
+        const size_t qp_sz = 262144u;
+        uint8_t *qp_tx = (uint8_t *)malloc(qp_sz);
+        uint8_t *qp_rx = (uint8_t *)calloc(1, qp_sz);
+        int qp_tfd = memfd_create("vxfec_uc_qp_tx", MFD_CLOEXEC);
+        int qp_rfd = memfd_create("vxfec_uc_qp_rx", MFD_CLOEXEC);
+        if (!qp_tx || !qp_rx || qp_tfd < 0 || qp_rfd < 0 || ftruncate(qp_tfd, (off_t)qp_sz) != 0 ||
+            ftruncate(qp_rfd, (off_t)qp_sz) != 0) {
+            if (qp_tfd >= 0)
+                close(qp_tfd);
+            if (qp_rfd >= 0)
+                close(qp_rfd);
+            free(qp_rx);
+            free(qp_tx);
+            goto out;
+        }
+        void *qp_tmr = NULL, *qp_rmr = NULL;
+        if (net->regMrDmaBuf(sc, qp_tx, qp_sz, NCCL_PTR_CUDA, 0u, qp_tfd, &qp_tmr) != ncclSuccess ||
+            net->regMrDmaBuf(rc, qp_rx, qp_sz, NCCL_PTR_CUDA, 0u, qp_rfd, &qp_rmr) != ncclSuccess) {
+            close(qp_tfd);
+            close(qp_rfd);
+            if (qp_tmr)
+                net->deregMr(sc, qp_tmr);
+            if (qp_rmr)
+                net->deregMr(rc, qp_rmr);
+            free(qp_rx);
+            free(qp_tx);
+            fprintf(stderr, "FAIL: RoCEv2 per-QP regMrDmaBuf failed\n");
+            goto out;
+        }
+        close(qp_tfd);
+        close(qp_rfd);
+
+        pthread_mutex_lock(&g_mock_ibv_mtx);
+        memset(g_mock_ibv.qp_rdma_wrs, 0, sizeof(g_mock_ibv.qp_rdma_wrs));
+        g_mock_ibv.drop_rdma_qpn = 0u;
+        g_mock_ibv.drop_rdma_every = 0u;
+        pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+        int hot_qi = -1, clean_qi = -1;
+        uint32_t hot_qpn = 0u, base_hot = 0u, base_clean = 0u;
+        reset_stats();
+
+        for (int iter = 0; iter < 15; iter++) {
+            if (iter == 1) {
+                pthread_mutex_lock(&g_mock_ibv_mtx);
+                for (int i = 0; i < MOCK_MAX_QPS; i++) {
+                    if (g_mock_qps[i] && g_mock_ibv.qp_rdma_wrs[i] > 0u) {
+                        if (hot_qi < 0) {
+                            hot_qi = i;
+                            hot_qpn = g_mock_qps[i]->qp.qp_num;
+                        } else if (clean_qi < 0) {
+                            clean_qi = i;
+                            break;
+                        }
+                    }
+                }
+                g_mock_ibv.drop_rdma_qpn = hot_qpn;
+                g_mock_ibv.drop_rdma_every = 2u; /* 50% congestion drops on hot_qpn spine link */
+                pthread_mutex_unlock(&g_mock_ibv_mtx);
+                if (hot_qi < 0 || clean_qi < 0 || hot_qpn == 0u) {
+                    net->deregMr(rc, qp_rmr);
+                    net->deregMr(sc, qp_tmr);
+                    free(qp_rx);
+                    free(qp_tx);
+                    fprintf(stderr, "FAIL: could not locate multi-QP TX RDMA QPs in mock IBV table\n");
+                    goto out;
+                }
+                reset_stats();
+            } else if (iter == 7) {
+                pthread_mutex_lock(&g_mock_ibv_mtx);
+                base_hot = g_mock_ibv.qp_rdma_wrs[hot_qi];
+                base_clean = g_mock_ibv.qp_rdma_wrs[clean_qi];
+                pthread_mutex_unlock(&g_mock_ibv_mtx);
+            }
+
+            for (size_t b = 0; b < qp_sz; b++)
+                qp_tx[b] = (uint8_t)((b * 37u + (size_t)iter * 19u + 5u) & 0xffu);
+            memset(qp_rx, 0x5au, qp_sz);
+
+            void *s_qp = NULL, *r_qp = NULL, *vp_rx = qp_rx;
+            int cap_qp = (int)qp_sz, tag_qp = 840 + iter, sd_qp = 0, rd_qp = 0, got_qp = 0;
+            if (net->irecv(rc, 1, &vp_rx, &cap_qp, &tag_qp, &qp_rmr, &r_qp) != ncclSuccess || !r_qp ||
+                net->isend(sc, qp_tx, (int)qp_sz, tag_qp, qp_tmr, &s_qp) != ncclSuccess || !s_qp) {
+                pthread_mutex_lock(&g_mock_ibv_mtx);
+                g_mock_ibv.drop_rdma_qpn = 0u;
+                g_mock_ibv.drop_rdma_every = 0u;
+                pthread_mutex_unlock(&g_mock_ibv_mtx);
+                net->deregMr(rc, qp_rmr);
+                net->deregMr(sc, qp_tmr);
+                free(qp_rx);
+                free(qp_tx);
+                goto out;
+            }
+            for (int spin = 0; spin < 200000 && (!sd_qp || !rd_qp); spin++) {
+                if (!sd_qp && net->test(s_qp, &sd_qp, NULL) != ncclSuccess)
+                    break;
+                if (!rd_qp && net->test(r_qp, &rd_qp, &got_qp) != ncclSuccess)
+                    break;
+                if (!sd_qp && !rd_qp && (spin & 63) == 63)
+                    usleep(100);
+            }
+            if (!sd_qp || !rd_qp || got_qp != (int)qp_sz || memcmp(qp_tx, qp_rx, qp_sz) != 0) {
+                pthread_mutex_lock(&g_mock_ibv_mtx);
+                g_mock_ibv.drop_rdma_qpn = 0u;
+                g_mock_ibv.drop_rdma_every = 0u;
+                pthread_mutex_unlock(&g_mock_ibv_mtx);
+                net->deregMr(rc, qp_rmr);
+                net->deregMr(sc, qp_tmr);
+                free(qp_rx);
+                free(qp_tx);
+                fprintf(stderr, "FAIL: RoCEv2 per-QP deflection test iter %d failed verification\n", iter);
+                goto out;
+            }
+        }
+
+        uint32_t tail_hot = 0u, tail_clean = 0u;
+        pthread_mutex_lock(&g_mock_ibv_mtx);
+        tail_hot = g_mock_ibv.qp_rdma_wrs[hot_qi] - base_hot;
+        tail_clean = g_mock_ibv.qp_rdma_wrs[clean_qi] - base_clean;
+        g_mock_ibv.drop_rdma_qpn = 0u;
+        g_mock_ibv.drop_rdma_every = 0u;
+        pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+        net->deregMr(rc, qp_rmr);
+        net->deregMr(sc, qp_tmr);
+        free(qp_rx);
+        free(qp_tx);
+
+        get_stats_ex(&st, sizeof(st));
+        if (st.tx_cnp_events < 3u || tail_clean == 0u || tail_hot * 3u > tail_clean) {
+            fprintf(stderr, "FAIL: IBV_QPT_UC per-QP deflection did not evict congested QP (cnp=%lu hot=%u clean=%u)\n",
+                    (unsigned long)st.tx_cnp_events, tail_hot, tail_clean);
+            goto out;
+        }
     }
 
     /* 3b) verify fatal TX CQ error notifies matching pending RDMA receive with ncclRemoteError */
@@ -5685,8 +6976,10 @@ static int run_ibv_mock_tests(void)
     pthread_mutex_lock(&g_mock_ibv_mtx);
     struct ibv_cq *rc_cq = NULL;
     for (int i = 0; i < MOCK_MAX_QPS; i++) {
-        if (g_mock_qps[i] && g_mock_qps[i]->rq_cnt > 0u) {
+        if (g_mock_qps[i] && g_mock_qps[i]->rq_cnt > 0u && g_mock_qps[i]->rq_sge[g_mock_qps[i]->rq_head].length > 256u) {
             rc_cq = g_mock_qps[i]->qp.recv_cq;
+            g_mock_ibv.busy_qpn = g_mock_qps[i]->qp.qp_num;
+            g_mock_ibv.busy_budget = 1u;
             break;
         }
     }
@@ -5698,8 +6991,9 @@ static int run_ibv_mock_tests(void)
         mock_cq_push_locked(rc_cq, bad_rwc);
     }
     pthread_mutex_unlock(&g_mock_ibv_mtx);
-    if (!rc_cq || net->test(rx_err_req, &rx_err_done, &rx_err_got) != ncclSystemError || rx_err_done != 0) {
-        fprintf(stderr, "FAIL: fatal RX WC error did not surface ncclSystemError\n");
+    if (!rc_cq || net->test(rx_err_req, &rx_err_done, &rx_err_got) != ncclSuccess || rx_err_done ||
+        net->test(rx_err_req, &rx_err_done, &rx_err_got) != ncclSystemError || rx_err_done) {
+        fprintf(stderr, "FAIL: expected fatal RX error only after busy QP teardown finished\n");
         goto out;
     }
     ncclResult_t tx_err_res = ncclSuccess;
@@ -5723,7 +7017,7 @@ static int run_ibv_mock_tests(void)
     pthread_mutex_lock(&g_mock_ibv_mtx);
     struct ibv_cq *fork_cq = NULL;
     for (int i = 0; i < MOCK_MAX_QPS; i++) {
-        if (g_mock_qps[i] && g_mock_qps[i]->rq_cnt > 0u) {
+        if (g_mock_qps[i] && g_mock_qps[i]->rq_cnt > 0u && g_mock_qps[i]->rq_sge[g_mock_qps[i]->rq_head].length > 256u) {
             fork_cq = g_mock_qps[i]->qp.recv_cq;
             break;
         }
@@ -5921,7 +7215,149 @@ out:
                                 break;
                             }
                         }
+                        set_codec("rs8");
+                        for (unsigned side = RQ_TX; ok && side <= RQ_RX; side++)
+                            ok = test_direct_gpu_fence(net, gsc, grc, tx_iova, rx_iova, gtmr, grmr, (int)gsz, side, NULL);
+                        if (ok) {
+                            ring_comms_t ring;
+                            ok = setup_ring(net, &ring);
+                            for (unsigned side = RQ_TX; ok && side <= RQ_RX; side++) {
+                                unsigned src = side - RQ_TX, dst = (src + 1) % NUM_RANKS;
+                                void **closing = side == RQ_TX ? &ring.send_comm[src] : &ring.recv_comm[dst];
+                                ok = test_direct_gpu_fence(net, ring.send_comm[src], ring.recv_comm[dst], tx_iova, rx_iova, gtmr,
+                                                           grmr, (int)gsz, side, closing);
+                            }
+                            teardown_ring(net, &ring);
+                        }
                         set_codec(NULL);
+
+                        /* 5d) 8 MiB Tier 2 collective saturation check: 32 KiB UC symbols + doorbell batching + isend-first CTS */
+                        const size_t big_sz = 8u * 1024u * 1024u;
+                        int btfd = -1, brfd = -1;
+                        vxfec_vk_buf *btvb = ok ? vxfec_vk_buf_new_exportable(vk, big_sz, true, &btfd) : NULL;
+                        vxfec_vk_buf *brvb = ok ? vxfec_vk_buf_new_exportable(vk, big_sz, true, &brfd) : NULL;
+                        uint8_t *bh_src = (uint8_t *)malloc(big_sz);
+                        uint8_t *bh_dst = (uint8_t *)calloc(1, big_sz);
+                        void *bgtmr = NULL, *bgrmr = NULL, *bhtmr = NULL, *bhrmr = NULL;
+                        void *btx_iova = (void *)(uintptr_t)0x630000000000ULL;
+                        void *brx_iova = (void *)(uintptr_t)0x640000000000ULL;
+                        if (!ok || !btvb || !brvb || btfd < 0 || brfd < 0 || !bh_src || !bh_dst ||
+                            net->regMrDmaBuf(gsc, btx_iova, big_sz, NCCL_PTR_CUDA, 0u, btfd, &bgtmr) != ncclSuccess ||
+                            net->regMrDmaBuf(grc, brx_iova, big_sz, NCCL_PTR_CUDA, 0u, brfd, &bgrmr) != ncclSuccess ||
+                            net->regMr(gsc, bh_src, big_sz, NCCL_PTR_HOST, &bhtmr) != ncclSuccess ||
+                            net->regMr(grc, bh_dst, big_sz, NCCL_PTR_HOST, &bhrmr) != ncclSuccess) {
+                            ok = false;
+                        } else {
+                            for (size_t i = 0; i < big_sz; i++)
+                                bh_src[i] = (uint8_t)(i * 97u + (i / 32768u) * 17u + 31u);
+                            /* host-MR 8 MiB send: verify headerless num_sge=1 RDMA_WRITE_WITH_IMM (sym_T == 32768 B, 0 hdr SGE) */
+                            pthread_mutex_lock(&g_mock_ibv_mtx);
+                            g_mock_ibv.max_send_bytes = 0u;
+                            g_mock_ibv.max_rdma_sge_seen = 0u;
+                            /* batch efficiency covers the bulk data; CTS, ACKs and repairs can legitimately post singly */
+                            g_mock_ibv.systematic_rdma_wrs = 0u;
+                            g_mock_ibv.systematic_rdma_posts = 0u;
+                            pthread_mutex_unlock(&g_mock_ibv_mtx);
+                            void *hsreq = NULL, *hrreq = NULL, *hrptr = bh_dst;
+                            int hcap = (int)big_sz, htag = 870, hsd = 0, hrd = 0, hgot = 0;
+                            if (net->irecv(grc, 1, &hrptr, &hcap, &htag, &bhrmr, &hrreq) != ncclSuccess ||
+                                net->isend(gsc, bh_src, (int)big_sz, htag, bhtmr, &hsreq) != ncclSuccess) {
+                                ok = false;
+                            }
+                            for (int spin = 0; ok && spin < 200000 && (!hsd || !hrd); spin++) {
+                                if (!hsd && net->test(hsreq, &hsd, NULL) != ncclSuccess)
+                                    ok = false;
+                                if (!hrd && net->test(hrreq, &hrd, &hgot) != ncclSuccess)
+                                    ok = false;
+                            }
+                            pthread_mutex_lock(&g_mock_ibv_mtx);
+                            uint32_t h_max_send = g_mock_ibv.max_send_bytes;
+                            uint32_t h_max_sge = g_mock_ibv.max_rdma_sge_seen;
+                            uint32_t h_wrs = g_mock_ibv.systematic_rdma_wrs;
+                            uint32_t h_calls = g_mock_ibv.systematic_rdma_posts;
+                            pthread_mutex_unlock(&g_mock_ibv_mtx);
+                            if (!ok || !hsd || !hrd || hgot != (int)big_sz || h_max_send != 32768u || h_max_sge != 1u ||
+                                h_calls == 0u || (h_wrs / h_calls) < 10u || memcmp(bh_src, bh_dst, big_sz) != 0) {
+                                fprintf(stderr,
+                                        "FAIL: 8 MiB host RDMA 32 KiB 1-SGE symbol/batch check failed (max=%u sge=%u wrs=%u "
+                                        "calls=%u)\n",
+                                        h_max_send, h_max_sge, h_wrs, h_calls);
+                                ok = false;
+                            }
+
+                            /* GPU DMA-BUF 8 MiB send with isend BEFORE irecv + 6 dropped 32 KiB RDMA writes + 1-SGE RDMA repair */
+                            if (ok) {
+                                ok = vxfec_vk_buf_write_offset(vk, btvb, 0u, bh_src, big_sz) &&
+                                     vxfec_vk_buf_release_external(vk, btvb) &&
+                                     vxfec_vk_buf_fill_offset(vk, brvb, 0u, big_sz, 0xa5a5a5a5u) &&
+                                     vxfec_vk_buf_release_external(vk, brvb);
+                            }
+                            if (ok) {
+                                reset_stats();
+                                pthread_mutex_lock(&g_mock_ibv_mtx);
+                                uint32_t pre_rdma8 = g_mock_ibv.rdma_write_imm_pkts;
+                                uint32_t pre_rep8 = g_mock_ibv.rdma_repair_imm_pkts;
+                                g_mock_ibv.max_rdma_sge_seen = 0u;
+                                g_mock_ibv.drop_rdma_rem = 6u;
+                                g_mock_ibv.dropped_rdma_pkts = 0u;
+                                g_mock_ibv.systematic_rdma_wrs = 0u;
+                                g_mock_ibv.systematic_rdma_posts = 0u;
+                                pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+                                void *bsreq = NULL, *brreq = NULL, *brptr = brx_iova;
+                                int bcap = (int)big_sz, btag = 871, bsd = 0, brd = 0, bgot = 0;
+                                /* call isend BEFORE irecv to verify 500us PKT_RDMA_CTS rendezvous prevents host fallback! */
+                                if (net->isend(gsc, btx_iova, (int)big_sz, btag, bgtmr, &bsreq) != ncclSuccess || !bsreq ||
+                                    net->irecv(grc, 1, &brptr, &bcap, &btag, &bgrmr, &brreq) != ncclSuccess || !brreq) {
+                                    ok = false;
+                                }
+                                for (int spin = 0; ok && spin < 300000 && (!bsd || !brd); spin++) {
+                                    if (!bsd && net->test(bsreq, &bsd, NULL) != ncclSuccess)
+                                        ok = false;
+                                    if (!brd && net->test(brreq, &brd, &bgot) != ncclSuccess)
+                                        ok = false;
+                                }
+                                pthread_mutex_lock(&g_mock_ibv_mtx);
+                                uint32_t rdma8 = g_mock_ibv.rdma_write_imm_pkts - pre_rdma8;
+                                uint32_t rep8 = g_mock_ibv.rdma_repair_imm_pkts - pre_rep8;
+                                uint32_t g_max_sge = g_mock_ibv.max_rdma_sge_seen;
+                                uint32_t drops8 = g_mock_ibv.dropped_rdma_pkts;
+                                uint32_t g_wrs = g_mock_ibv.systematic_rdma_wrs;
+                                uint32_t g_calls = g_mock_ibv.systematic_rdma_posts;
+                                g_mock_ibv.drop_rdma_rem = 0u;
+                                pthread_mutex_unlock(&g_mock_ibv_mtx);
+
+                                memset(bh_dst, 0, big_sz);
+                                if (!ok || !bsd || !brd || bgot != (int)big_sz || rdma8 < 240u || rep8 < 6u || g_max_sge != 1u ||
+                                    drops8 != 6u || g_calls == 0u || (g_wrs / g_calls) < 10u ||
+                                    !vxfec_vk_buf_read_offset(vk, brvb, 0u, bh_dst, big_sz) ||
+                                    memcmp(bh_src, bh_dst, big_sz) != 0) {
+                                    fprintf(stderr,
+                                            "FAIL: 8 MiB GPU RDMA_WRITE_WITH_IMM 32 KiB + 1-SGE repair + CTS rendezvous failed "
+                                            "(rdma=%u rep=%u sge=%u drops=%u wrs=%u calls=%u)\n",
+                                            rdma8, rep8, g_max_sge, drops8, g_wrs, g_calls);
+                                    ok = false;
+                                }
+                            }
+                        }
+                        if (ok)
+                            ok = test_gpu_repair_partial_post(net, gsc, grc, btx_iova, brx_iova, bgtmr, bgrmr, (int)big_sz);
+                        if (bhtmr)
+                            net->deregMr(gsc, bhtmr);
+                        if (bhrmr)
+                            net->deregMr(grc, bhrmr);
+                        if (bgtmr)
+                            net->deregMr(gsc, bgtmr);
+                        if (bgrmr)
+                            net->deregMr(grc, bgrmr);
+                        if (btfd >= 0)
+                            close(btfd);
+                        if (brfd >= 0)
+                            close(brfd);
+                        vxfec_vk_buf_free(vk, btvb);
+                        vxfec_vk_buf_free(vk, brvb);
+                        free(bh_dst);
+                        free(bh_src);
                     }
                 }
                 if (gtmr)
@@ -5945,8 +7381,7 @@ out:
                 free(h_src);
             }
             if (ok) {
-                printf("PASS: GPUDirect RDMA_WRITE_WITH_IMM -> DMA-BUF VRAM + zero-copy out_dmabuf parity + in-place VRAM "
-                       "RS8/RQ-GF2 decode\n");
+                puts("PASS: GPU DMA-BUF RDMA, in-place RS8/RQ-GF2 decode, direct GPU error fences, and partial-post retention");
             }
         } else if (vk) {
             vxfec_vk_ctx_free(vk);
@@ -6541,12 +7976,618 @@ out:
     return ok;
 }
 
+static int run_cuda_mps_guard_test(const char *so_path)
+{
+    int vk_st = VXFEC_VK_ERROR;
+    vxfec_vk_ctx *ext_vk = vxfec_vk_ctx_new_status(&vk_st);
+    if (!ext_vk)
+        return (vk_st == VXFEC_VK_UNAVAILABLE) ? 0 : 1;
+    bool can_dmabuf = vxfec_vk_has_dmabuf(ext_vk);
+    vxfec_vk_ctx_free(ext_vk);
+    if (!can_dmabuf)
+        return 0;
+
+    /* verify CUDA_MPS_ACTIVE_THREAD_PERCENTAGE keeps in-process Vulkan active alongside NVIDIA NCCL */
+    setenv("VXFEC_TEST_FAKE_NVIDIA_NCCL", "1", 1);
+    unsetenv("VXFEC_NCCL_VULKAN");
+    unsetenv("VXFEC_NCCL_GPU_BACKEND");
+    unsetenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE");
+    void *dl = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!dl)
+        return 1;
+    const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
+    uint32_t (*get_inproc_vk)(void) = (uint32_t (*)(void))dlsym(dl, "vxfec_nccl_get_inproc_vk_devs");
+    bool ok = net && get_inproc_vk;
+    ncclNetProperties_v8_t p_no_mps = {0}, p_mps = {0};
+    if (ok && (net->init(dummy_nccl_logger) != ncclSuccess || net->getProperties(0, &p_no_mps) != ncclSuccess ||
+               (p_no_mps.ptrSupport & NCCL_PTR_DMABUF) != 0 || get_inproc_vk() != 0u)) {
+        fprintf(stderr, "FAIL: fake NVIDIA NCCL without MPS did not disable in-process Vulkan\n");
+        ok = false;
+    }
+    if (ok) {
+        setenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", "40", 1);
+        if (net->init(dummy_nccl_logger) != ncclSuccess || net->getProperties(0, &p_mps) != ncclSuccess ||
+            (p_mps.ptrSupport & NCCL_PTR_DMABUF) == 0 || get_inproc_vk() == 0u) {
+            fprintf(stderr, "FAIL: CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=40 did not enable GPU Vulkan FEC\n");
+            ok = false;
+        }
+    }
+    dlclose(dl);
+    unsetenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE");
+    unsetenv("VXFEC_TEST_FAKE_NVIDIA_NCCL");
+    if (ok)
+        printf("PASS: CUDA_MPS SM partitioning keeps in-process Vulkan active alongside NVIDIA NCCL\n");
+    return ok ? 0 : 1;
+}
+
+static int run_rail_worker_tests(void)
+{
+    const char *so_path = getenv("VXFEC_NCCL_SO_PATH");
+    if (!so_path || !*so_path)
+        so_path = "./libnccl-vxfec.so";
+
+    setenv("VXFEC_NCCL_IFNAMES", "lo", 1);
+    setenv("VXFEC_NCCL_PORTS", "4", 1);
+    setenv("VXFEC_NCCL_VULKAN", "0", 1);
+    setenv("VXFEC_NCCL_RAILS", "4", 1);
+    setenv("VXFEC_NCCL_RAIL_WORKERS", "2", 1);
+
+    void *dl = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!dl) {
+        fprintf(stderr, "FAIL: dlopen(%s): %s\n", so_path, dlerror());
+        return 1;
+    }
+
+    const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
+    uint32_t (*get_rail_workers)(void) = (uint32_t (*)(void))dlsym(dl, "vxfec_nccl_active_rail_workers");
+    uint64_t (*get_rail_ticks)(int) = (uint64_t (*)(int))dlsym(dl, "vxfec_nccl_rail_worker_ticks");
+    void (*set_fault)(uint32_t, uint32_t, bool) = (void (*)(uint32_t, uint32_t, bool))dlsym(dl, "vxfec_nccl_set_fault_injection");
+
+    int ndev = 0;
+    bool ok = net && get_rail_workers && get_rail_ticks && set_fault && net->init(dummy_nccl_logger) == ncclSuccess &&
+              net->devices(&ndev) == ncclSuccess && ndev == 4;
+    if (!ok) {
+        fprintf(stderr, "FAIL: rail-worker init expected ndev=4, got %d\n", ndev);
+        dlclose(dl);
+        return 1;
+    }
+
+    void *lc[4] = {0}, *sc[4] = {0}, *rc[4] = {0};
+    void *tx_mr[4] = {0}, *rx_mr[4] = {0};
+    uint8_t *tx_buf[4] = {0}, *rx_buf[4] = {0};
+    uint8_t handles[4][NCCL_NET_HANDLE_MAXSIZE];
+    const size_t sz = 1024u * 1024u;
+
+    for (int r = 0; r < 4 && ok; r++) {
+        memset(handles[r], 0, sizeof(handles[r]));
+        if (net->listen(r, handles[r], &lc[r]) != ncclSuccess) {
+            ok = false;
+            break;
+        }
+        while (!sc[r] || !rc[r]) {
+            if (!sc[r] && net->connect(r, handles[r], &sc[r], NULL) != ncclSuccess) {
+                ok = false;
+                break;
+            }
+            if (!rc[r] && net->accept(lc[r], &rc[r], NULL) != ncclSuccess) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            tx_buf[r] = (uint8_t *)malloc(sz);
+            rx_buf[r] = (uint8_t *)calloc(1, sz);
+            if (!tx_buf[r] || !rx_buf[r] || net->regMr(sc[r], tx_buf[r], sz, NCCL_PTR_HOST, &tx_mr[r]) != ncclSuccess ||
+                net->regMr(rc[r], rx_buf[r], sz, NCCL_PTR_HOST, &rx_mr[r]) != ncclSuccess) {
+                ok = false;
+            } else {
+                for (size_t i = 0; i < sz; i++)
+                    tx_buf[r][i] = (uint8_t)((r * 37u + i * 13u + 5u) & 0xffu);
+            }
+        }
+    }
+
+    if (ok && get_rail_workers() != 4u) {
+        fprintf(stderr, "FAIL: expected 4 active per-rail worker threads, got %u\n", get_rail_workers());
+        ok = false;
+    }
+
+    /* 1) verify true background completion without caller spinning in vxf_test */
+    if (ok) {
+        set_fault(0u, 1u, false);
+        void *sreq0 = NULL, *rreq0 = NULL;
+        void *rptr0 = rx_buf[0];
+        int rsz0 = (int)(256u * 1024u);
+        int tag0 = 910;
+        if (net->irecv(rc[0], 1, &rptr0, &rsz0, &tag0, &rx_mr[0], &rreq0) != ncclSuccess ||
+            net->isend(sc[0], tx_buf[0], rsz0, tag0, tx_mr[0], &sreq0) != ncclSuccess || !sreq0 || !rreq0) {
+            ok = false;
+        } else {
+            usleep(40000);
+            int sdone0 = 0, rdone0 = 0, got_sz = 0;
+            if (net->test(rreq0, &rdone0, &got_sz) != ncclSuccess || net->test(sreq0, &sdone0, NULL) != ncclSuccess ||
+                rdone0 != 1 || sdone0 != 1 || got_sz != rsz0 || memcmp(rx_buf[0], tx_buf[0], (size_t)rsz0) != 0) {
+                fprintf(stderr, "FAIL: background rail worker did not complete transfer while caller slept (rdone=%d sdone=%d)\n",
+                        rdone0, sdone0);
+                ok = false;
+            }
+            /* verify double-test on reaped request returns ncclInvalidUsage */
+            int dummy_done = 0;
+            if (ok && net->test(sreq0, &dummy_done, NULL) != ncclInvalidUsage) {
+                fprintf(stderr, "FAIL: expected ncclInvalidUsage on already-reaped request\n");
+                ok = false;
+            }
+        }
+    }
+
+    /* 2) verify 4-rail concurrent burst under 2.5% burst=5 loss progresses all 4 dedicated rail workers */
+    if (ok) {
+        set_fault(25000u, 5u, true);
+        for (int it = 0; it < 4 && ok; it++) {
+            void *sreq[4] = {0}, *rreq[4] = {0};
+            int sdone[4] = {0}, rdone[4] = {0};
+            for (int r = 0; r < 4 && ok; r++) {
+                memset(rx_buf[r], 0, sz);
+                void *rptr = rx_buf[r];
+                int rsz = (int)sz;
+                int tag = 920 + r;
+                if (net->irecv(rc[r], 1, &rptr, &rsz, &tag, &rx_mr[r], &rreq[r]) != ncclSuccess ||
+                    net->isend(sc[r], tx_buf[r], (int)sz, tag, tx_mr[r], &sreq[r]) != ncclSuccess)
+                    ok = false;
+            }
+            int done_cnt = 0;
+            while (ok && done_cnt < 8) {
+                for (int r = 0; r < 4; r++) {
+                    if (!sdone[r]) {
+                        if (net->test(sreq[r], &sdone[r], NULL) != ncclSuccess)
+                            ok = false;
+                        else if (sdone[r])
+                            done_cnt++;
+                    }
+                    if (!rdone[r]) {
+                        int got = 0;
+                        if (net->test(rreq[r], &rdone[r], &got) != ncclSuccess)
+                            ok = false;
+                        else if (rdone[r]) {
+                            if ((size_t)got != sz)
+                                ok = false;
+                            done_cnt++;
+                        }
+                    }
+                }
+            }
+            for (int r = 0; r < 4 && ok; r++) {
+                if (memcmp(rx_buf[r], tx_buf[r], sz) != 0) {
+                    fprintf(stderr, "FAIL: 4-rail mismatch on rail %d iter %d\n", r, it);
+                    ok = false;
+                }
+            }
+        }
+        for (int r = 0; r < 4 && ok; r++) {
+            if (get_rail_ticks(r) == 0ULL) {
+                fprintf(stderr, "FAIL: rail worker %d recorded 0 background progress ticks\n", r);
+                ok = false;
+            }
+        }
+    }
+
+    /* 3) verify VXFEC_NCCL_DEV_SLICE="1/4" isolates 1 device out of 4 */
+    for (int r = 0; r < 4; r++) {
+        if (rx_mr[r])
+            net->deregMr(rc[r], rx_mr[r]);
+        if (tx_mr[r])
+            net->deregMr(sc[r], tx_mr[r]);
+        if (sc[r])
+            net->closeSend(sc[r]);
+        if (rc[r])
+            net->closeRecv(rc[r]);
+        if (lc[r])
+            net->closeListen(lc[r]);
+        free(tx_buf[r]);
+        free(rx_buf[r]);
+    }
+    set_fault(0u, 1u, false);
+
+    if (ok) {
+        unsetenv("VXFEC_NCCL_RAILS");
+        setenv("VXFEC_NCCL_RAILS", "1", 1);
+        unsetenv("VXFEC_NCCL_RAILS");
+        /* test slice after multi-rail clone */
+        setenv("VXFEC_NCCL_DEV_SLICE", "1/2", 1);
+        int sliced_ndev = 0;
+        if (net->init(dummy_nccl_logger) != ncclSuccess || net->devices(&sliced_ndev) != ncclSuccess || sliced_ndev != 1) {
+            fprintf(stderr, "FAIL: VXFEC_NCCL_DEV_SLICE=1/2 on 1-NIC host expected 1 device, got %d\n", sliced_ndev);
+            ok = false;
+        }
+        unsetenv("VXFEC_NCCL_DEV_SLICE");
+    }
+
+    dlclose(dl);
+    unsetenv("VXFEC_NCCL_RAILS");
+    unsetenv("VXFEC_NCCL_RAIL_WORKERS");
+    if (ok)
+        printf("PASS: 4 dedicated per-rail background TX/RX worker threads + zero-spin background completion verified\n");
+    return ok ? 0 : 1;
+}
+
+static int run_gpu_export_fd_unload_test(const char *so_path)
+{
+    int saved_stdin = dup(STDIN_FILENO);
+    int test_fd = open("/dev/null", O_RDONLY);
+    if (test_fd < 0 || dup2(test_fd, STDIN_FILENO) < 0) {
+        if (test_fd >= 0)
+            close(test_fd);
+        if (saved_stdin >= 0)
+            close(saved_stdin);
+        fprintf(stderr, "FAIL: setup for GPU export FD unload test\n");
+        return 1;
+    }
+    if (test_fd != STDIN_FILENO)
+        close(test_fd);
+
+    setenv("VXFEC_NCCL_IFNAMES", "lo", 1);
+    setenv("VXFEC_NCCL_GPU_BACKEND", "cpu", 1);
+    void *dl = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    const ncclNet_v8_t *net = dl ? dlsym(dl, "ncclNetPlugin_v8") : NULL;
+    bool ok = net && net->init(dummy_nccl_logger) == ncclSuccess;
+    if (dl && dlclose(dl) != 0)
+        ok = false;
+    ok = ok && fcntl(STDIN_FILENO, F_GETFD) >= 0;
+    unsetenv("VXFEC_NCCL_GPU_BACKEND");
+
+    if (saved_stdin >= 0) {
+        if (dup2(saved_stdin, STDIN_FILENO) < 0)
+            ok = false;
+        close(saved_stdin);
+    } else {
+        close(STDIN_FILENO);
+    }
+    if (!ok) {
+        fprintf(stderr, "FAIL: inactive GPU export caches must preserve FD zero on plugin unload\n");
+        return 1;
+    }
+    printf("PASS: inactive GPU export caches preserve FD zero on plugin unload\n");
+    return 0;
+}
+
+static int mock_hip_pointer_attribute(void *out, int attribute, void *ptr)
+{
+    if (attribute == 2)
+        *(unsigned int *)out = *(unsigned int *)ptr;
+    else if (attribute == 9)
+        *(int *)out = 3;
+    else
+        return 1;
+    return 0;
+}
+
+typedef struct {
+    int first_sync;
+    int query_status;
+    int syncs;
+    int queries;
+} mock_copy_stream_t;
+
+static int mock_copy_sync(void *stream)
+{
+    mock_copy_stream_t *s = stream;
+    return s->syncs++ == 0 ? s->first_sync : 0;
+}
+
+static int mock_copy_query(void *stream)
+{
+    mock_copy_stream_t *s = stream;
+    s->queries++;
+    return s->query_status;
+}
+
+static int run_gpu_rt_tests(void)
+{
+    mock_copy_stream_t complete = {0};
+    mock_copy_stream_t pending = {.first_sync = 999, .query_status = 600};
+    mock_copy_stream_t idle = {.first_sync = 999, .query_status = 0};
+    mock_copy_stream_t lost = {.first_sync = 999, .query_status = VXF_GPURT_CONTEXT_DESTROYED};
+    mock_copy_stream_t sticky = {.first_sync = 700, .query_status = 700};
+    if (!vxf_gpurt_finish_copy(&complete, mock_copy_sync, mock_copy_query) || complete.queries != 0 ||
+        vxf_gpurt_finish_copy(&pending, mock_copy_sync, mock_copy_query) || pending.syncs != 2 || pending.queries != 1 ||
+        vxf_gpurt_finish_copy(&idle, mock_copy_sync, mock_copy_query) || idle.syncs != 1 || idle.queries != 1 ||
+        vxf_gpurt_finish_copy(&lost, mock_copy_sync, mock_copy_query) || lost.syncs != 1 || lost.queries != 1 ||
+        vxf_gpurt_finish_copy(&sticky, mock_copy_sync, mock_copy_query) || sticky.syncs != 1 || sticky.queries != 1) {
+        fprintf(stderr, "FAIL: staged GPU copy error escaped its stream fence or lost its status\n");
+        return 1;
+    }
+    puts("PASS: staged GPU copy errors wait for the copy stream or context destruction");
+
+    unsigned int device_type = 2u, host_type = 1u;
+    int ordinal = -1;
+    if (!vxf_hip_device_ordinal(mock_hip_pointer_attribute, &device_type, &ordinal) || ordinal != 3 ||
+        vxf_hip_device_ordinal(mock_hip_pointer_attribute, &host_type, &ordinal)) {
+        fprintf(stderr, "FAIL: HIP pointer attributes misclassified device or host memory\n");
+        return 1;
+    }
+    printf("PASS: HIP device/host pointer attributes (ROCm 6/7 ABI)\n");
+
+    const char *so_path = getenv("VXFEC_NCCL_SO_PATH");
+    if (!so_path || !*so_path)
+        so_path = "./libnccl-vxfec.so";
+    if (run_gpu_export_fd_unload_test(so_path) != 0 || run_cuda_mps_guard_test(so_path) != 0)
+        return 1;
+
+    if (access("/dev/kfd", R_OK | W_OK) != 0 && access("/dev/nvidiactl", R_OK | W_OK) != 0) {
+        printf("SKIP: /dev/kfd and /dev/nvidiactl inaccessible in sandbox; skipping native HIP/CUDA runtime test\n");
+        return 0;
+    }
+
+    void *gpu_dl = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
+    if (!gpu_dl)
+        gpu_dl = dlopen("libamdhip64.so.6", RTLD_NOW | RTLD_GLOBAL);
+    if (!gpu_dl)
+        gpu_dl = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+    bool is_hip = (gpu_dl != NULL);
+    if (!gpu_dl) {
+        gpu_dl = dlopen("libcudart.so.13", RTLD_NOW | RTLD_GLOBAL);
+        if (!gpu_dl)
+            gpu_dl = dlopen("libcudart.so.12", RTLD_NOW | RTLD_GLOBAL);
+        if (!gpu_dl)
+            gpu_dl = dlopen("libcudart.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (!gpu_dl) {
+        printf("SKIP: neither ROCm HIP nor CUDA runtime installed; skipping native GPU FEC test\n");
+        return 0;
+    }
+
+    int (*dev_cnt)(int *) = dlsym(gpu_dl, is_hip ? "hipGetDeviceCount" : "cudaGetDeviceCount");
+    int (*set_dev)(int) = dlsym(gpu_dl, is_hip ? "hipSetDevice" : "cudaSetDevice");
+    int (*dev_malloc)(void **, size_t) = dlsym(gpu_dl, is_hip ? "hipMalloc" : "cudaMalloc");
+    int (*dev_free)(void *) = dlsym(gpu_dl, is_hip ? "hipFree" : "cudaFree");
+    int (*dev_memcpy)(void *, const void *, size_t, int) = dlsym(gpu_dl, is_hip ? "hipMemcpy" : "cudaMemcpy");
+    int ngpu = 0;
+    if (!dev_cnt || !set_dev || !dev_malloc || !dev_free || !dev_memcpy || dev_cnt(&ngpu) != 0 || ngpu < 1 || set_dev(0) != 0) {
+        dlclose(gpu_dl);
+        printf("SKIP: no active HIP/CUDA GPUs detected; skipping native GPU FEC test\n");
+        return 0;
+    }
+
+    setenv("VXFEC_NCCL_IFNAMES", "lo", 1);
+    setenv("VXFEC_NCCL_PORTS", "4", 1);
+    setenv("VXFEC_NCCL_RAIL_WORKERS", "2", 1);
+    unsetenv("VXFEC_NCCL_CU_COUNT");
+    setenv("VXFEC_NCCL_GPU_BACKEND", "auto", 1);
+    setenv("VXFEC_NCCL_GPU_FORCE", "1", 1);
+    unsetenv("VXFEC_NCCL_VULKAN");
+
+    void *dl = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    if (!dl) {
+        fprintf(stderr, "FAIL: dlopen(%s): %s\n", so_path, dlerror());
+        dlclose(gpu_dl);
+        return 1;
+    }
+
+    const ncclNet_v8_t *net = (const ncclNet_v8_t *)dlsym(dl, "ncclNetPlugin_v8");
+    const char *(*get_be)(void) = (const char *(*)(void))dlsym(dl, "vxfec_nccl_get_gpu_backend");
+    int (*get_sm_part)(void) = (int (*)(void))dlsym(dl, "vxfec_nccl_gpu_sm_partitioned");
+    uint32_t (*get_vk_devs)(void) = (uint32_t (*)(void))dlsym(dl, "vxfec_nccl_get_inproc_vk_devs");
+    g_test_get_stats_ex = (test_get_stats_ex_fn)dlsym(dl, "vxfec_nccl_get_stats_ex");
+    void (*reset_stats)(void) = (void (*)(void))dlsym(dl, "vxfec_nccl_reset_stats");
+    void (*set_fault)(uint32_t, uint32_t, bool) = (void (*)(uint32_t, uint32_t, bool))dlsym(dl, "vxfec_nccl_set_fault_injection");
+    void (*set_codec)(const char *) = (void (*)(const char *))dlsym(dl, "vxfec_nccl_set_codec_override");
+
+    ncclNetProperties_v8_t props = {0};
+    bool ok = net && get_be && get_sm_part && get_vk_devs && g_test_get_stats_ex && reset_stats && set_fault && set_codec &&
+              net->init(dummy_nccl_logger) == ncclSuccess && net->getProperties(0, &props) == ncclSuccess;
+    if (!ok) {
+        fprintf(stderr, "FAIL: native GPU backend init failed\n");
+        dlclose(dl);
+        dlclose(gpu_dl);
+        return 1;
+    }
+
+    const char *active_be = get_be();
+    const char *exp_be = is_hip ? "hip" : "cuda";
+    if (!active_be || strcmp(active_be, exp_be) != 0 || get_vk_devs() != 0u || (props.ptrSupport & NCCL_PTR_CUDA) == 0) {
+        fprintf(stderr, "FAIL: expected native backend '%s' with 0 VkInstances & NCCL_PTR_CUDA (got '%s', vk=%u, ptr=0x%x)\n",
+                exp_be, active_be ? active_be : "null", get_vk_devs(), props.ptrSupport);
+        dlclose(dl);
+        dlclose(gpu_dl);
+        return 1;
+    }
+
+    uint32_t (*get_rail_workers)(void) = dlsym(dl, "vxfec_nccl_active_rail_workers");
+    uint32_t (*get_reserved_units)(void) = dlsym(dl, "vxfec_nccl_gpu_reserved_units");
+    int (*get_high_priority)(void) = dlsym(dl, "vxfec_nccl_gpu_high_priority_stream");
+    if (!get_rail_workers || !get_reserved_units || !get_high_priority ||
+        (is_hip && (get_sm_part() != 0 || get_reserved_units() != 0u))) {
+        fprintf(stderr, "FAIL: native GPU stream diagnostics or default HIP priority fallback\n");
+        dlclose(dl);
+        dlclose(gpu_dl);
+        return 1;
+    }
+
+    uint8_t handle[NCCL_NET_HANDLE_MAXSIZE] = {0};
+    void *lc = NULL, *sc = NULL, *rc = NULL;
+    if (net->listen(0, handle, &lc) != ncclSuccess)
+        ok = false;
+    while (ok && (!sc || !rc)) {
+        if (!sc && net->connect(0, handle, &sc, NULL) != ncclSuccess)
+            ok = false;
+        if (ok && !rc && net->accept(lc, &rc, NULL) != ncclSuccess)
+            ok = false;
+    }
+
+    if (ok && get_rail_workers() == 0u) {
+        fprintf(stderr, "FAIL: no rail worker available for native GPU FEC tests\n");
+        ok = false;
+    }
+    if (ok && is_hip) {
+        int (*host_malloc)(void **, size_t, unsigned int) = dlsym(gpu_dl, "hipHostMalloc");
+        int (*host_free)(void *) = dlsym(gpu_dl, "hipHostFree");
+        void *host = NULL, *mr = NULL;
+        if (!host_malloc || !host_free || host_malloc(&host, 4096u, 0u) != 0 ||
+            net->regMr(sc, host, 4096u, NCCL_PTR_CUDA, &mr) != ncclInvalidArgument) {
+            fprintf(stderr, "FAIL: native HIP regMr must reject pinned host memory passed as a device pointer\n");
+            ok = false;
+        }
+        if (mr)
+            net->deregMr(sc, mr);
+        if (host)
+            host_free(host);
+    }
+    const int tested_gpus = ngpu > 1 ? 2 : 1;
+    for (int ordinal = 0; ordinal < tested_gpus && ok; ordinal++) {
+        const size_t sz = 2u * 1024u * 1024u;
+        uint8_t *h_tx = (uint8_t *)malloc(sz);
+        uint8_t *h_rx = (uint8_t *)calloc(1, sz);
+        void *d_tx = NULL, *d_rx = NULL;
+        void *mr_tx = NULL, *mr_rx = NULL;
+        if (set_dev(ordinal) != 0 || !h_tx || !h_rx || dev_malloc(&d_tx, sz) != 0 || dev_malloc(&d_rx, sz) != 0)
+            ok = false;
+
+        if (ok && (net->regMr(sc, d_tx, sz, NCCL_PTR_CUDA, &mr_tx) != ncclSuccess ||
+                   net->regMr(rc, d_rx, sz, NCCL_PTR_CUDA, &mr_rx) != ncclSuccess)) {
+            fprintf(stderr, "FAIL: native NCCL_PTR_CUDA regMr on void* device pointer failed\n");
+            ok = false;
+        }
+
+        const char *codecs[3] = {"rs8", "rq-gf2", "rq-gf256"};
+        const size_t sizes[3] = {256u * 1024u, 2u * 1024u * 1024u, 2u * 1024u * 1024u};
+        for (int c = 0; c < 3 && ok; c++) {
+            reset_stats();
+            set_codec(codecs[c]);
+            set_fault(60000u, 6u, true);
+
+            vxfec_nccl_stats_t st = {0};
+            for (int it = 0; it < 8 && ok; it++) {
+                /* distinguish stale data from another symbol, transfer, or device */
+                unsigned seed = 17u + (unsigned)(ordinal * 64 + c * 8 + it);
+                for (size_t i = 0; i < sizes[c]; i++)
+                    h_tx[i] = (uint8_t)(i * 29u + (i / 1024u) * 17u + seed);
+                memset(h_rx, 0, sizes[c]);
+                if (dev_memcpy(d_tx, h_tx, sizes[c], 1 /* HtoD */) != 0 || dev_memcpy(d_rx, h_rx, sizes[c], 1 /* HtoD */) != 0) {
+                    ok = false;
+                    break;
+                }
+
+                void *sreq = NULL, *rreq = NULL;
+                void *rptr = d_rx;
+                int rsz = (int)sizes[c];
+                int tag = 1400 + c * 16 + it;
+                if (net->irecv(rc, 1, &rptr, &rsz, &tag, &mr_rx, &rreq) != ncclSuccess ||
+                    net->isend(sc, d_tx, rsz, tag, mr_tx, &sreq) != ncclSuccess) {
+                    ok = false;
+                    break;
+                }
+                int sdone = 0, rdone = 0, got = 0;
+                while (ok && (!sdone || !rdone)) {
+                    if (!sdone && net->test(sreq, &sdone, NULL) != ncclSuccess)
+                        ok = false;
+                    if (!rdone && net->test(rreq, &rdone, &got) != ncclSuccess)
+                        ok = false;
+                }
+                if (!ok)
+                    break;
+                if (got != rsz || dev_memcpy(h_rx, d_rx, sizes[c], 2 /* DtoH */) != 0 || memcmp(h_rx, h_tx, sizes[c]) != 0) {
+                    fprintf(stderr, "FAIL: native %s device %d VRAM transfer mismatch under codec=%s (iter=%d)\n", active_be,
+                            ordinal, codecs[c], it);
+                    ok = false;
+                    break;
+                }
+                test_query_stats(&st);
+                if (st.vk_offload_calls > 0u && st.rx_fec_decodes > 0u && (is_hip || st.rx_cuda_repair_completions > 0u))
+                    break;
+            }
+            bool cuda_repairs_ok = is_hip
+                                       ? st.rx_cuda_repair_completions == 0u
+                                       : st.rx_cuda_repair_completions > 0u && st.rx_cuda_repair_completions <= st.rx_fec_decodes;
+            if (ok && (st.vk_offload_calls == 0u || st.rx_fec_decodes == 0u || !cuda_repairs_ok)) {
+                fprintf(stderr, "FAIL: native %s codec=%s GPU FEC counters (gpu_calls=%lu fec_dec=%lu cuda_rx=%lu)\n", active_be,
+                        codecs[c], (unsigned long)st.vk_offload_calls, (unsigned long)st.rx_fec_decodes,
+                        (unsigned long)st.rx_cuda_repair_completions);
+                ok = false;
+                break;
+            }
+        }
+
+        set_fault(0u, 1u, false);
+        set_codec(NULL);
+        if (mr_rx)
+            net->deregMr(rc, mr_rx);
+        if (mr_tx)
+            net->deregMr(sc, mr_tx);
+        if (d_rx)
+            (void)dev_free(d_rx);
+        if (d_tx)
+            (void)dev_free(d_tx);
+        free(h_rx);
+        free(h_tx);
+    }
+    if (sc)
+        net->closeSend(sc);
+    if (rc)
+        net->closeRecv(rc);
+    if (lc)
+        net->closeListen(lc);
+    int sm_part = get_sm_part();
+    uint32_t reserved_units = get_reserved_units();
+    int high_priority = get_high_priority();
+    dlclose(dl);
+
+    /* Also verify explicit ROCm CU-mask stream creation (VXFEC_NCCL_CU_COUNT=8) when HIP is active */
+    if (ok && is_hip) {
+        setenv("VXFEC_NCCL_CU_COUNT", "8", 1);
+        void *dl_cu = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+        const ncclNet_v8_t *net_cu = dl_cu ? (const ncclNet_v8_t *)dlsym(dl_cu, "ncclNetPlugin_v8") : NULL;
+        int (*sm_part_cu)(void) = dl_cu ? (int (*)(void))dlsym(dl_cu, "vxfec_nccl_gpu_sm_partitioned") : NULL;
+        uint32_t (*reserved_cu)(void) = dl_cu ? dlsym(dl_cu, "vxfec_nccl_gpu_reserved_units") : NULL;
+        int (*priority_cu)(void) = dl_cu ? dlsym(dl_cu, "vxfec_nccl_gpu_high_priority_stream") : NULL;
+        if (!dl_cu || !net_cu || !sm_part_cu || !reserved_cu || !priority_cu || net_cu->init(dummy_nccl_logger) != ncclSuccess ||
+            sm_part_cu() != 1 || reserved_cu() != 8u || priority_cu() != 0) {
+            fprintf(stderr, "FAIL: explicit VXFEC_NCCL_CU_COUNT=8 CU-masked HIP stream init failed\n");
+            ok = false;
+        }
+        if (dl_cu)
+            dlclose(dl_cu);
+        unsetenv("VXFEC_NCCL_CU_COUNT");
+    }
+
+    dlclose(gpu_dl);
+    unsetenv("VXFEC_NCCL_GPU_BACKEND");
+    unsetenv("VXFEC_NCCL_GPU_FORCE");
+    unsetenv("VXFEC_NCCL_RAIL_WORKERS");
+
+    if (ok) {
+        printf("PASS: native %s GPU FEC bit-exact on %d device(s) with rail workers "
+               "(partitioned=%d, reserved_units=%u, high_priority=%d)\n",
+               exp_be, tested_gpus, sm_part, reserved_units, high_priority);
+    }
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--wide-udp-fallback") == 0) {
+#ifdef UDP_SEGMENT
+        test_wide_udp = true;
+        setenv("VXFEC_NCCL_BACKEND", "udp", 1);
+        setenv("VXFEC_NCCL_IFNAMES", "=lo", 1);
+        setenv("VXFEC_NCCL_PORTS", "16", 1);
+        setenv("VXFEC_NCCL_MTU_SYM", "1280", 1);
+        setenv("VXFEC_NCCL_SLICE_KB", "0", 1);
+        setenv("VXFEC_NCCL_CWND_KB", "2048", 1);
+        setenv("VXFEC_NCCL_UDP_GSO", "1", 1);
+        setenv("VXFEC_NCCL_RAIL_WORKERS", "0", 1);
+#else
+        puts("SKIP: UDP_SEGMENT unavailable");
+        return 0;
+#endif
+    }
     if (argc == 4 && strcmp(argv[1], "--sender-child") == 0)
         return run_sender_child_mode(argv[2], atoi(argv[3]));
     if (argc == 2 && strcmp(argv[1], "--rq-async") == 0)
         return run_rq_gpu_progress_tests();
+    if (argc == 2 && strcmp(argv[1], "--rail-workers") == 0)
+        return run_rail_worker_tests();
+    if (argc == 2 && strcmp(argv[1], "--gpu-rt") == 0)
+        return run_gpu_rt_tests();
 #ifdef VXFEC_HAVE_IBVERBS
     if (argc == 2 && strcmp(argv[1], "--ibv-mock") == 0)
         return run_ibv_mock_tests();
@@ -6555,6 +8596,13 @@ int main(int argc, char **argv)
         return 0;
 #endif
 
+    if (argc == 3 && strcmp(argv[1], "--passive-worker") == 0) {
+        setenv("VXFEC_NCCL_BACKEND", "udp", 1);
+        setenv("VXFEC_NCCL_IFNAMES", "=lo", 1);
+        setenv("VXFEC_NCCL_RAILS", "1", 1);
+        setenv("VXFEC_NCCL_PORTS", "4", 1);
+        setenv("VXFEC_NCCL_VULKAN", "0", 1);
+    }
     if (!test_harq_math() || !test_ifname_filter_syntax())
         return 1;
     printf("PASS: IID parity budget, HARQ SACK/IR, SWRR math, and NCCL interface filter syntax\n");
@@ -6605,7 +8653,46 @@ int main(int argc, char **argv)
     }
     printf("Loaded plugin '%s' (dev='%s', speed=%d Mbps, ptrSupport=0x%x)\n", net->name, props.name, props.speed, props.ptrSupport);
 
-    if (!test_path_mtu_limits(net) || !test_fresh_ecn_feedback(net) || !test_low_rate_cap_and_tail_clock(net, set_cong) ||
+    if (argc == 3 && strcmp(argv[1], "--passive-worker") == 0) {
+        uint32_t (*count_workers)(void) = dlsym(dl, "vxfec_nccl_active_rail_workers");
+        uint32_t expected = (uint32_t)atoi(argv[2]);
+        ring_comms_t ring = {0};
+        bool ok = count_workers && setup_ring(net, &ring);
+        if (ok)
+            ok = count_workers() == expected;
+        if (ok)
+            ok = run_host_ring_allreduce(net, &ring, 32768, 12001);
+        if (ok) {
+            set_fault(15000u, 4u, false);
+            ok = run_host_ring_allreduce(net, &ring, 32768, 12002);
+            set_fault(0u, 1u, false);
+        }
+        if (ok)
+            ok = count_workers() == expected;
+        if (!ok)
+            fprintf(stderr, "FAIL: passive watcher count/transfer (expected %u, got %u)\n", expected,
+                    count_workers ? count_workers() : 999u);
+        teardown_ring(net, &ring);
+        dlclose(dl);
+        if (ok)
+            printf("PASS: %u workers before/after bit-exact clean and burst-loss transfers\n", expected);
+        return ok ? 0 : 1;
+    }
+#ifdef UDP_SEGMENT
+    if (test_wide_udp) {
+        set_codec("sack");
+        bool ok = test_wide_fallback(net);
+        dlclose(dl);
+        return ok ? 0 : 1;
+    }
+#endif
+    bool check_gso_fallback = false;
+#ifdef UDP_SEGMENT
+    const char *gso = getenv("VXFEC_NCCL_UDP_GSO");
+    check_gso_fallback = !gso || strcmp(gso, "0") != 0;
+#endif
+    if (!test_path_mtu_limits(net, false) || (check_gso_fallback && !test_path_mtu_limits(net, true)) ||
+        !test_fresh_ecn_feedback(net) || !test_low_rate_cap_and_tail_clock(net, set_cong) ||
         !test_lost_done_and_send_abort_and_close_listen(net, set_hs_fault, set_done_fault, set_abort_fault, set_delay)) {
         set_delay(0u);
         dlclose(dl);
@@ -6630,6 +8717,10 @@ int main(int argc, char **argv)
         goto fail;
     printf("PASS: 4-rank Ring AllReduce [0%% lossless]: 0 parity tax, %lu fast completions\n",
            (unsigned long)st_a.rx_fast_completions);
+    if (!test_send_histogram(dl, net, &ring)) {
+        fprintf(stderr, "FAIL: send request size histogram\n");
+        goto fail;
+    }
 
     /* Scenario B: Out-of-order ECMP + sparse 0.3% single-packet drops -> SACK */
     reset_stats();
@@ -6728,6 +8819,9 @@ int main(int argc, char **argv)
         goto fail;
 
     if (!test_zero_rtt_proactive_fec_repair(net, get_stats, reset_stats, set_codec))
+        goto fail;
+
+    if (!test_paired_systematic_loss(dl, net, reset_stats, set_codec))
         goto fail;
 
     if (!test_paced_recovery_and_cwnd_bounds(net, get_stats, reset_stats, set_fault, set_cong, set_codec))

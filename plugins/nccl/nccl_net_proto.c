@@ -3,6 +3,24 @@
 
 static const vxfec_req_kind_t g_flush_sentinel = VXFEC_REQ_FLUSH;
 
+static inline void tx_mark_ureq_done_locked(vxfec_send_comm_t *comm, vxfec_tx_user_req_t *ureq)
+{
+    if (!atomic_load_explicit(&ureq->done, memory_order_relaxed)) {
+        atomic_store_explicit(&ureq->done, true, memory_order_release);
+        if (comm && atomic_load_explicit(&comm->active_reqs, memory_order_relaxed) > 0u)
+            atomic_fetch_sub_explicit(&comm->active_reqs, 1u, memory_order_acq_rel);
+    }
+}
+
+static inline void rx_mark_req_done_locked(vxfec_recv_comm_t *comm, vxfec_rx_req_t *req)
+{
+    if (!atomic_load_explicit(&req->done, memory_order_relaxed)) {
+        atomic_store_explicit(&req->done, true, memory_order_release);
+        if (comm && atomic_load_explicit(&comm->active_reqs, memory_order_relaxed) > 0u)
+            atomic_fetch_sub_explicit(&comm->active_reqs, 1u, memory_order_acq_rel);
+    }
+}
+
 void vxf_tag_map_free(vxfec_tag_map_t *map)
 {
     if (map->slots && map->slots != map->inline_slots)
@@ -76,16 +94,20 @@ uint32_t vxf_peek_tag_seq(const vxfec_tag_map_t *map, uint32_t tag)
 }
 
 /* O(1) open-addressed msg_seq -> slot index hash helpers (Knuth Algorithm R deletion) */
-static void tx_hash_insert(vxfec_send_comm_t *comm, uint32_t slot_idx, uint32_t msg_seq)
+static void slot_hash_insert(int16_t *table, uint32_t mask, uint32_t slot_idx, uint32_t msg_seq)
 {
-    const uint32_t mask = VXFEC_TX_HASH_SLOTS - 1u;
     uint32_t h = (msg_seq * 0x9E3779B1u) & mask;
-    while (comm->tx_seq_hash[h] >= 0) {
-        if ((uint32_t)comm->tx_seq_hash[h] == slot_idx)
+    while (table[h] >= 0) {
+        if ((uint32_t)table[h] == slot_idx)
             return;
         h = (h + 1u) & mask;
     }
-    comm->tx_seq_hash[h] = (int16_t)slot_idx;
+    table[h] = (int16_t)slot_idx;
+}
+
+static void tx_hash_insert(vxfec_send_comm_t *comm, uint32_t slot_idx, uint32_t msg_seq)
+{
+    slot_hash_insert(comm->tx_seq_hash, VXFEC_TX_HASH_SLOTS - 1u, slot_idx, msg_seq);
 }
 
 static vxfec_tx_slot_t *tx_hash_lookup(vxfec_send_comm_t *comm, uint32_t msg_seq)
@@ -137,14 +159,7 @@ static void tx_hash_remove(vxfec_send_comm_t *comm, uint32_t slot_idx, uint32_t 
 
 static void rx_hash_insert(vxfec_recv_comm_t *comm, uint32_t slot_idx, uint32_t msg_seq)
 {
-    const uint32_t mask = VXFEC_RX_HASH_SLOTS - 1u;
-    uint32_t h = (msg_seq * 0x9E3779B1u) & mask;
-    while (comm->msg_seq_hash[h] >= 0) {
-        if ((uint32_t)comm->msg_seq_hash[h] == slot_idx)
-            return;
-        h = (h + 1u) & mask;
-    }
-    comm->msg_seq_hash[h] = (int16_t)slot_idx;
+    slot_hash_insert(comm->msg_seq_hash, VXFEC_RX_HASH_SLOTS - 1u, slot_idx, msg_seq);
 }
 
 static vxfec_rx_slot_t *rx_hash_lookup(vxfec_recv_comm_t *comm, uint32_t msg_seq)
@@ -198,24 +213,34 @@ uint16_t vxf_tx_path_sym_limit(const vxfec_send_comm_t *comm)
 {
     const vxfec_nic_dev_t *d =
         (comm->dev_idx >= 0 && (uint32_t)comm->dev_idx < vxf_num_devs) ? &vxf_devs[comm->dev_idx] : &vxf_devs[0];
-    uint32_t limit = VXFEC_MAX_SYM_T;
+    uint32_t cfg_sym = atomic_load_explicit(&vxf_cfg_mtu_sym, memory_order_relaxed);
     uint8_t active_feat = comm->connected ? comm->features : comm->hello.features;
     size_t wire_hdr_bytes = (active_feat & VXFEC_HELLO_SLICE) ? sizeof(vxfec_wire_hdr_ext_t) : sizeof(vxfec_wire_hdr_t);
 
+    uint32_t ibv_limit = 0u;
     if (comm->ibv_ep && !comm->ibv_failed) {
-        uint32_t imtu = vxfec_ibv_ep_path_mtu(comm->ibv_ep);
-        if (imtu == 0u)
-            imtu = d->mtu ? d->mtu : 4096u;
-        uint32_t hdr_rsv = (wire_hdr_bytes > 80u) ? (uint32_t)wire_hdr_bytes : 80u;
-        if (imtu <= hdr_rsv)
+        uint32_t limit = VXFEC_MAX_SYM_T;
+        uint32_t peer_cap = comm->connected ? vxfec_ibv_ep_peer_max_recv(comm->ibv_ep) : VXFEC_IBV_MAX_PKT_BYTES;
+        if (peer_cap == 0u)
+            peer_cap = vxfec_ibv_ep_path_mtu(comm->ibv_ep);
+        if (peer_cap == 0u)
+            peer_cap = d->mtu ? d->mtu : 4096u;
+        uint32_t hdr_rsv =
+            (peer_cap > 4096u) ? (uint32_t)wire_hdr_bytes : ((wire_hdr_bytes > 80u) ? (uint32_t)wire_hdr_bytes : 80u);
+        if (peer_cap <= hdr_rsv)
             return 0u;
-        uint32_t ibv_cap = (imtu - hdr_rsv) & ~15u;
+        uint32_t ibv_cap = (peer_cap - hdr_rsv) & ~15u;
         if (ibv_cap < limit)
             limit = ibv_cap;
         if (!vxfec_ibv_ep_tx_is_hdr_only(comm->ibv_ep))
             return (uint16_t)(limit & ~15u);
+        ibv_limit = limit & ~15u;
     }
 
+    uint32_t limit =
+        (cfg_sym > VXFEC_UDP_MAX_SYM_T) ? ((cfg_sym < VXFEC_MAX_SYM_T) ? cfg_sym : VXFEC_MAX_SYM_T) : VXFEC_UDP_MAX_SYM_T;
+    if (ibv_limit > 0u && ibv_limit < limit)
+        limit = ibv_limit;
     const int headers = (int)(sizeof(struct iphdr) + sizeof(struct udphdr) + wire_hdr_bytes);
     if (!d->is_ibv && d->mtu > 0u && d->mtu < 9000u) {
         if (d->mtu <= (uint32_t)headers)
@@ -239,7 +264,7 @@ uint16_t vxf_tx_path_sym_limit(const vxfec_send_comm_t *comm)
     return (uint16_t)(limit & ~15u);
 }
 
-static uint16_t get_cfg_sym_t(uint32_t total_bytes, uint16_t path_limit)
+static uint16_t get_cfg_sym_t(uint32_t total_bytes, uint16_t path_limit, bool ibv_zc)
 {
     uint32_t cfg = atomic_load_explicit(&vxf_cfg_mtu_sym, memory_order_relaxed);
     if (path_limit == 0u)
@@ -248,10 +273,19 @@ static uint16_t get_cfg_sym_t(uint32_t total_bytes, uint16_t path_limit)
         return (uint16_t)((cfg < path_limit) ? cfg : path_limit);
 
     uint32_t t = VXFEC_DEF_SYM_T;
-    if (total_bytes >= 1024u * 1024u)
-        t = 8192u;
-    else if (total_bytes >= 320u * 1024u)
-        t = 4096u;
+    if (ibv_zc) {
+        if (total_bytes >= 1024u * 1024u)
+            t = 32768u;
+        else if (total_bytes >= 512u * 1024u)
+            t = 16384u;
+        else if (total_bytes >= 128u * 1024u)
+            t = 4096u;
+    } else {
+        if (total_bytes >= 1024u * 1024u)
+            t = 8192u;
+        else if (total_bytes >= 320u * 1024u)
+            t = 4096u;
+    }
     if (t > path_limit)
         t = path_limit;
     while (t < path_limit && (((uint64_t)total_bytes + t - 1u) / t) > 56000u)
@@ -311,24 +345,55 @@ static inline uint32_t pack_rdma_imm(bool is_sliced, uint8_t rslot, uint8_t toke
     uint32_t hi = ((is_sliced ? 1u : 0u) << 31u) | (((uint32_t)rslot & 0x3fu) << 25u) | (((uint32_t)token & 0x7u) << 22u) |
                   ((need_ack ? 1u : 0u) << 21u);
     if (is_sliced)
-        return hi | (((uint32_t)gen_idx & 0x3fffu) << 7u) | (esi & 0x7fu);
+        return hi | (((uint32_t)gen_idx & 0x1fffu) << 7u) | (esi & 0x7fu);
     return hi | (esi & 0x1fffffu);
 }
 
-static inline void unpack_rdma_imm(uint32_t imm, bool *out_sliced, uint8_t *out_rslot, uint8_t *out_token, bool *out_need_ack,
-                                   uint16_t *out_gen_idx, uint32_t *out_esi)
+static inline uint32_t pack_rdma_repair_imm(uint8_t rslot, uint8_t token, bool need_ack, uint8_t rep_slot, uint16_t gen_idx,
+                                            uint32_t rep_ord)
 {
-    bool sliced = (imm >> 31u) != 0u;
-    *out_sliced = sliced;
+    uint32_t hi = (1u << 31u) | (((uint32_t)rslot & 0x3fu) << 25u) | (((uint32_t)token & 0x7u) << 22u) |
+                  ((need_ack ? 1u : 0u) << 21u) | (1u << 20u);
+    return hi | (((uint32_t)rep_slot & 0xffu) << 12u) | (((uint32_t)gen_idx & 0x3fu) << 6u) | (rep_ord & 0x3fu);
+}
+
+static inline void unpack_rdma_imm(uint32_t imm, uint8_t features, bool *out_sliced, bool *out_is_repair, uint8_t *out_rslot,
+                                   uint8_t *out_token, bool *out_need_ack, uint8_t *out_rep_slot, uint16_t *out_gen_idx,
+                                   uint32_t *out_esi_or_ord)
+{
+    bool ext = (imm >> 31u) != 0u;
     *out_rslot = (uint8_t)((imm >> 25u) & 0x3fu);
     *out_token = (uint8_t)((imm >> 22u) & 0x7u);
     *out_need_ack = ((imm >> 21u) & 1u) != 0u;
-    if (sliced) {
-        *out_gen_idx = (uint16_t)((imm >> 7u) & 0x3fffu);
-        *out_esi = imm & 0x7fu;
-    } else {
+    if (!ext) {
+        *out_sliced = false;
+        *out_is_repair = false;
+        *out_rep_slot = 0u;
         *out_gen_idx = 0u;
-        *out_esi = imm & 0x1fffffu;
+        *out_esi_or_ord = imm & 0x1fffffu;
+    } else if ((features & VXFEC_HELLO_RDMA_REPAIR) && ((imm >> 20u) & 1u) != 0u) {
+        *out_sliced = false;
+        *out_is_repair = true;
+        *out_rep_slot = (uint8_t)((imm >> 12u) & 0xffu);
+        *out_gen_idx = (uint16_t)((imm >> 6u) & 0x3fu);
+        *out_esi_or_ord = imm & 0x3fu;
+    } else {
+        *out_sliced = true;
+        *out_is_repair = false;
+        *out_rep_slot = 0u;
+        /* Legacy sliced peers use bit 20 for the high generation bit. */
+        *out_gen_idx = (uint16_t)((imm >> 7u) & 0x3fffu);
+        *out_esi_or_ord = imm & 0x7fu;
+    }
+}
+
+static void free_zc_gpu_job_list(vxfec_gpu_job_t *head)
+{
+    while (head) {
+        vxfec_gpu_job_t *j = head;
+        head = j->next;
+        j->next = NULL;
+        vxf_gpu_job_free(j);
     }
 }
 
@@ -336,12 +401,25 @@ void vxf_free_ureq_zc_jobs(vxfec_tx_user_req_t *ureq)
 {
     if (!ureq)
         return;
-    while (ureq->zc_gpu_head) {
-        vxfec_gpu_job_t *j = ureq->zc_gpu_head;
-        ureq->zc_gpu_head = j->next;
-        j->next = NULL;
-        vxf_gpu_job_free(j);
+    vxfec_gpu_job_t *head = ureq->zc_gpu_head;
+    ureq->zc_gpu_head = NULL;
+    free_zc_gpu_job_list(head);
+}
+
+static void tx_release_gpu_repair(vxfec_tx_slot_t *req)
+{
+    vxfec_gpu_job_t *job = req->tx_gpu;
+    if (!job)
+        return;
+    if (req->tx_gpu_ibv_posted) {
+        /* A posted prefix still owns the output even if DONE or an error stopped the paced send. */
+        job->next = req->parent->zc_gpu_head;
+        req->parent->zc_gpu_head = job;
+    } else {
+        vxf_gpu_job_free(job);
     }
+    req->tx_gpu = NULL;
+    req->tx_gpu_ibv_posted = false;
 }
 
 static uint32_t wire_flags_ir_slack(uint8_t flags, uint32_t K)
@@ -355,22 +433,33 @@ static uint32_t wire_flags_ir_slack(uint8_t flags, uint32_t K)
 
 void vxf_init_send_comm_pacer(vxfec_send_comm_t *sc, uint64_t now_ns)
 {
+    const vxfec_nic_dev_t *d = (sc->dev_idx >= 0 && (uint32_t)sc->dev_idx < vxf_num_devs) ? &vxf_devs[sc->dev_idx] : &vxf_devs[0];
+    bool is_ibv = (sc->ibv_ep != NULL && !sc->ibv_failed);
     uint32_t rmem = atomic_load_explicit(&vxf_granted_rcvbuf, memory_order_relaxed);
-    uint64_t init_cwnd = (rmem >= 16u * 1024u * 1024u) ? (8ULL * 1024ULL * 1024ULL) : (2ULL * 1024ULL * 1024ULL);
-    uint64_t max_cwnd = (rmem >= 16u * 1024u * 1024u) ? (32ULL * 1024ULL * 1024ULL) : (16ULL * 1024ULL * 1024ULL);
-    const char *cwnd_s = getenv("VXFEC_NCCL_CWND_KB");
-    if (cwnd_s && *cwnd_s) {
-        long kb = atol(cwnd_s);
-        if (kb >= 16) {
-            init_cwnd = (uint64_t)kb * 1024ULL;
-            max_cwnd = (init_cwnd > 8ULL * 1024ULL * 1024ULL) ? init_cwnd : (8ULL * 1024ULL * 1024ULL);
-        }
+    uint64_t init_cwnd = is_ibv ? (8ULL * 1024ULL * 1024ULL)
+                                : ((rmem >= 16u * 1024u * 1024u) ? (8ULL * 1024ULL * 1024ULL) : (2ULL * 1024ULL * 1024ULL));
+    uint64_t max_cwnd = is_ibv ? (16ULL * 1024ULL * 1024ULL)
+                               : ((rmem >= 16u * 1024u * 1024u) ? (32ULL * 1024ULL * 1024ULL) : (16ULL * 1024ULL * 1024ULL));
+    uint64_t cwnd_kb = atomic_load_explicit(&vxf_cfg_cwnd_kb, memory_order_relaxed);
+#if VXFEC_ENABLE_SIM
+    {
+        const char *cwnd_s = getenv("VXFEC_NCCL_CWND_KB");
+        long dyn_kb = (cwnd_s && *cwnd_s) ? atol(cwnd_s) : 0L;
+        cwnd_kb = (dyn_kb >= 16L) ? (uint64_t)dyn_kb : 0ULL;
+    }
+#endif
+    bool has_cwnd_ovr = false;
+    if (cwnd_kb >= 16ULL) {
+        init_cwnd = cwnd_kb * 1024ULL;
+        max_cwnd = (init_cwnd > 8ULL * 1024ULL * 1024ULL) ? init_cwnd : (8ULL * 1024ULL * 1024ULL);
+        has_cwnd_ovr = true;
     }
 
     uint64_t max_rate_mbps = vxf_sim_rate_cap_mbps();
     if (max_rate_mbps == 0u) {
-        const char *rate_s = getenv("VXFEC_NCCL_MAX_RATE_MBPS");
-        max_rate_mbps = (rate_s && *rate_s && atol(rate_s) > 0) ? (uint64_t)atol(rate_s) : 400000ULL;
+        uint64_t cfg_rate = atomic_load_explicit(&vxf_cfg_max_rate_mbps, memory_order_relaxed);
+        uint64_t def_rate = (is_ibv && d && d->speed_mbps > 400000ULL) ? d->speed_mbps : 400000ULL;
+        max_rate_mbps = (cfg_rate > 0ULL) ? cfg_rate : def_rate;
     }
     uint64_t max_rate_Bps = max_rate_mbps * 125000ULL;
     uint64_t min_rate_Bps = 25ULL * 1000ULL * 1000ULL;
@@ -378,15 +467,44 @@ void vxf_init_send_comm_pacer(vxfec_send_comm_t *sc, uint64_t now_ns)
         min_rate_Bps = (max_rate_Bps >= 4u) ? (max_rate_Bps / 4u) : 1u;
 
     uint64_t target_qdelay_ns = 2500000ULL;
-    const char *qd_s = getenv("VXFEC_NCCL_TARGET_QDELAY_US");
-    if (qd_s && *qd_s) {
-        long us = atol(qd_s);
-        target_qdelay_ns = (us > 0) ? ((uint64_t)us * 1000ULL) : 0ULL;
-    }
+    int64_t qd_us = atomic_load_explicit(&vxf_cfg_target_qdelay_us, memory_order_relaxed);
+    if (qd_us >= 0)
+        target_qdelay_ns = (qd_us > 0) ? ((uint64_t)qd_us * 1000ULL) : 0ULL;
 
     harq_pacer_init(&sc->pacer, init_cwnd, 32ULL * 1024ULL, max_cwnd, min_rate_Bps, max_rate_Bps, target_qdelay_ns, now_ns);
+    if (!is_ibv && !has_cwnd_ovr && rmem > 0u && rmem < 2u * 1024u * 1024u && max_rate_Bps < 2000000000ULL) {
+        uint32_t eff_socks = (sc->num_ports > 0u) ? ((sc->num_ports < 4u) ? sc->num_ports : 4u) : 1u;
+        uint64_t rmem_cwnd = (uint64_t)(rmem / 2u) * eff_socks;
+        if (rmem_cwnd < 131072ULL)
+            rmem_cwnd = 131072ULL;
+        if (rmem_cwnd < sc->pacer.cwnd_bytes)
+            sc->pacer.cwnd_bytes = rmem_cwnd;
+        if (rmem_cwnd * 2ULL < sc->pacer.max_cwnd_bytes)
+            sc->pacer.max_cwnd_bytes = rmem_cwnd * 2ULL;
+    }
+    if (max_rate_Bps < 2000000000ULL) {
+        uint64_t rate_burst = max_rate_Bps / 2000ULL;
+        if (rate_burst < 65536ULL)
+            rate_burst = 65536ULL;
+        if (!is_ibv && rmem > 0u && (uint64_t)rmem / 2u >= 65536ULL && rate_burst > (uint64_t)rmem / 2u)
+            rate_burst = (uint64_t)rmem / 2u;
+        if (rate_burst < sc->pacer.max_burst_bytes)
+            sc->pacer.max_burst_bytes = rate_burst;
+    } else if (is_ibv && !has_cwnd_ovr) {
+        sc->pacer.max_burst_bytes = 8ULL * 1024ULL * 1024ULL;
+    }
+    {
+        uint64_t init_tok = (sc->pacer.cwnd_bytes < sc->pacer.max_burst_bytes) ? sc->pacer.cwnd_bytes : sc->pacer.max_burst_bytes;
+        sc->pacer.tokens_bytes = (double)init_tok;
+    }
+    if (vxf_sim_delay_ns() == 0u && sc->hs_rtt_ns > 0u) {
+        sc->pacer.srtt_ns = sc->hs_rtt_ns;
+        sc->pacer.min_rtt_ns = sc->hs_rtt_ns;
+        sc->pacer.min_rtt_stamp_ns = now_ns;
+    }
     for (uint32_t i = 0; i < VXFEC_MAX_PORTS; i++)
         sc->port_weights[i] = VXFEC_PORT_WEIGHT_MAX;
+    sc->loss_evicted_mask = 0u;
     sc->has_nonuniform_weights = false;
     sc->cfg_epoch = vxf_sim_epoch();
 }
@@ -395,7 +513,7 @@ static bool ensure_tx_host_ptr(vxfec_tx_slot_t *req)
 {
     if (req->src_host || req->total_bytes == 0u)
         return true;
-    if (!req->mr || req->mr->ptr_type != NCCL_PTR_CUDA || !req->mr->vk_buf)
+    if (!req->mr || req->mr->ptr_type != NCCL_PTR_CUDA || !vxf_mr_can_gpu_rw(req->mr))
         return false;
     req->bounce_buf = (uint8_t *)malloc(req->total_bytes);
     if (!req->bounce_buf)
@@ -569,40 +687,125 @@ static uint64_t clamp_u64(uint64_t v, uint64_t lo, uint64_t hi)
 static uint64_t tx_tail_rto_ns(const vxfec_send_comm_t *comm)
 {
     uint64_t srtt = (comm && comm->pacer.srtt_ns > 0u) ? comm->pacer.srtt_ns : 250000ULL;
-    return clamp_u64(2ULL * srtt + 250000ULL, 500000ULL, 50000000ULL);
+#if VXFEC_ENABLE_SIM
+    if ((!comm || comm->pacer.srtt_ns == 0u) && vxf_sim_delay_ns() > 0u)
+        srtt = 2ULL * vxf_sim_delay_ns();
+#endif
+    uint64_t hi = (srtt > 15000000ULL) ? 250000000ULL : 50000000ULL;
+    return clamp_u64(2ULL * srtt + 250000ULL, 500000ULL, hi);
 }
 
 static uint64_t rx_reorder_grace_ns(const vxfec_recv_comm_t *comm)
 {
     uint64_t srtt = (comm && comm->peer_srtt_ns > 0u) ? comm->peer_srtt_ns : 200000ULL;
+    if (srtt > 15000000ULL)
+        return clamp_u64((srtt * 4ULL) / 5ULL, 50000ULL, 35000000ULL);
     return clamp_u64(srtt / 2ULL, 50000ULL, 2000000ULL);
 }
 
 static uint64_t rx_fb_cooldown_ns(const vxfec_recv_comm_t *comm)
 {
     uint64_t srtt = (comm && comm->peer_srtt_ns > 0u) ? comm->peer_srtt_ns : 200000ULL;
-    return clamp_u64(srtt + (srtt >> 1u), 200000ULL, 20000000ULL);
+    uint64_t hi = (srtt > 15000000ULL) ? 150000000ULL : 20000000ULL;
+    return clamp_u64(srtt + (srtt >> 1u), 200000ULL, hi);
 }
 
 static uint64_t rx_idle_tail_ns(const vxfec_recv_comm_t *comm)
 {
     uint64_t srtt = (comm && comm->peer_srtt_ns > 0u) ? comm->peer_srtt_ns : 200000ULL;
-    return clamp_u64(2ULL * srtt + 200000ULL, 400000ULL, 25000000ULL);
+    uint64_t hi = (srtt > 15000000ULL) ? 200000000ULL : 25000000ULL;
+    return clamp_u64(2ULL * srtt + 200000ULL, 400000ULL, hi);
 }
 
 /* match SACK feedback floor (200 us) for fair Go-Back-N baseline comparisons */
 static uint64_t rx_gbn_cooldown_ns(const vxfec_recv_comm_t *comm)
 {
     uint64_t srtt = (comm && comm->peer_srtt_ns > 0u) ? comm->peer_srtt_ns : 200000ULL;
-    return clamp_u64(srtt + (srtt >> 1u), 200000ULL, 20000000ULL);
+    uint64_t hi = (srtt > 15000000ULL) ? 150000000ULL : 20000000ULL;
+    return clamp_u64(srtt + (srtt >> 1u), 200000ULL, hi);
+}
+
+/* The contiguous mmsghdr array is followed by iovec pairs and wire headers. */
+_Static_assert(_Alignof(struct mmsghdr) >= _Alignof(struct iovec) && _Alignof(struct iovec) >= _Alignof(vxfec_wire_hdr_ext_t),
+               "UDP batch alignment");
+static vxfec_tx_udp_batch_t *alloc_tx_udp_batch(uint32_t capacity)
+{
+    vxfec_tx_udp_batch_t *ub;
+    size_t per_packet = sizeof(ub->msgs[0]) + sizeof(ub->iovs[0]) + sizeof(ub->hdrs[0]);
+    ub = calloc(1, sizeof(*ub) + capacity * per_packet);
+    if (ub) {
+        ub->capacity = capacity;
+        ub->iovs = (void *)(ub->msgs + capacity);
+        ub->hdrs = (void *)(ub->iovs + capacity);
+    }
+    return ub;
 }
 
 static vxfec_tx_udp_batch_t *ensure_tx_udp_batch(vxfec_send_comm_t *comm)
 {
-    if (!comm->tx_udp)
-        comm->tx_udp = (vxfec_tx_udp_batch_t *)calloc(1, sizeof(*comm->tx_udp));
+    if (!comm->tx_udp) {
+        comm->tx_udp = alloc_tx_udp_batch(VXFEC_UDP_TX_BATCH);
+        const char *gso = getenv("VXFEC_NCCL_UDP_GSO");
+        if (comm->tx_udp && gso && strcmp(gso, "0") == 0)
+            comm->tx_udp->gso_disabled = true;
+    }
     return comm->tx_udp;
 }
+
+#ifdef UDP_SEGMENT
+/* Each segment retains its own wire header and payload. Linux permits a shorter
+ * final segment and limits the aggregate to one IPv4 UDP payload. */
+static unsigned tx_send_gso(int fd, struct mmsghdr *msgs, unsigned count, vxfec_tx_udp_batch_t *ub)
+{
+    if (count < 2u || ub->gso_disabled || msgs[0].msg_hdr.msg_controllen)
+        return 0u;
+
+    enum { MAX_SEGMENTS = 64, MAX_PAYLOAD = UINT16_MAX - sizeof(struct iphdr) - sizeof(struct udphdr) };
+    struct iovec iovs[2 * MAX_SEGMENTS];
+    size_t niov = 0, total = 0;
+    uint16_t segment = 0;
+    unsigned grouped = 0;
+    while (grouped < count && grouped < MAX_SEGMENTS) {
+        const struct msghdr *hdr = &msgs[grouped].msg_hdr;
+        /* Send marked packets conventionally to retain their individual ECN. */
+        if (hdr->msg_controllen || hdr->msg_iovlen != 2u)
+            break;
+        size_t len = hdr->msg_iov[0].iov_len + hdr->msg_iov[1].iov_len;
+        if (total + len > MAX_PAYLOAD || (grouped && len > segment))
+            break;
+        if (!grouped)
+            segment = (uint16_t)len;
+        iovs[niov++] = hdr->msg_iov[0];
+        iovs[niov++] = hdr->msg_iov[1];
+        total += len;
+        grouped++;
+        if (len < segment)
+            break;
+    }
+    if (grouped < 2u)
+        return 0u;
+
+    _Alignas(struct cmsghdr) uint8_t ctrl[CMSG_SPACE(sizeof(segment))] = {0};
+    struct mmsghdr aggregate = {.msg_hdr = msgs[0].msg_hdr};
+    aggregate.msg_hdr.msg_iov = iovs;
+    aggregate.msg_hdr.msg_iovlen = niov;
+    aggregate.msg_hdr.msg_control = ctrl;
+    aggregate.msg_hdr.msg_controllen = sizeof(ctrl);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&aggregate.msg_hdr);
+    cmsg->cmsg_level = IPPROTO_UDP;
+    cmsg->cmsg_type = UDP_SEGMENT;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(segment));
+    memcpy(CMSG_DATA(cmsg), &segment, sizeof(segment));
+
+    if (sendmmsg(fd, &aggregate, 1u, MSG_DONTWAIT) == 1) {
+        ub->gso_datagrams += grouped;
+        return grouped;
+    }
+    if (errno == ENOPROTOOPT || errno == EOPNOTSUPP || errno == EINVAL || errno == EIO)
+        ub->gso_disabled = true;
+    return 0u;
+}
+#endif
 
 static bool tx_send_batches(vxfec_tx_slot_t *req, vxfec_tx_udp_batch_t *ub, const uint8_t *pkt_ports, const uint8_t *pkt_niov,
                             const bool *pkt_ecn, uint32_t n_valid, const uint32_t *port_cnt)
@@ -612,11 +815,13 @@ static bool tx_send_batches(vxfec_tx_slot_t *req, vxfec_tx_udp_batch_t *ub, cons
     vxfec_send_comm_t *comm = req->comm;
     uint32_t port_off[VXFEC_MAX_PORTS] = {0};
     uint32_t port_cur[VXFEC_MAX_PORTS] = {0};
-    uint32_t acc = 0u;
+    uint32_t acc = 0u, max_port_count = 0u;
     for (uint32_t p = 0; p < comm->num_ports; p++) {
         port_off[p] = acc;
         port_cur[p] = acc;
         acc += port_cnt[p];
+        if (port_cnt[p] > max_port_count)
+            max_port_count = port_cnt[p];
     }
     for (uint32_t i = 0; i < n_valid; i++) {
         uint32_t p = pkt_ports[i];
@@ -635,29 +840,59 @@ static bool tx_send_batches(vxfec_tx_slot_t *req, vxfec_tx_udp_batch_t *ub, cons
         mm->msg_hdr.msg_iovlen = pkt_niov[i];
     }
 
-    for (uint32_t p = 0; p < comm->num_ports; p++) {
-        if (port_cnt[p] == 0u)
-            continue;
-        if (comm->fds[p] < 0)
-            return false;
-        uint32_t off = 0u;
-        while (off < port_cnt[p]) {
-            int sent = sendmmsg(comm->fds[p], ub->msgs + port_off[p] + off, port_cnt[p] - off, MSG_DONTWAIT);
-            if (sent > 0) {
-                off += (uint32_t)sent;
+    uint32_t done[VXFEC_MAX_PORTS] = {0};
+    uint32_t width = n_valid;
+#ifdef UDP_SEGMENT
+    bool wide = n_valid > VXFEC_UDP_TX_BATCH;
+submit_windows:
+#endif
+    for (uint32_t start = 0; start < max_port_count; start += width) {
+        for (uint32_t p = 0; p < comm->num_ports; p++) {
+            uint32_t end = port_cnt[p] < start + width ? port_cnt[p] : start + width;
+            if (done[p] >= end)
                 continue;
-            }
-            if (sent < 0 && errno == EINTR)
-                continue;
-            req->ack_probe_tx_ns = 0u;
-            if (sent < 0 && errno == EMSGSIZE) {
-                uint16_t refreshed = vxf_tx_path_sym_limit(comm);
-                if (refreshed >= req->sym_T)
-                    refreshed = (req->sym_T > 64u) ? (uint16_t)((req->sym_T - 64u) & ~15u) : 0u;
-                comm->path_sym_limit = refreshed;
+            if (comm->fds[p] < 0)
                 return false;
+            while (done[p] < end) {
+                struct mmsghdr *msgs = ub->msgs + port_off[p] + done[p];
+                unsigned count = end - done[p];
+                int sent = 0;
+#ifdef UDP_SEGMENT
+                bool try_gso = (count >= 2u && !ub->gso_disabled && !msgs[0].msg_hdr.msg_controllen);
+                sent = try_gso ? (int)tx_send_gso(comm->fds[p], msgs, count, ub) : 0;
+                if (!sent && wide && try_gso) {
+                    /* Resume at the first unsent packet of each original 128-symbol
+                     * window. A transient failure can only skip the rest of that
+                     * port in this window, just as on the ordinary UDP path. */
+                    width = VXFEC_UDP_TX_BATCH / comm->num_ports;
+                    wide = false;
+                    goto submit_windows;
+                }
+#endif
+                if (!sent)
+                    sent = sendmmsg(comm->fds[p], msgs, count, MSG_DONTWAIT);
+                if (sent > 0) {
+                    if (req->total_bytes > 0u) {
+                        atomic_fetch_add_explicit(&vxf_st_tx_udp_payload_pkts, (uint32_t)sent, memory_order_relaxed);
+                        uint32_t total = (uint32_t)req->tx_qp_pkts[p] + (uint32_t)sent;
+                        req->tx_qp_pkts[p] = total > UINT16_MAX ? UINT16_MAX : (uint16_t)total;
+                    }
+                    done[p] += (uint32_t)sent;
+                    continue;
+                }
+                if (sent < 0 && errno == EINTR)
+                    continue;
+                req->ack_probe_tx_ns = 0u;
+                if (sent < 0 && errno == EMSGSIZE) {
+                    uint16_t refreshed = vxf_tx_path_sym_limit(comm);
+                    if (refreshed >= req->sym_T)
+                        refreshed = (req->sym_T > 64u) ? (uint16_t)((req->sym_T - 64u) & ~15u) : 0u;
+                    comm->path_sym_limit = refreshed;
+                    return false;
+                }
+                done[p] = end;
+                break;
             }
-            break;
         }
     }
     return true;
@@ -708,11 +943,105 @@ static void tx_send_pkt_single(vxfec_send_comm_t *comm, const void *hdr, size_t 
 
 static bool tx_send_ctrl_wire_hdr(vxfec_send_comm_t *comm, const void *hdr, size_t hdr_len);
 
+static bool tx_ibv_wait_seq_done(vxfec_ibv_ep_t *ep, const uint64_t fseq[VXFEC_IBV_MAX_QPS])
+{
+    if (vxfec_ibv_ep_tx_done(ep, fseq))
+        return true;
+    if (!ep || vxfec_ibv_ep_has_error(ep))
+        return false;
+    uint64_t deadline = mono_ns() + 250000000ULL;
+    for (uint32_t spin = 0u;; spin++) {
+        if (vxfec_ibv_ep_tx_done(ep, fseq))
+            return true;
+        if (vxfec_ibv_ep_has_error(ep) || mono_ns() >= deadline)
+            return false;
+        if ((spin & 255u) == 255u)
+            sched_yield();
+    }
+}
+
 static bool tx_ibv_flush_qp_for_space(vxfec_ibv_ep_t *ep, uint32_t qp_idx)
 {
     uint64_t qseq[VXFEC_IBV_MAX_QPS] = {0};
     vxfec_ibv_ep_record_qp_tail(ep, qp_idx, qseq);
-    return vxfec_ibv_ep_tx_done(ep, qseq);
+    return tx_ibv_wait_seq_done(ep, qseq);
+}
+
+static bool rx_ibv_ensure_rep_mr(vxfec_recv_comm_t *comm)
+{
+    if (comm->ibv_rep_mr && comm->ibv_rep_buf)
+        return true;
+    if (!comm->ibv_ref || !comm->ibv_ref->ctx)
+        return false;
+    size_t sz = (size_t)VXFEC_RX_IBV_REP_SLOTS * VXFEC_MAX_SYM_T;
+    if (!comm->ibv_rep_buf && posix_memalign((void **)&comm->ibv_rep_buf, 4096u, sz) != 0) {
+        comm->ibv_rep_buf = NULL;
+        return false;
+    }
+    comm->ibv_rep_mr = vxfec_ibv_mr_reg_host(comm->ibv_ref->ctx, comm->ibv_rep_buf, sz, true);
+    if (!comm->ibv_rep_mr || vxfec_ibv_mr_rkey(comm->ibv_rep_mr) == 0u) {
+        if (comm->ibv_rep_mr) {
+            vxfec_ibv_mr_dereg(comm->ibv_rep_mr);
+            comm->ibv_rep_mr = NULL;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool tx_ibv_ensure_rep_mr(vxfec_send_comm_t *comm)
+{
+    if (comm->ibv_rep_mr && comm->ibv_rep_buf)
+        return true;
+    if (!comm->ibv_ref || !comm->ibv_ref->ctx)
+        return false;
+    size_t sz = (size_t)VXFEC_IBV_REP_RING * VXFEC_MAX_SYM_T;
+    if (!comm->ibv_rep_buf && posix_memalign((void **)&comm->ibv_rep_buf, 4096u, sz) != 0) {
+        comm->ibv_rep_buf = NULL;
+        return false;
+    }
+    comm->ibv_rep_mr = vxfec_ibv_mr_reg_host(comm->ibv_ref->ctx, comm->ibv_rep_buf, sz, false);
+    return comm->ibv_rep_mr != NULL;
+}
+
+static uint32_t tx_ibv_post_rdma_batch_all(vxfec_ibv_ep_t *ep, uint32_t q, const vxfec_ibv_rdma_wr_t *wrs, uint32_t cnt)
+{
+    uint32_t off = 0u;
+    while (off < cnt) {
+        uint32_t sent = vxfec_ibv_ep_rdma_write_imm_batch(ep, q, &wrs[off], cnt - off);
+        off += sent;
+        if (off < cnt) {
+            if (vxfec_ibv_ep_has_error(ep) || !tx_ibv_flush_qp_for_space(ep, q))
+                break;
+            if (sent == 0u) {
+                sent = vxfec_ibv_ep_rdma_write_imm_batch(ep, q, &wrs[off], cnt - off);
+                off += sent;
+                if (sent == 0u)
+                    break;
+            }
+        }
+    }
+    return off;
+}
+
+static uint32_t tx_ibv_post_send_batch_all(vxfec_ibv_ep_t *ep, uint32_t q, const vxfec_ibv_send_wr_desc_t *pkts, uint32_t cnt)
+{
+    uint32_t off = 0u;
+    while (off < cnt) {
+        uint32_t sent = vxfec_ibv_ep_send_pkt_batch(ep, q, &pkts[off], cnt - off);
+        off += sent;
+        if (off < cnt) {
+            if (vxfec_ibv_ep_has_error(ep) || !tx_ibv_flush_qp_for_space(ep, q))
+                break;
+            if (sent == 0u) {
+                sent = vxfec_ibv_ep_send_pkt_batch(ep, q, &pkts[off], cnt - off);
+                off += sent;
+                if (sent == 0u)
+                    break;
+            }
+        }
+    }
+    return off;
 }
 
 static bool tx_send_rdma_gen_hdr(vxfec_tx_slot_t *req)
@@ -757,6 +1086,61 @@ static bool tx_send_rdma_gen_hdr(vxfec_tx_slot_t *req)
     return true;
 }
 
+static vxfec_tx_ibv_batch_t *ensure_tx_ibv_batch(vxfec_send_comm_t *comm)
+{
+    if (!comm->tx_ibv)
+        comm->tx_ibv = (vxfec_tx_ibv_batch_t *)malloc(sizeof(*comm->tx_ibv));
+    return comm->tx_ibv;
+}
+
+static void tx_record_sys_posts(vxfec_tx_slot_t *req, uint32_t qp, uint32_t sent, bool has_zc)
+{
+    atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, sent, memory_order_relaxed);
+    if (sent == 0u || req->total_bytes == 0u)
+        return;
+    if (qp < VXFEC_IBV_MAX_QPS) {
+        uint32_t tot = (uint32_t)req->tx_qp_pkts[qp] + sent;
+        req->tx_qp_pkts[qp] = (tot > UINT16_MAX) ? UINT16_MAX : (uint16_t)tot;
+    }
+    atomic_fetch_add_explicit(&vxf_st_tx_sys_ibv_pkts, sent, memory_order_relaxed);
+    if (has_zc && req->src_ibv_dmabuf && req->mr && req->mr->ptr_type == NCCL_PTR_CUDA) {
+        atomic_fetch_add_explicit(&vxf_st_tx_sys_gpu_direct_pkts, sent, memory_order_relaxed);
+        unsigned dev = (unsigned)req->comm->comm_dev_idx;
+        if (dev < VXFEC_MAX_DEVS)
+            atomic_fetch_add_explicit(&vxf_st_rail_tx_gpu_direct_pkts[dev], sent, memory_order_relaxed);
+    }
+    if (has_zc && req->parent) {
+        req->parent->ibv_zc_pending = true;
+        vxfec_ibv_ep_record_qp_tail(req->comm->ibv_ep, qp, req->parent->ibv_target_seq);
+    }
+}
+
+static uint32_t tx_sys_batch_cap(vxfec_tx_slot_t *req, uint32_t remaining, bool is_retx, bool reorder)
+{
+#ifdef UDP_SEGMENT
+    vxfec_send_comm_t *comm = req->comm;
+    vxfec_tx_udp_batch_t *ub = comm->tx_udp;
+    if (remaining <= VXFEC_UDP_TX_BATCH || is_retx || reorder || comm->ibv_ep || !ub || ub->gso_disabled || !ub->gso_datagrams ||
+        comm->has_nonuniform_weights || !comm->num_ports || VXFEC_UDP_TX_BATCH % comm->num_ports)
+        return VXFEC_UDP_TX_BATCH;
+#if VXFEC_ENABLE_SIM
+    if (atomic_load_explicit(&vxf_sim_active, memory_order_relaxed) || req->parent->paired_fault_epoch)
+        return VXFEC_UDP_TX_BATCH;
+#endif
+    if (ub->capacity < VXFEC_UDP_SYS_TX_BATCH) {
+        vxfec_tx_udp_batch_t *wide = alloc_tx_udp_batch(VXFEC_UDP_SYS_TX_BATCH);
+        if (!wide)
+            return VXFEC_UDP_TX_BATCH;
+        wide->gso_datagrams = ub->gso_datagrams;
+        comm->tx_udp = wide;
+        free(ub);
+    }
+    return VXFEC_UDP_SYS_TX_BATCH;
+#else
+    return VXFEC_UDP_TX_BATCH;
+#endif
+}
+
 static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const uint32_t *esis, uint32_t count, bool is_retx,
                                bool need_ack_last, uint64_t now_ns)
 {
@@ -776,19 +1160,20 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
     }
 
     while (idx < count) {
-        uint32_t batch = (count - idx > VXFEC_UDP_TX_BATCH) ? VXFEC_UDP_TX_BATCH : (count - idx);
+        uint32_t cap = tx_sys_batch_cap(req, count - idx, is_retx, reorder);
+        uint32_t batch = count - idx > cap ? cap : count - idx;
         bool is_last_batch = (idx + batch == count);
         uint32_t port_cnt[VXFEC_MAX_PORTS] = {0};
         uint32_t order[VXFEC_UDP_TX_BATCH];
-        uint8_t pkt_ports[VXFEC_UDP_TX_BATCH];
-        uint8_t pkt_niov[VXFEC_UDP_TX_BATCH];
-        bool pkt_ecn[VXFEC_UDP_TX_BATCH];
+        uint8_t pkt_ports[VXFEC_UDP_SYS_TX_BATCH];
+        uint8_t pkt_niov[VXFEC_UDP_SYS_TX_BATCH];
+        bool pkt_ecn[VXFEC_UDP_SYS_TX_BATCH];
         vxfec_tx_udp_batch_t *ub = NULL;
         uint32_t n_valid = 0;
 
-        for (uint32_t b = 0; b < batch; b++)
-            order[b] = b;
-        if (reorder && batch > 1u) {
+        if (reorder) {
+            for (uint32_t b = 0; b < batch; b++)
+                order[b] = b;
             for (uint32_t b = batch - 1u; b > 0u; b--) {
                 uint32_t swap_idx = vxf_fast_rand32() % (b + 1u);
                 uint32_t tmp = order[b];
@@ -797,9 +1182,23 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
             }
         }
 
+        bool ibv_use_rdma = (comm->ibv_ep != NULL && req->use_rdma_write && req->src_ibv_lkey != 0u);
+        uint32_t ibv_num_qps = (comm->ibv_ep != NULL) ? vxfec_ibv_ep_num_qps(comm->ibv_ep) : 0u;
+        if (ibv_num_qps == 0u && comm->ibv_ep != NULL)
+            ibv_num_qps = 1u;
+        vxfec_tx_ibv_batch_t *ib = comm->ibv_ep ? ensure_tx_ibv_batch(comm) : NULL;
+        if (comm->ibv_ep && !ib) {
+            req->ack_probe_tx_ns = 0u;
+            return false;
+        }
+        uint32_t q_cnt[VXFEC_IBV_MAX_QPS] = {0};
+        bool q_has_zc[VXFEC_IBV_MAX_QPS] = {false};
+
         for (uint32_t b = 0; b < batch; b++) {
-            uint32_t e = esis ? esis[idx + order[b]] : (base_esi + idx + order[b]);
-            if (vxf_sim_should_drop_data()) {
+            uint32_t pos = idx + (reorder ? order[b] : b);
+            uint32_t e = esis ? esis[pos] : base_esi + pos;
+            uint32_t p = swrr_next(comm->swrr_cur, w, comm->num_ports);
+            if (vxf_sim_should_drop_port_data(p)) {
                 req->ack_probe_tx_ns = 0u;
                 continue;
             }
@@ -807,9 +1206,134 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
             size_t off = (size_t)e * req->sym_T;
             size_t rem = (off < req->total_bytes) ? (req->total_bytes - off) : 0u;
             uint16_t valid_len = (uint16_t)((rem > req->sym_T) ? req->sym_T : rem);
+#if VXFEC_ENABLE_SIM
+            if (!is_retx && valid_len > 0u && req->parent->paired_fault_epoch != 0u && vxf_sim_should_drop_first_sys(req, e)) {
+                req->ack_probe_tx_ns = 0u;
+                continue;
+            }
+#endif
 
-            vxfec_wire_hdr_ext_t whdr;
-            whdr.base = (vxfec_wire_hdr_t){
+            if (comm->ibv_ep) {
+                if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
+                    req->ack_probe_tx_ns = 0u;
+                    return false;
+                }
+                uint32_t q = p % ibv_num_qps;
+                bool is_final_pkt = is_last_batch && (b + 1u == batch);
+                if (need_ack_last && is_final_pkt) {
+                    if (!is_retx && !req->retx_or_ir_sent && req->ack_probe_tx_ns == 0u)
+                        req->ack_probe_tx_ns = now_ns;
+                }
+                if (ibv_use_rdma) {
+                    const void *pay_ptr = (valid_len > 0u) ? (const void *)(req->src_ibv_ptr + off) : NULL;
+                    uint32_t imm =
+                        pack_rdma_imm(has_ext, req->rdma_rslot, req->rdma_token, need_ack_last && is_final_pkt, req->gen_idx, e);
+                    uint32_t qi = q_cnt[q]++;
+                    ib->rdma[q][qi] = (vxfec_ibv_rdma_wr_t){
+                        .src_addr = pay_ptr,
+                        .remote_addr = req->rdma_gen_iova + off,
+                        .byte_len = valid_len,
+                        .lkey = req->src_ibv_lkey,
+                        .rkey = req->rdma_rkey,
+                        .imm_host_order = imm,
+                        .force_signal = is_final_pkt,
+                    };
+                    if (valid_len > 0u)
+                        q_has_zc[q] = true;
+                    if (q_cnt[q] == VXFEC_IBV_BATCH_MAX) {
+                        uint32_t sent = tx_ibv_post_rdma_batch_all(comm->ibv_ep, q, ib->rdma[q], VXFEC_IBV_BATCH_MAX);
+                        tx_record_sys_posts(req, q, sent, q_has_zc[q]);
+                        if (sent < VXFEC_IBV_BATCH_MAX) {
+                            req->ack_probe_tx_ns = 0u;
+                            return false;
+                        }
+                        q_cnt[q] = 0u;
+                        q_has_zc[q] = false;
+                    }
+                    continue;
+                }
+                vxfec_wire_hdr_ext_t whdr;
+                whdr.base = (vxfec_wire_hdr_t){
+                    .magic = VXFEC_NET_MAGIC,
+                    .cookie = comm->cookie,
+                    .pkt_type = PKT_DATA,
+                    .flags = base_flags,
+                    .sym_len = valid_len,
+                    .msg_seq = req->msg_seq,
+                    .tag_seq = req->tag_seq,
+                    .tag = req->tag,
+                    .total_bytes = req->total_bytes,
+                    .K = req->K,
+                    .sym_T = req->sym_T,
+                    .srtt_us = srtt_us,
+                    .esi = e,
+                };
+                if (has_ext) {
+                    whdr.ext = (vxfec_gen_ext_t){
+                        .msg_total_bytes = req->msg_total_bytes,
+                        .gen_idx = req->gen_idx,
+                        .num_gens = req->num_gens,
+                    };
+                }
+                ib->ihdrs[b] = whdr;
+                if (need_ack_last && is_final_pkt)
+                    ib->ihdrs[b].base.flags |= WIRE_FLAG_NEED_ACK;
+                if (req->src_ibv_lkey != 0u || ensure_tx_host_ptr(req)) {
+                    const void *pay_ptr = (valid_len > 0u)
+                                              ? (const void *)((req->src_ibv_lkey != 0u ? req->src_ibv_ptr : req->src_host) + off)
+                                              : NULL;
+                    uint32_t qi = q_cnt[q]++;
+                    ib->orig_idx[q][qi] = e;
+                    ib->send[q][qi] = (vxfec_ibv_send_wr_desc_t){
+                        .hdr = &ib->ihdrs[b],
+                        .payload = pay_ptr,
+                        .hdr_len = (uint32_t)hdr_len,
+                        .pay_len = valid_len,
+                        .pay_lkey = req->src_ibv_lkey,
+                        .force_signal = (req->src_ibv_lkey != 0u) && is_final_pkt,
+                    };
+                    if (req->src_ibv_lkey != 0u && valid_len > 0u)
+                        q_has_zc[q] = true;
+                    if (q_cnt[q] == VXFEC_IBV_BATCH_MAX) {
+                        uint32_t sent = tx_ibv_post_send_batch_all(comm->ibv_ep, q, ib->send[q], VXFEC_IBV_BATCH_MAX);
+                        tx_record_sys_posts(req, q, sent, q_has_zc[q]);
+                        if (sent < VXFEC_IBV_BATCH_MAX) {
+                            if (req->src_ibv_lkey != 0u || vxfec_ibv_ep_has_error(comm->ibv_ep) ||
+                                !(ub = ensure_tx_udp_batch(comm))) {
+                                req->ack_probe_tx_ns = 0u;
+                                return false;
+                            }
+                            for (uint32_t u = sent; u < VXFEC_IBV_BATCH_MAX; u++) {
+                                uint32_t ue = ib->orig_idx[q][u];
+                                size_t uoff = (size_t)ue * req->sym_T;
+                                uint16_t ulen = (uint16_t)ib->send[q][u].pay_len;
+                                memcpy(&ub->hdrs[n_valid], ib->send[q][u].hdr, hdr_len);
+                                ub->iovs[n_valid][0].iov_base = &ub->hdrs[n_valid];
+                                ub->iovs[n_valid][0].iov_len = hdr_len;
+                                uint8_t niov = 1u;
+                                if (ulen > 0u) {
+                                    ub->iovs[n_valid][1].iov_base = (void *)(req->src_host + uoff);
+                                    ub->iovs[n_valid][1].iov_len = ulen;
+                                    niov = 2u;
+                                }
+                                pkt_ports[n_valid] = (uint8_t)q;
+                                pkt_niov[n_valid] = niov;
+                                pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(q);
+                                port_cnt[q]++;
+                                n_valid++;
+                            }
+                        }
+                        q_cnt[q] = 0u;
+                        q_has_zc[q] = false;
+                    }
+                    continue;
+                }
+            }
+            if (!ensure_tx_host_ptr(req) || !(ub = ensure_tx_udp_batch(comm))) {
+                req->ack_probe_tx_ns = 0u;
+                return false;
+            }
+            ub->hdrs[n_valid].base = (vxfec_wire_hdr_t){
                 .magic = VXFEC_NET_MAGIC,
                 .cookie = comm->cookie,
                 .pkt_type = PKT_DATA,
@@ -825,78 +1349,12 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
                 .esi = e,
             };
             if (has_ext) {
-                whdr.ext = (vxfec_gen_ext_t){
+                ub->hdrs[n_valid].ext = (vxfec_gen_ext_t){
                     .msg_total_bytes = req->msg_total_bytes,
                     .gen_idx = req->gen_idx,
                     .num_gens = req->num_gens,
                 };
             }
-
-            uint32_t p = swrr_next(comm->swrr_cur, w, comm->num_ports);
-            if (comm->ibv_ep) {
-                if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
-                    req->ack_probe_tx_ns = 0u;
-                    return false;
-                }
-                vxfec_wire_hdr_ext_t ihdr = whdr;
-                bool is_final_pkt = is_last_batch && (b + 1u == batch);
-                if (need_ack_last && is_final_pkt) {
-                    ihdr.base.flags |= WIRE_FLAG_NEED_ACK;
-                    if (!is_retx && !req->retx_or_ir_sent && req->ack_probe_tx_ns == 0u)
-                        req->ack_probe_tx_ns = now_ns;
-                }
-                if (req->src_ibv_lkey != 0u) {
-                    const void *pay_ptr = (valid_len > 0u) ? (const void *)(req->src_ibv_ptr + off) : NULL;
-                    if (req->use_rdma_write) {
-                        uint32_t imm = pack_rdma_imm(has_ext, req->rdma_rslot, req->rdma_token, need_ack_last && is_final_pkt,
-                                                     req->gen_idx, e);
-                        bool rsent = vxfec_ibv_ep_rdma_write_imm(comm->ibv_ep, p, pay_ptr, valid_len, req->src_ibv_lkey,
-                                                                 req->rdma_gen_iova + off, req->rdma_rkey, imm);
-                        if (!rsent && !vxfec_ibv_ep_has_error(comm->ibv_ep) && tx_ibv_flush_qp_for_space(comm->ibv_ep, p)) {
-                            rsent = vxfec_ibv_ep_rdma_write_imm(comm->ibv_ep, p, pay_ptr, valid_len, req->src_ibv_lkey,
-                                                                req->rdma_gen_iova + off, req->rdma_rkey, imm);
-                        }
-                        if (rsent) {
-                            if (req->parent && valid_len > 0u) {
-                                req->parent->ibv_zc_pending = true;
-                                vxfec_ibv_ep_record_qp_tail(comm->ibv_ep, p, req->parent->ibv_target_seq);
-                            }
-                            atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, 1, memory_order_relaxed);
-                            continue;
-                        }
-                    } else {
-                        bool ssent = vxfec_ibv_ep_send_pkt_ex(comm->ibv_ep, p, &ihdr, (uint32_t)hdr_len, pay_ptr, valid_len,
-                                                              req->src_ibv_lkey, is_final_pkt);
-                        if (!ssent && !vxfec_ibv_ep_has_error(comm->ibv_ep) && tx_ibv_flush_qp_for_space(comm->ibv_ep, p)) {
-                            ssent = vxfec_ibv_ep_send_pkt_ex(comm->ibv_ep, p, &ihdr, (uint32_t)hdr_len, pay_ptr, valid_len,
-                                                             req->src_ibv_lkey, is_final_pkt);
-                        }
-                        if (ssent) {
-                            if (req->parent && valid_len > 0u) {
-                                req->parent->ibv_zc_pending = true;
-                                vxfec_ibv_ep_record_qp_tail(comm->ibv_ep, p, req->parent->ibv_target_seq);
-                            }
-                            atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, 1, memory_order_relaxed);
-                            continue;
-                        }
-                    }
-                } else if (ensure_tx_host_ptr(req)) {
-                    const void *pay_ptr = (valid_len > 0u) ? (const void *)(req->src_host + off) : NULL;
-                    if (vxfec_ibv_ep_send_pkt(comm->ibv_ep, p, &ihdr, (uint32_t)hdr_len, pay_ptr, valid_len, 0u)) {
-                        atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, 1, memory_order_relaxed);
-                        continue;
-                    }
-                }
-                if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
-                    req->ack_probe_tx_ns = 0u;
-                    return false;
-                }
-            }
-            if (!ensure_tx_host_ptr(req) || !(ub = ensure_tx_udp_batch(comm))) {
-                req->ack_probe_tx_ns = 0u;
-                return false;
-            }
-            ub->hdrs[n_valid] = whdr;
             ub->iovs[n_valid][0].iov_base = &ub->hdrs[n_valid];
             ub->iovs[n_valid][0].iov_len = hdr_len;
             uint8_t niov = 1u;
@@ -910,6 +1368,53 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
             pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(p);
             port_cnt[p]++;
             n_valid++;
+        }
+
+        if (comm->ibv_ep) {
+            for (uint32_t q = 0; q < ibv_num_qps; q++) {
+                if (q_cnt[q] == 0u)
+                    continue;
+                if (ibv_use_rdma) {
+                    if (is_last_batch && q_has_zc[q])
+                        ib->rdma[q][q_cnt[q] - 1u].force_signal = true;
+                    uint32_t sent = tx_ibv_post_rdma_batch_all(comm->ibv_ep, q, ib->rdma[q], q_cnt[q]);
+                    tx_record_sys_posts(req, q, sent, q_has_zc[q]);
+                    if (sent < q_cnt[q]) {
+                        req->ack_probe_tx_ns = 0u;
+                        return false;
+                    }
+                } else {
+                    if (is_last_batch && q_has_zc[q])
+                        ib->send[q][q_cnt[q] - 1u].force_signal = true;
+                    uint32_t sent = tx_ibv_post_send_batch_all(comm->ibv_ep, q, ib->send[q], q_cnt[q]);
+                    tx_record_sys_posts(req, q, sent, q_has_zc[q]);
+                    if (sent < q_cnt[q]) {
+                        if (req->src_ibv_lkey != 0u || vxfec_ibv_ep_has_error(comm->ibv_ep) || !(ub = ensure_tx_udp_batch(comm))) {
+                            req->ack_probe_tx_ns = 0u;
+                            return false;
+                        }
+                        for (uint32_t u = sent; u < q_cnt[q]; u++) {
+                            uint32_t ue = ib->orig_idx[q][u];
+                            size_t uoff = (size_t)ue * req->sym_T;
+                            uint16_t ulen = (uint16_t)ib->send[q][u].pay_len;
+                            memcpy(&ub->hdrs[n_valid], ib->send[q][u].hdr, hdr_len);
+                            ub->iovs[n_valid][0].iov_base = &ub->hdrs[n_valid];
+                            ub->iovs[n_valid][0].iov_len = hdr_len;
+                            uint8_t niov = 1u;
+                            if (ulen > 0u) {
+                                ub->iovs[n_valid][1].iov_base = (void *)(req->src_host + uoff);
+                                ub->iovs[n_valid][1].iov_len = ulen;
+                                niov = 2u;
+                            }
+                            pkt_ports[n_valid] = (uint8_t)q;
+                            pkt_niov[n_valid] = niov;
+                            pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(q);
+                            port_cnt[q]++;
+                            n_valid++;
+                        }
+                    }
+                }
+            }
         }
 
         if (need_ack_last && is_last_batch && n_valid > 0u) {
@@ -930,6 +1435,44 @@ static bool tx_spray_sys_range(vxfec_tx_slot_t *req, uint32_t base_esi, const ui
     return true;
 }
 
+static bool tx_alloc_rx_rep_slot(vxfec_send_comm_t *comm, vxfec_tx_slot_t *req, uint64_t now_ns, uint8_t *out_slot)
+{
+    uint32_t limit = (req->rdma_rep_slots <= 256u) ? (uint32_t)req->rdma_rep_slots : 256u;
+    if (limit == 0u || comm->rx_rep_inflight >= limit)
+        return false;
+    uint32_t start = comm->rx_rep_ring_cursor % limit;
+    for (uint32_t step = 0u; step < limit; step++) {
+        uint32_t cand = (start + step) % limit;
+        uint32_t w = cand >> 6u;
+        uint64_t bit = 1ULL << (cand & 63u);
+        if ((comm->rx_rep_slot_mask[w] & bit) == 0ULL && now_ns >= comm->rx_rep_ready_ns[cand]) {
+            comm->rx_rep_slot_mask[w] |= bit;
+            req->rdma_rep_slot_mask[w] |= bit;
+            comm->rx_rep_ring_cursor = cand + 1u;
+            comm->rx_rep_inflight++;
+            req->rdma_rep_sent++;
+            *out_slot = (uint8_t)cand;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void tx_record_repair_posts(vxfec_tx_slot_t *req, uint32_t qp, uint32_t sent, uint32_t lkey, uint32_t gpu_lkey)
+{
+    atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, sent, memory_order_relaxed);
+    if (sent > 0u && qp < VXFEC_IBV_MAX_QPS) {
+        uint32_t tot = (uint32_t)req->tx_qp_pkts[qp] + sent;
+        req->tx_qp_pkts[qp] = (tot > UINT16_MAX) ? UINT16_MAX : (uint16_t)tot;
+    }
+    if (lkey != 0u && req->parent && sent > 0u) {
+        req->parent->ibv_zc_pending = true;
+        vxfec_ibv_ep_record_qp_tail(req->comm->ibv_ep, qp, req->parent->ibv_target_seq);
+        if (gpu_lkey != 0u)
+            req->tx_gpu_ibv_posted = true;
+    }
+}
+
 static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uint32_t *esis, uint32_t start_esi,
                                   const uint8_t *rep_buf, size_t rep_stride, uint32_t rep_lkey, uint32_t count, bool need_ack_last,
                                   uint64_t now_ns)
@@ -942,8 +1485,20 @@ static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uin
     const size_t hdr_len = has_ext ? sizeof(vxfec_wire_hdr_ext_t) : sizeof(vxfec_wire_hdr_t);
     uint32_t idx = 0;
 
+    bool can_rdma_rep = (comm->ibv_ep != NULL && !comm->ibv_failed && req->use_rdma_write && !req->codec_promoted &&
+                         req->rdma_rep_rkey != 0u && req->rdma_rep_slots > 0u && req->gen_idx < 64u && vxf_sim_delay_ns() == 0u);
+    if (can_rdma_rep && !req->rdma_gen_hdr_sent) {
+        if (!tx_send_rdma_gen_hdr(req))
+            return false;
+    }
+
+    bool use_rep_mr = false;
+    if (comm->ibv_ep && rep_lkey == 0u && (can_rdma_rep || (hdr_len + req->sym_T) > vxfec_ibv_ep_tx_stage_cap(comm->ibv_ep)))
+        use_rep_mr = tx_ibv_ensure_rep_mr(comm);
+
+    uint32_t step_cap = (use_rep_mr && VXFEC_IBV_REP_RING < VXFEC_UDP_TX_BATCH) ? VXFEC_IBV_REP_RING : VXFEC_UDP_TX_BATCH;
     while (idx < count) {
-        uint32_t batch = (count - idx > VXFEC_UDP_TX_BATCH) ? VXFEC_UDP_TX_BATCH : (count - idx);
+        uint32_t batch = (count - idx > step_cap) ? step_cap : (count - idx);
         bool is_last_batch = (idx + batch == count);
         uint32_t port_cnt[VXFEC_MAX_PORTS] = {0};
         uint8_t pkt_ports[VXFEC_UDP_TX_BATCH];
@@ -951,13 +1506,36 @@ static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uin
         bool pkt_ecn[VXFEC_UDP_TX_BATCH];
         vxfec_tx_udp_batch_t *ub = NULL;
         uint32_t n_valid = 0;
+        uint32_t ibv_num_qps = (comm->ibv_ep != NULL) ? vxfec_ibv_ep_num_qps(comm->ibv_ep) : 0u;
+        if (ibv_num_qps == 0u && comm->ibv_ep != NULL)
+            ibv_num_qps = 1u;
+        vxfec_tx_ibv_batch_t *ib = comm->ibv_ep ? ensure_tx_ibv_batch(comm) : NULL;
+        if (comm->ibv_ep && !ib) {
+            req->ack_probe_tx_ns = 0u;
+            return false;
+        }
+        uint32_t q_rcnt[VXFEC_IBV_MAX_QPS] = {0};
+        uint32_t q_cnt[VXFEC_IBV_MAX_QPS] = {0};
+
+        if (use_rep_mr && comm->ibv_ep && comm->ibv_rep_cursor + batch > VXFEC_IBV_REP_RING) {
+            uint64_t fseq[VXFEC_IBV_MAX_QPS] = {0};
+            for (uint32_t q = 0; q < ibv_num_qps; q++)
+                vxfec_ibv_ep_record_qp_tail(comm->ibv_ep, q, fseq);
+            if (!tx_ibv_wait_seq_done(comm->ibv_ep, fseq)) {
+                req->ack_probe_tx_ns = 0u;
+                return false;
+            }
+            comm->ibv_rep_cursor = 0u;
+        }
 
         for (uint32_t b = 0; b < batch; b++) {
-            if (vxf_sim_should_drop_data()) {
+            uint32_t p = swrr_next(comm->swrr_cur, w, comm->num_ports);
+            if (vxf_sim_should_drop_port_data(p)) {
                 req->ack_probe_tx_ns = 0u;
                 continue;
             }
             uint32_t i = idx + b;
+            uint32_t e = esis ? esis[i] : (start_esi + i);
             vxfec_wire_hdr_ext_t whdr;
             whdr.base = (vxfec_wire_hdr_t){
                 .magic = VXFEC_NET_MAGIC,
@@ -972,7 +1550,7 @@ static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uin
                 .K = req->K,
                 .sym_T = req->sym_T,
                 .srtt_us = srtt_us,
-                .esi = esis ? esis[i] : (start_esi + i),
+                .esi = e,
             };
             if (has_ext) {
                 whdr.ext = (vxfec_gen_ext_t){
@@ -981,38 +1559,90 @@ static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uin
                     .num_gens = req->num_gens,
                 };
             }
-            uint32_t p = swrr_next(comm->swrr_cur, w, comm->num_ports);
             if (comm->ibv_ep) {
                 if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
                     req->ack_probe_tx_ns = 0u;
                     return false;
                 }
-                vxfec_wire_hdr_ext_t ihdr = whdr;
+                uint32_t q = p % ibv_num_qps;
                 bool is_final_pkt = is_last_batch && (b + 1u == batch);
+                ib->ihdrs[b] = whdr;
                 if (need_ack_last && is_final_pkt) {
-                    ihdr.base.flags |= WIRE_FLAG_NEED_ACK;
+                    ib->ihdrs[b].base.flags |= WIRE_FLAG_NEED_ACK;
                     if (!req->retx_or_ir_sent && req->ack_probe_tx_ns == 0u)
                         req->ack_probe_tx_ns = now_ns;
                 }
                 const void *pay_ptr = (const void *)(rep_buf + (size_t)i * rep_stride);
-                bool ssent = vxfec_ibv_ep_send_pkt_ex(comm->ibv_ep, p, &ihdr, (uint32_t)hdr_len, pay_ptr, req->sym_T, rep_lkey,
-                                                      rep_lkey != 0u && is_final_pkt);
-                if (!ssent && !vxfec_ibv_ep_has_error(comm->ibv_ep) && tx_ibv_flush_qp_for_space(comm->ibv_ep, p)) {
-                    ssent = vxfec_ibv_ep_send_pkt_ex(comm->ibv_ep, p, &ihdr, (uint32_t)hdr_len, pay_ptr, req->sym_T, rep_lkey,
-                                                     rep_lkey != 0u && is_final_pkt);
+                uint32_t eff_lkey = rep_lkey;
+                if (use_rep_mr) {
+                    uint32_t rslot = comm->ibv_rep_cursor++;
+                    uint8_t *rdst = comm->ibv_rep_buf + (size_t)rslot * VXFEC_MAX_SYM_T;
+                    memcpy(rdst, pay_ptr, req->sym_T);
+                    pay_ptr = rdst;
+                    eff_lkey = vxfec_ibv_mr_lkey(comm->ibv_rep_mr);
                 }
-                if (ssent) {
-                    if (rep_lkey != 0u && req->parent) {
-                        req->parent->ibv_zc_pending = true;
-                        vxfec_ibv_ep_record_qp_tail(comm->ibv_ep, p, req->parent->ibv_target_seq);
+                uint8_t rx_rslot = 0u;
+                if (can_rdma_rep && eff_lkey != 0u && e >= req->K && (e - req->K) < 64u &&
+                    (flags != WIRE_FLAG_RS_CAUCHY8 || e < 256u) && tx_alloc_rx_rep_slot(comm, req, now_ns, &rx_rslot)) {
+                    uint32_t rq = (uint32_t)rx_rslot % ibv_num_qps;
+                    uint32_t imm = pack_rdma_repair_imm(req->rdma_rslot, req->rdma_token, need_ack_last && is_final_pkt, rx_rslot,
+                                                        req->gen_idx, e - req->K);
+                    uint32_t rqi = q_rcnt[rq]++;
+                    ib->rdma[rq][rqi] = (vxfec_ibv_rdma_wr_t){
+                        .src_addr = pay_ptr,
+                        .remote_addr = req->rdma_rep_iova + (size_t)rx_rslot * VXFEC_MAX_SYM_T,
+                        .byte_len = req->sym_T,
+                        .lkey = eff_lkey,
+                        .rkey = req->rdma_rep_rkey,
+                        .imm_host_order = imm,
+                        .force_signal = is_final_pkt,
+                    };
+                    if (q_rcnt[rq] == VXFEC_IBV_BATCH_MAX) {
+                        uint32_t sent = tx_ibv_post_rdma_batch_all(comm->ibv_ep, rq, ib->rdma[rq], VXFEC_IBV_BATCH_MAX);
+                        tx_record_repair_posts(req, rq, sent, eff_lkey, rep_lkey);
+                        if (sent < VXFEC_IBV_BATCH_MAX) {
+                            req->ack_probe_tx_ns = 0u;
+                            return false;
+                        }
+                        q_rcnt[rq] = 0u;
                     }
-                    atomic_fetch_add_explicit(&vxf_st_ibv_direct_pkts, 1, memory_order_relaxed);
                     continue;
                 }
-                if (rep_lkey != 0u || vxfec_ibv_ep_has_error(comm->ibv_ep)) {
-                    req->ack_probe_tx_ns = 0u;
-                    return false;
+                uint32_t qi = q_cnt[q]++;
+                ib->orig_idx[q][qi] = i;
+                ib->send[q][qi] = (vxfec_ibv_send_wr_desc_t){
+                    .hdr = &ib->ihdrs[b],
+                    .payload = pay_ptr,
+                    .hdr_len = (uint32_t)hdr_len,
+                    .pay_len = req->sym_T,
+                    .pay_lkey = eff_lkey,
+                    .force_signal = (eff_lkey != 0u) && is_final_pkt,
+                };
+                if (q_cnt[q] == VXFEC_IBV_BATCH_MAX) {
+                    uint32_t sent = tx_ibv_post_send_batch_all(comm->ibv_ep, q, ib->send[q], VXFEC_IBV_BATCH_MAX);
+                    tx_record_repair_posts(req, q, sent, eff_lkey, rep_lkey);
+                    if (sent < VXFEC_IBV_BATCH_MAX) {
+                        if (rep_lkey != 0u || vxfec_ibv_ep_has_error(comm->ibv_ep) || !(ub = ensure_tx_udp_batch(comm))) {
+                            req->ack_probe_tx_ns = 0u;
+                            return false;
+                        }
+                        for (uint32_t u = sent; u < VXFEC_IBV_BATCH_MAX; u++) {
+                            uint32_t ui = ib->orig_idx[q][u];
+                            memcpy(&ub->hdrs[n_valid], ib->send[q][u].hdr, hdr_len);
+                            ub->iovs[n_valid][0].iov_base = &ub->hdrs[n_valid];
+                            ub->iovs[n_valid][0].iov_len = hdr_len;
+                            ub->iovs[n_valid][1].iov_base = (void *)(rep_buf + (size_t)ui * rep_stride);
+                            ub->iovs[n_valid][1].iov_len = req->sym_T;
+                            pkt_ports[n_valid] = (uint8_t)q;
+                            pkt_niov[n_valid] = 2u;
+                            pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(q);
+                            port_cnt[q]++;
+                            n_valid++;
+                        }
+                    }
+                    q_cnt[q] = 0u;
                 }
+                continue;
             }
             if (rep_lkey != 0u || !(ub = ensure_tx_udp_batch(comm))) {
                 req->ack_probe_tx_ns = 0u;
@@ -1028,6 +1658,47 @@ static bool tx_spray_repair_batch(vxfec_tx_slot_t *req, uint8_t flags, const uin
             pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(p);
             port_cnt[p]++;
             n_valid++;
+        }
+
+        if (comm->ibv_ep) {
+            uint32_t eff_lkey = use_rep_mr ? vxfec_ibv_mr_lkey(comm->ibv_rep_mr) : rep_lkey;
+            for (uint32_t q = 0; q < ibv_num_qps; q++) {
+                if (q_rcnt[q] > 0u) {
+                    if (is_last_batch)
+                        ib->rdma[q][q_rcnt[q] - 1u].force_signal = true;
+                    uint32_t sent = tx_ibv_post_rdma_batch_all(comm->ibv_ep, q, ib->rdma[q], q_rcnt[q]);
+                    tx_record_repair_posts(req, q, sent, eff_lkey, rep_lkey);
+                    if (sent < q_rcnt[q]) {
+                        req->ack_probe_tx_ns = 0u;
+                        return false;
+                    }
+                }
+                if (q_cnt[q] == 0u)
+                    continue;
+                if (is_last_batch && eff_lkey != 0u)
+                    ib->send[q][q_cnt[q] - 1u].force_signal = true;
+                uint32_t sent = tx_ibv_post_send_batch_all(comm->ibv_ep, q, ib->send[q], q_cnt[q]);
+                tx_record_repair_posts(req, q, sent, eff_lkey, rep_lkey);
+                if (sent < q_cnt[q]) {
+                    if (rep_lkey != 0u || vxfec_ibv_ep_has_error(comm->ibv_ep) || !(ub = ensure_tx_udp_batch(comm))) {
+                        req->ack_probe_tx_ns = 0u;
+                        return false;
+                    }
+                    for (uint32_t u = sent; u < q_cnt[q]; u++) {
+                        uint32_t ui = ib->orig_idx[q][u];
+                        memcpy(&ub->hdrs[n_valid], ib->send[q][u].hdr, hdr_len);
+                        ub->iovs[n_valid][0].iov_base = &ub->hdrs[n_valid];
+                        ub->iovs[n_valid][0].iov_len = hdr_len;
+                        ub->iovs[n_valid][1].iov_base = (void *)(rep_buf + (size_t)ui * rep_stride);
+                        ub->iovs[n_valid][1].iov_len = req->sym_T;
+                        pkt_ports[n_valid] = (uint8_t)q;
+                        pkt_niov[n_valid] = 2u;
+                        pkt_ecn[n_valid] = vxf_sim_should_mark_ecn(q);
+                        port_cnt[q]++;
+                        n_valid++;
+                    }
+                }
+            }
         }
 
         if (need_ack_last && is_last_batch && n_valid > 0u) {
@@ -1077,15 +1748,15 @@ static tx_repair_result_t tx_generate_and_spray_repairs_rs8(vxfec_tx_slot_t *req
     size_t in_bytes = (size_t)req->K * req->sym_T;
     size_t out_bytes = (size_t)count * req->sym_T;
     uint32_t rs_m = 256u - req->K;
-    vxfec_vk_ctx *prefer_vk = req->mr ? req->mr->vk_ctx : NULL;
-    bool has_vram_src = (req->mr && req->mr->ptr_type == NCCL_PTR_CUDA && req->mr->vk_buf != NULL);
+    bool has_vram_src = (req->mr && req->mr->ptr_type == NCCL_PTR_CUDA && vxf_mr_has_gpu_buf(req->mr));
     bool want_ibv_out = (req->comm && req->comm->ibv_ep && !req->comm->ibv_failed);
 
     vxfec_gpu_job_t *job =
-        req->tx_gpu_failed ? NULL : vxf_rs8_gpu_job_new(prefer_vk, false, req->K, rs_m, NULL, parity_m, count, req->sym_T);
+        req->tx_gpu_failed ? NULL : vxf_rs8_gpu_job_new(req->mr, false, req->K, rs_m, NULL, parity_m, count, req->sym_T);
     if (job && has_vram_src) {
         bool use_zc_out = want_ibv_out && vxf_gpu_job_prepare_ibv_out(job, req->comm->dev_idx, out_bytes);
-        if (vxf_rs8_gpu_job_submit_vram_enc(job, req->mr->vk_buf, req->mr_offset, req->total_bytes, req->sym_T, use_zc_out)) {
+        if (vxf_rs8_gpu_job_submit_vram_enc(job, req->mr, req->mr_offset, req->total_bytes, req->sym_T, use_zc_out)) {
+            vxf_gpu_track_direct_job(job, &req->parent->direct_jobs);
             req->tx_gpu = job;
             req->tx_gpu_esi = start_esi;
             req->tx_gpu_count = count;
@@ -1107,9 +1778,7 @@ static tx_repair_result_t tx_generate_and_spray_repairs_rs8(vxfec_tx_slot_t *req
     }
 
     if (job) {
-        bool use_zc_out = want_ibv_out && vxf_gpu_job_prepare_ibv_out(job, req->comm->dev_idx, out_bytes);
-        (void)use_zc_out;
-        memcpy(vxfec_vk_buf_staging_ptr(job->in_buf), sys_in, in_bytes);
+        memcpy(vxf_gpu_job_in_ptr(job), sys_in, in_bytes);
         if (vxf_rs8_gpu_job_submit(job, req->sym_T)) {
             req->tx_gpu = job;
             req->tx_gpu_esi = start_esi;
@@ -1144,6 +1813,7 @@ static tx_repair_result_t tx_generate_and_spray_repairs(vxfec_tx_slot_t *req, ui
         if (start_esi + count <= 256u)
             return tx_generate_and_spray_repairs_rs8(req, start_esi, count, proactive, need_ack_last, now_ns);
         req->codec = choose_rq_overflow_codec(req->K, req->comm ? req->comm->features : 0u, &req->wire_flags);
+        req->codec_promoted = true;
         if (start_esi < 256u)
             start_esi = 256u;
         req->ir_start_esi = start_esi;
@@ -1153,19 +1823,19 @@ static tx_repair_result_t tx_generate_and_spray_repairs(vxfec_tx_slot_t *req, ui
 
     size_t d_bytes = (size_t)req->enc_rows * req->enc_stride;
     size_t out_bytes = (size_t)count * req->enc_stride;
-    vxfec_vk_ctx *prefer_vk = req->mr ? req->mr->vk_ctx : NULL;
-    bool has_vram_src = (req->mr && req->mr->ptr_type == NCCL_PTR_CUDA && req->mr->vk_buf != NULL);
+    bool has_vram_src = (req->mr && req->mr->ptr_type == NCCL_PTR_CUDA && vxf_mr_has_gpu_buf(req->mr));
     bool want_ibv_out = (req->comm && req->comm->ibv_ep && !req->comm->ibv_failed);
     vxfec_gpu_job_t *job = (req->tx_gpu_failed || count > VXFEC_BATCH_PKTS)
                                ? NULL
-                               : vxf_rq_gpu_job_new(prefer_vk, req->enc_ptr, &req->enc_sched, d_bytes, out_bytes);
+                               : vxf_rq_gpu_job_new(req->mr, req->enc_ptr, &req->enc_sched, d_bytes, out_bytes);
     if (job && has_vram_src) {
         uint32_t esis[VXFEC_BATCH_PKTS];
         for (uint32_t i = 0; i < count; i++)
             esis[i] = start_esi + i;
         bool use_zc_out = want_ibv_out && vxf_gpu_job_prepare_ibv_out(job, req->comm->dev_idx, out_bytes);
-        if (vxf_rq_gpu_job_submit_vram_enc(job, req->enc_ptr, req->mr->vk_buf, req->mr_offset, req->total_bytes, req->sym_T,
+        if (vxf_rq_gpu_job_submit_vram_enc(job, req->enc_ptr, req->mr, req->mr_offset, req->total_bytes, req->sym_T,
                                            req->enc_stride, esis, count, use_zc_out)) {
+            vxf_gpu_track_direct_job(job, &req->parent->direct_jobs);
             req->tx_gpu = job;
             req->tx_gpu_esi = start_esi;
             req->tx_gpu_count = count;
@@ -1189,7 +1859,7 @@ static tx_repair_result_t tx_generate_and_spray_repairs(vxfec_tx_slot_t *req, ui
         uint32_t esis[VXFEC_BATCH_PKTS];
         for (uint32_t i = 0; i < count; i++)
             esis[i] = start_esi + i;
-        init_tx_rq_rows(req, vxfec_vk_buf_staging_ptr(job->in_buf));
+        init_tx_rq_rows(req, vxf_gpu_job_in_ptr(job));
         if (vxf_rq_gpu_job_submit(job, req->enc_ptr, req->enc_stride, esis, count)) {
             req->tx_gpu = job;
             req->tx_gpu_esi = start_esi;
@@ -1389,8 +2059,7 @@ void vxf_free_tx_req_resources(vxfec_tx_slot_t *req)
 {
     if (!req)
         return;
-    vxf_gpu_job_free(req->tx_gpu);
-    req->tx_gpu = NULL;
+    tx_release_gpu_repair(req);
     free(req->sack_queue);
     req->sack_queue = NULL;
     free(req->rs_sys_padded);
@@ -1425,6 +2094,24 @@ static void tx_deactivate_slot(vxfec_send_comm_t *comm, vxfec_tx_slot_t *req, bo
         tx_hash_remove(comm, s, req->msg_seq);
     req->wire_active = false;
     req->done = true;
+    if (req->rdma_rep_sent > 0u) {
+        /* quarantine released remote repair slots so late surplus writes cannot overwrite newer parity */
+        uint64_t srtt_ns = comm->pacer.srtt_ns;
+        uint64_t q_ns = (srtt_ns > 500000ULL) ? (srtt_ns * 4ULL) : 2000000ULL;
+        uint64_t ready_at = mono_ns() + q_ns;
+        for (uint32_t w = 0u; w < 4u; w++) {
+            uint64_t m = req->rdma_rep_slot_mask[w];
+            while (m) {
+                uint32_t b = (uint32_t)__builtin_ctzll(m);
+                m &= m - 1ULL;
+                comm->rx_rep_ready_ns[w * 64u + b] = ready_at;
+            }
+            comm->rx_rep_slot_mask[w] &= ~req->rdma_rep_slot_mask[w];
+            req->rdma_rep_slot_mask[w] = 0ULL;
+        }
+        comm->rx_rep_inflight = (req->rdma_rep_sent >= comm->rx_rep_inflight) ? 0u : (comm->rx_rep_inflight - req->rdma_rep_sent);
+        req->rdma_rep_sent = 0u;
+    }
     if (release_resources) {
         vxf_free_tx_req_resources(req);
         req->in_use = false;
@@ -1448,12 +2135,15 @@ void vxf_reset_rx_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *s)
             rx_hash_remove(comm, idx, s->msg_seq);
         comm->active_slot_mask[idx >> 6u] &= ~(1ULL << (idx & 63u));
     }
+    if (s->bound_req && s->gen_idx < 64u && s->bound_req->gen_to_slot[s->gen_idx] == (int16_t)s->slot_idx)
+        s->bound_req->gen_to_slot[s->gen_idx] = -1;
     vxf_gpu_job_free(s->rq_gpu_job);
     free(s->rq_gpu_missing);
     s->rq_gpu_job = NULL;
     s->rq_gpu_missing = NULL;
     release_rx_slot_vk(s);
-    free(s->sys_bitmap);
+    if (s->sys_bitmap != s->inline_bitmap)
+        free(s->sys_bitmap);
     if (s->stage_pool_idx > 0 && comm && (uint32_t)s->stage_pool_idx <= VXFEC_STAGE_POOL_SLOTS)
         comm->stage_pool[s->stage_pool_idx - 1].in_use = false;
     else
@@ -1474,6 +2164,19 @@ static void rx_send_ctrl(vxfec_recv_comm_t *comm, const vxfec_ctrl_pkt_t *ctrl, 
         if (live_copies == 0)
             return;
         copies = live_copies;
+    }
+
+    size_t inline_len = sizeof(*ctrl) + pay_len;
+    if (comm->ibv_ep && !comm->ibv_failed && vxfec_ibv_ep_peer_has_ctrl_rx(comm->ibv_ep) && ctrl->pkt_type != PKT_ERR &&
+        vxf_sim_delay_ns() == 0u && inline_len <= VXFEC_IBV_CTRL_MAX_BYTES) {
+        uint8_t ibuf[VXFEC_IBV_CTRL_MAX_BYTES];
+        memcpy(ibuf, ctrl, sizeof(*ctrl));
+        if (pay_len > 0u && payload)
+            memcpy(ibuf + sizeof(*ctrl), payload, pay_len);
+        while (copies > 0 && vxfec_ibv_ep_send_ctrl_inline(comm->ibv_ep, ibuf, (uint32_t)inline_len))
+            copies--;
+        if (copies == 0)
+            return;
     }
 
     struct iovec iov[2] = {
@@ -1503,6 +2206,34 @@ static void rx_send_ctrl(vxfec_recv_comm_t *comm, const vxfec_ctrl_pkt_t *ctrl, 
         msg.msg_namelen = sizeof(comm->peer_data[p]);
         (void)sendmsg(comm->fds[p], &msg, MSG_DONTWAIT);
     }
+}
+
+static void rx_emit_cts_pkt(vxfec_recv_comm_t *comm, const vxfec_rx_req_t *req, int copies)
+{
+    struct {
+        uint64_t remote_iova;
+        uint32_t remote_rkey;
+        uint32_t max_bytes;
+    } cts_pay = {
+        .remote_iova = req->cts_remote_iova,
+        .remote_rkey = req->cts_remote_rkey,
+        .max_bytes = req->rdma_cts_sent ? (uint32_t)req->max_size : 0u,
+    };
+    vxfec_ctrl_pkt_t chdr = {
+        .magic = VXFEC_NET_MAGIC,
+        .cookie = comm->cookie,
+        .pkt_type = PKT_RDMA_CTS,
+        .flags = req->rdma_cts_sent ? req->cts_token : 0u,
+        .sack_cnt = (uint16_t)req->rslot_idx,
+        .msg_seq = 0u,
+        .tag = req->tag,
+        .K = req->expected_tag_seq,
+        .rx_pkts = (uint32_t)req->cts_rep_iova,
+        .ecn_ce_pkts = (uint32_t)(req->cts_rep_iova >> 32u),
+        .ecn_port_mask = req->cts_rep_rkey,
+        .ir_count = req->cts_rep_slots,
+    };
+    rx_send_ctrl(comm, &chdr, &cts_pay, sizeof(cts_pay), copies);
 }
 
 static uint64_t rx_done_seq(const vxfec_recv_comm_t *comm, uint32_t msg_seq)
@@ -1660,6 +2391,8 @@ static void rx_record_done(vxfec_recv_comm_t *comm, uint32_t msg_seq, uint32_t K
 
 static bool rx_req_test_gen_bit(const vxfec_rx_req_t *req, uint16_t gen_idx)
 {
+    if (gen_idx >= req->expected_num_gens)
+        return false;
     uint64_t bit = 1ULL << (gen_idx & 63u);
     if (req->expected_num_gens <= 64u)
         return (req->inline_gen_bits & bit) != 0u;
@@ -1699,6 +2432,8 @@ static bool rx_bind_slot_to_req(vxfec_rx_slot_t *s, vxfec_rx_req_t *req)
     if (rx_req_test_gen_bit(req, s->gen_idx))
         return false;
     s->bound_req = req;
+    if (s->gen_idx < 64u)
+        req->gen_to_slot[s->gen_idx] = (int16_t)s->slot_idx;
     return true;
 }
 
@@ -1716,6 +2451,7 @@ static bool rx_slot_overflows_req(const vxfec_rx_slot_t *slot)
 static void rx_promote_slot_to_rq(vxfec_rx_slot_t *slot, uint8_t rq_flags)
 {
     slot->flags = rq_flags;
+    slot->codec_promoted = true;
     slot->ir_slack = wire_flags_ir_slack(rq_flags, slot->K);
     slot->rx_rep_cnt = 0u;
     if (slot->max_rep_esi < 255u)
@@ -1807,8 +2543,16 @@ static void rx_fail_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, ncclRes
     }
     if (req) {
         req->status = err_status;
-        req->done = true;
+        rx_mark_req_done_locked(comm, req);
     }
+}
+
+static inline size_t rx_port_counts_bytes(const vxfec_recv_comm_t *comm)
+{
+    if (comm->ibv_ep != NULL)
+        return VXFEC_IBV_MAX_QPS * sizeof(uint16_t);
+    uint32_t np = (comm->num_ports <= VXFEC_MAX_PORTS) ? comm->num_ports : VXFEC_MAX_PORTS;
+    return (np > 1u) ? ((size_t)np * sizeof(uint16_t)) : 0u;
 }
 
 static void rx_finish_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, bool used_fec)
@@ -1819,13 +2563,19 @@ static void rx_finish_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, bool 
 
     bool write_ok = !slot->stage_failed;
     if (write_ok && slot->direct_vram) {
-        if (!req->mr || req->mr->ptr_type != NCCL_PTR_CUDA || !req->mr->vk_buf || vxf_sim_should_fail_gpu_rx())
+        if (!req->mr) {
             write_ok = false;
+        } else if (req->mr->ptr_type == NCCL_PTR_CUDA) {
+            if (!vxf_mr_can_gpu_rw(req->mr) || vxf_sim_should_fail_gpu_rx())
+                write_ok = false;
+        } else if (req->mr->ptr_type != NCCL_PTR_HOST || !req->dst_ptr) {
+            write_ok = false;
+        }
     } else if (write_ok && slot->total_bytes > 0u && slot->sys_stage) {
         size_t max_rem = ((size_t)req->max_size > slot->gen_offset) ? ((size_t)req->max_size - slot->gen_offset) : 0u;
         uint32_t copy_bytes = (slot->total_bytes <= max_rem) ? slot->total_bytes : (uint32_t)max_rem;
         if (req->mr && req->mr->ptr_type == NCCL_PTR_CUDA) {
-            if (!req->mr->vk_buf || vxf_sim_should_fail_gpu_rx()) {
+            if (!vxf_mr_can_gpu_rw(req->mr) || vxf_sim_should_fail_gpu_rx()) {
                 write_ok = false;
             } else {
                 size_t sub_off = (size_t)((uintptr_t)req->dst_ptr - (uintptr_t)req->mr->base_ptr) + slot->gen_offset;
@@ -1868,6 +2618,7 @@ static void rx_finish_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, bool 
         .magic = VXFEC_NET_MAGIC,
         .cookie = comm->cookie,
         .pkt_type = PKT_DONE,
+        .flags = slot->tail_seen ? 1u : 0u,
         .msg_seq = slot->msg_seq,
         .tag = slot->tag,
         .K = slot->K,
@@ -1877,11 +2628,15 @@ static void rx_finish_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, bool 
         .esi = lost,
         .dwell_us = dwell_us,
     };
-    rx_send_ctrl(comm, &dhdr, NULL, 0, (slot->num_gens > 1u) ? 1 : 2);
+    size_t done_pay_len = rx_port_counts_bytes(comm);
+    const void *done_pay = (done_pay_len > 0u) ? (const void *)slot->rx_qp_pkts : NULL;
+    rx_send_ctrl(comm, &dhdr, done_pay, done_pay_len, (slot->num_gens > 1u) ? 1 : 2);
 
     if (used_fec) {
         req->any_gen_used_fec = true;
         atomic_fetch_add_explicit(&vxf_st_rx_fec_decodes, 1, memory_order_relaxed);
+        if (slot->cuda_repaired)
+            atomic_fetch_add_explicit(&vxf_st_rx_cuda_repair_completions, 1, memory_order_relaxed);
     }
 
     if (rx_req_set_gen_bit(req, slot->gen_idx))
@@ -1894,7 +2649,7 @@ static void rx_finish_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, bool 
         atomic_fetch_add_explicit(&vxf_st_rx_messages, 1, memory_order_relaxed);
         if (!req->any_gen_used_fec)
             atomic_fetch_add_explicit(&vxf_st_rx_fast_completions, 1, memory_order_relaxed);
-        req->done = true;
+        rx_mark_req_done_locked(comm, req);
     }
 }
 
@@ -1925,15 +2680,16 @@ static int rx_try_rs8_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
         return -1;
 
     uint32_t rs_m = 256u - K;
-    vxfec_vk_ctx *prefer_vk = (slot->bound_req && slot->bound_req->mr) ? slot->bound_req->mr->vk_ctx : NULL;
+    const vxfec_mr_t *prefer_mr = slot->bound_req ? slot->bound_req->mr : NULL;
 
-    if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->vk_buf &&
-        !rx_slot_overflows_req(slot)) {
+    if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA &&
+        vxf_mr_can_gpu_rw(slot->bound_req->mr) && !rx_slot_overflows_req(slot)) {
         vxfec_mr_t *dmr = slot->bound_req->mr;
         size_t target_off = (size_t)((uintptr_t)slot->bound_req->dst_ptr - (uintptr_t)dmr->base_ptr) + slot->gen_offset;
-        vxfec_gpu_job_t *vjob = vxf_rs8_gpu_job_new(prefer_vk, true, K, rs_m, erased_k, parity_m, missing, slot->sym_T);
+        vxfec_gpu_job_t *vjob =
+            vxf_mr_has_gpu_buf(dmr) ? vxf_rs8_gpu_job_new(dmr, true, K, rs_m, erased_k, parity_m, missing, slot->sym_T) : NULL;
         if (vjob) {
-            uint8_t *st = (uint8_t *)vxfec_vk_buf_staging_ptr(vjob->in_buf);
+            uint8_t *st = (uint8_t *)vxf_gpu_job_in_ptr(vjob);
             uint32_t rep_cur = 0u;
             for (uint32_t r = 0; r < slot->rx_rep_cnt && rep_cur < missing; r++) {
                 uint32_t esi = slot->rep_esis[r];
@@ -1942,7 +2698,8 @@ static int rx_try_rs8_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
                     rep_cur++;
                 }
             }
-            if (vxf_rs8_gpu_job_submit_vram_rep(vjob, slot->sys_bitmap, dmr->vk_buf, target_off, slot->total_bytes, slot->sym_T)) {
+            if (vxf_rs8_gpu_job_submit_vram_rep(vjob, slot->sys_bitmap, dmr, target_off, slot->total_bytes, slot->sym_T)) {
+                vxf_gpu_track_direct_job(vjob, &slot->bound_req->direct_jobs);
                 slot->rs8_gpu_job = vjob;
                 slot->vk_missing = missing;
                 slot->vk_stride = slot->sym_T;
@@ -2030,9 +2787,9 @@ static int rx_try_rs8_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
         }
     }
 
-    vxfec_gpu_job_t *job = vxf_rs8_gpu_job_new(prefer_vk, true, K, rs_m, erased_k, parity_m, missing, slot->sym_T);
+    vxfec_gpu_job_t *job = vxf_rs8_gpu_job_new(prefer_mr, true, K, rs_m, erased_k, parity_m, missing, slot->sym_T);
     if (job) {
-        memcpy(vxfec_vk_buf_staging_ptr(job->in_buf), compact, k_bytes);
+        memcpy(vxf_gpu_job_in_ptr(job), compact, k_bytes);
         if (vxf_rs8_gpu_job_submit(job, slot->sym_T)) {
             slot->rs8_gpu_job = job;
             slot->vk_missing = missing;
@@ -2111,12 +2868,14 @@ static void rx_rq_apply_recovery(vxfec_rx_slot_t *slot, uint8_t *sys_base, const
 
 static bool rx_poll_rq_recovery(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
 {
-    if (slot->rx_sys_cnt != slot->K) {
-        int status = vxf_gpu_job_poll(slot->rq_gpu_job);
-        if (status == 0)
-            return false;
+    int status = vxf_gpu_job_poll(slot->rq_gpu_job);
+    if (status == 0)
+        return false;
+    if (status == VXF_GPURT_POLL_UNSAFE) {
+        slot->stage_failed = true;
+    } else if (slot->rx_sys_cnt != slot->K) {
         if (status > 0) {
-            if (slot->direct_vram) {
+            if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA) {
                 for (uint32_t r = 0; r < slot->rq_gpu_count; r++) {
                     uint32_t e = slot->rq_gpu_missing[r];
                     uint8_t mask = (uint8_t)(1u << (e & 7u));
@@ -2131,10 +2890,11 @@ static bool rx_poll_rq_recovery(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
                 uint8_t *sys_base = rx_slot_sys_base(comm, slot);
                 if (sys_base)
                     rx_rq_apply_recovery(slot, sys_base, slot->rq_gpu_missing, slot->rq_gpu_count, slot->rq_gpu_stride,
-                                         vxfec_vk_buf_staging_ptr(slot->rq_gpu_job->out_buf));
+                                         vxf_gpu_job_out_ptr(slot->rq_gpu_job));
                 else
                     slot->stage_failed = true;
             }
+            slot->cuda_repaired = slot->fec_repaired && slot->rq_gpu_job->gpurt_kind == VXF_GPURT_CUDA;
         } else {
             slot->rq_gpu_disabled = true;
         }
@@ -2265,16 +3025,17 @@ static bool rx_try_rq_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
     uint32_t stride = nanorq_core_recommended_stride(slot->sym_T);
     size_t d_bytes = (size_t)rows * stride;
     size_t rec_bytes = (size_t)missing * stride;
-    vxfec_vk_ctx *prefer_vk = (slot->bound_req && slot->bound_req->mr) ? slot->bound_req->mr->vk_ctx : NULL;
+    const vxfec_mr_t *prefer_mr = slot->bound_req ? slot->bound_req->mr : NULL;
 
-    if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->vk_buf &&
-        !rx_slot_overflows_req(slot)) {
+    if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA &&
+        vxf_mr_can_gpu_rw(slot->bound_req->mr) && !rx_slot_overflows_req(slot)) {
         vxfec_mr_t *dmr = slot->bound_req->mr;
         size_t target_off = (size_t)((uintptr_t)slot->bound_req->dst_ptr - (uintptr_t)dmr->base_ptr) + slot->gen_offset;
-        vxfec_gpu_job_t *vjob = slot->rq_gpu_disabled ? NULL : vxf_rq_gpu_job_new(prefer_vk, &dec, &S_dec, d_bytes, rec_bytes);
+        vxfec_gpu_job_t *vjob =
+            (vxf_mr_has_gpu_buf(dmr) && !slot->rq_gpu_disabled) ? vxf_rq_gpu_job_new(dmr, &dec, &S_dec, d_bytes, rec_bytes) : NULL;
         if (vjob) {
             uint32_t sh = nanorq_core_get_pc_genc_offset(&dec);
-            uint8_t *st = (uint8_t *)vxfec_vk_buf_staging_ptr(vjob->in_buf);
+            uint8_t *st = (uint8_t *)vxf_gpu_job_in_ptr(vjob);
             for (uint32_t r = 0; r < missing; r++) {
                 memcpy(st + (size_t)(sh + miss_esis[r]) * stride, slot->rep_data + (size_t)(rep_offset + r) * slot->sym_T,
                        slot->sym_T);
@@ -2283,8 +3044,9 @@ static bool rx_try_rq_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
                 memcpy(st + (size_t)(sh + dec.P.Kprime + r) * stride,
                        slot->rep_data + (size_t)(rep_offset + missing + r) * slot->sym_T, slot->sym_T);
             }
-            if (vxf_rq_gpu_job_submit_vram_rep(vjob, &dec, slot->sys_bitmap, slot->K, slot->sym_T, dmr->vk_buf, target_off,
+            if (vxf_rq_gpu_job_submit_vram_rep(vjob, &dec, slot->sys_bitmap, slot->K, slot->sym_T, dmr, target_off,
                                                slot->total_bytes, stride, miss_esis, missing, overhead)) {
+                vxf_gpu_track_direct_job(vjob, &slot->bound_req->direct_jobs);
                 slot->rq_gpu_job = vjob;
                 slot->rq_gpu_missing = miss_esis;
                 slot->rq_gpu_count = missing;
@@ -2343,10 +3105,9 @@ static bool rx_try_rq_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
     if (!sys_base)
         goto out;
 
-    vxfec_gpu_job_t *job = slot->rq_gpu_disabled ? NULL : vxf_rq_gpu_job_new(prefer_vk, &dec, &S_dec, d_bytes, rec_bytes);
+    vxfec_gpu_job_t *job = slot->rq_gpu_disabled ? NULL : vxf_rq_gpu_job_new(prefer_mr, &dec, &S_dec, d_bytes, rec_bytes);
     if (job) {
-        rx_rq_fill_matrix(vxfec_vk_buf_staging_ptr(job->in_buf), stride, &dec, d_bytes, slot, sys_base, miss_esis, missing,
-                          rep_offset, overhead);
+        rx_rq_fill_matrix(vxf_gpu_job_in_ptr(job), stride, &dec, d_bytes, slot, sys_base, miss_esis, missing, rep_offset, overhead);
         if (vxf_rq_gpu_job_submit(job, &dec, stride, miss_esis, missing)) {
             slot->rq_gpu_job = job;
             slot->rq_gpu_missing = miss_esis;
@@ -2425,6 +3186,15 @@ static void rx_send_sack_missing(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
     if (cnt == 0u)
         return;
 
+    uint8_t sack_pay[VXFEC_SACK_MAX * sizeof(uint32_t) + sizeof(slot->rx_qp_pkts)];
+    size_t sack_bytes = (size_t)cnt * sizeof(uint32_t);
+    memcpy(sack_pay, sack_list, sack_bytes);
+    size_t port_bytes = rx_port_counts_bytes(comm);
+    if (port_bytes > 0u) {
+        memcpy(sack_pay + sack_bytes, slot->rx_qp_pkts, port_bytes);
+        sack_bytes += port_bytes;
+    }
+
     vxfec_ctrl_pkt_t shdr = {
         .magic = VXFEC_NET_MAGIC,
         .cookie = comm->cookie,
@@ -2433,8 +3203,11 @@ static void rx_send_sack_missing(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
         .msg_seq = slot->msg_seq,
         .tag = slot->tag,
         .K = slot->K,
+        .rx_pkts = slot->rx_pkt_cnt,
+        .ecn_ce_pkts = slot->rx_ecn_ce_cnt,
+        .ecn_port_mask = slot->ecn_port_mask,
     };
-    rx_send_ctrl(comm, &shdr, sack_list, cnt * sizeof(uint32_t), 1);
+    rx_send_ctrl(comm, &shdr, sack_pay, sack_bytes, 1);
 }
 
 static int rx_poll_vk_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
@@ -2446,8 +3219,19 @@ static int rx_poll_vk_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
     if (pst == 0)
         return 0;
 
+    if (pst == VXF_GPURT_POLL_UNSAFE) {
+        slot->stage_failed = true;
+        release_rx_slot_vk(slot);
+        return -1;
+    }
+
+    if (slot->rx_sys_cnt == slot->K) {
+        release_rx_slot_vk(slot);
+        return 1;
+    }
+
     if (pst == 1) {
-        if (slot->direct_vram) {
+        if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA) {
             for (uint32_t i = 0; i < slot->vk_missing; i++) {
                 uint32_t e = (uint32_t)job->rs8_erased_k[i];
                 uint8_t mask = (uint8_t)(1u << (e & 7u));
@@ -2457,12 +3241,13 @@ static int rx_poll_vk_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
                 }
             }
             slot->fec_repaired = true;
+            slot->cuda_repaired = job->gpurt_kind == VXF_GPURT_CUDA;
             atomic_fetch_add_explicit(&vxf_st_rx_rs8_decodes, 1, memory_order_relaxed);
             release_rx_slot_vk(slot);
             return 1;
         }
         uint8_t *sys_base = rx_slot_sys_base(comm, slot);
-        const uint8_t *rec = job->out_buf ? (const uint8_t *)vxfec_vk_buf_staging_ptr(job->out_buf) : NULL;
+        const uint8_t *rec = (const uint8_t *)vxf_gpu_job_out_ptr(job);
         if (!sys_base || !rec) {
             slot->stage_failed = true;
             release_rx_slot_vk(slot);
@@ -2482,6 +3267,7 @@ static int rx_poll_vk_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
             slot->rx_sys_cnt++;
         }
         slot->fec_repaired = true;
+        slot->cuda_repaired = job->gpurt_kind == VXF_GPURT_CUDA;
         atomic_fetch_add_explicit(&vxf_st_rx_rs8_decodes, 1, memory_order_relaxed);
         release_rx_slot_vk(slot);
         return 1;
@@ -2513,7 +3299,7 @@ static int rx_poll_vk_decode(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot)
             }
         }
     }
-    if (slot->direct_vram && !cpu_ok)
+    if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA && !cpu_ok)
         slot->stage_failed = true;
     release_rx_slot_vk(slot);
     return cpu_ok ? 1 : -1;
@@ -2531,7 +3317,7 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
     }
     if (slot->rq_gpu_job && !slot->stage_failed && !rx_poll_rq_recovery(comm, slot))
         return;
-    if (slot->rs8_gpu_job && !slot->stage_failed && slot->rx_sys_cnt != slot->K) {
+    if (slot->rs8_gpu_job && !slot->stage_failed) {
         int pst = rx_poll_vk_decode(comm, slot);
         if (pst == 0)
             return;
@@ -2550,14 +3336,25 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
     }
 
     uint64_t grace_ns = rx_reorder_grace_ns(comm);
+    if (comm->num_ports > 1u && grace_ns < 250000ULL)
+        grace_ns = 250000ULL;
+    else if (comm->ibv_ep && grace_ns < 150000ULL)
+        grace_ns = 150000ULL;
+    uint64_t tail_ref_ns = slot->tail_seen_ns;
+    if (slot->last_pkt_ns > tail_ref_ns) {
+        uint64_t max_stretch = slot->tail_seen_ns + 32ULL * grace_ns;
+        tail_ref_ns = (slot->last_pkt_ns < max_stretch) ? slot->last_pkt_ns : max_stretch;
+    }
     uint64_t fb_cool_ns = rx_fb_cooldown_ns(comm);
     uint64_t idle_tail_ns = rx_idle_tail_ns(comm);
+    if (!slot->tail_seen && slot->K >= 16u && idle_tail_ns < 2500000ULL)
+        idle_tail_ns = 2500000ULL;
 
     if (slot->flags == WIRE_FLAG_NOFEC_GBN) {
         uint64_t gbn_cool_ns = rx_gbn_cooldown_ns(comm);
         if (!slot->tail_seen && (now_ns - slot->last_pkt_ns) < idle_tail_ns)
             return;
-        if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - slot->tail_seen_ns) < grace_ns)
+        if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - tail_ref_ns) < grace_ns)
             return;
         if (slot->initial_missing_sys == 0u)
             slot->initial_missing_sys = missing;
@@ -2589,7 +3386,7 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
     if (slot->flags == WIRE_FLAG_SACK_ONLY) {
         if (!slot->tail_seen && (now_ns - slot->last_pkt_ns) < idle_tail_ns)
             return;
-        if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - slot->tail_seen_ns) < grace_ns)
+        if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - tail_ref_ns) < grace_ns)
             return;
         if (slot->initial_missing_sys == 0u)
             slot->initial_missing_sys = missing;
@@ -2614,6 +3411,8 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
                 rx_finish_slot(comm, slot, true);
                 return;
             }
+            if (slot->stage_failed)
+                return;
             uint8_t promo_flag = WIRE_FLAG_RQ_GF256;
             (void)choose_rq_overflow_codec(slot->K, comm->features, &promo_flag);
             rx_promote_slot_to_rq(slot, promo_flag);
@@ -2623,6 +3422,8 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
                     rx_finish_slot(comm, slot, true);
                 return;
             }
+            if (slot->stage_failed)
+                return;
             slot->ir_slack += 4u;
         }
         dec = harq_plan_feedback(missing, slot->rx_rep_cnt, 2u, slot->ir_slack);
@@ -2630,7 +3431,7 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
 
     if (!slot->tail_seen && (now_ns - slot->last_pkt_ns) < idle_tail_ns)
         return;
-    if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - slot->tail_seen_ns) < grace_ns)
+    if (slot->tail_seen && slot->last_fb_ns == 0u && (now_ns - tail_ref_ns) < grace_ns)
         return;
     if (slot->initial_missing_sys == 0u)
         slot->initial_missing_sys = missing;
@@ -2660,17 +3461,35 @@ static void rx_evaluate_slot(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uin
             .msg_seq = slot->msg_seq,
             .tag = slot->tag,
             .K = slot->K,
+            .rx_pkts = slot->rx_pkt_cnt,
+            .ecn_ce_pkts = slot->rx_ecn_ce_cnt,
+            .ecn_port_mask = slot->ecn_port_mask,
             .esi = start_esi,
             .ir_count = dec.request_count,
         };
-        rx_send_ctrl(comm, &ihdr, NULL, 0, 1);
+        size_t ir_pay_len = rx_port_counts_bytes(comm);
+        const void *ir_pay = (ir_pay_len > 0u) ? (const void *)slot->rx_qp_pkts : NULL;
+        rx_send_ctrl(comm, &ihdr, ir_pay, ir_pay_len, 1);
     }
 }
 
-static void rx_apply_direct_sys_sym(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uint32_t e, bool need_win_ack, uint64_t now_ns)
+static void rx_apply_direct_sys_sym(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uint32_t port, uint32_t e, bool need_win_ack,
+                                    uint64_t now_ns)
 {
     if (!slot || !slot->sys_bitmap || e >= slot->K)
         return;
+    if (port < VXFEC_IBV_MAX_QPS && slot->rx_qp_pkts[port] < UINT16_MAX)
+        slot->rx_qp_pkts[port]++;
+    if ((size_t)e * slot->sym_T < slot->total_bytes) {
+        atomic_fetch_add_explicit(&vxf_st_rx_sys_pkts, 1, memory_order_relaxed);
+        /* CTS permits RDMA into a CUDA destination only when its DMA-BUF MR is registered. */
+        if (slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA) {
+            atomic_fetch_add_explicit(&vxf_st_rx_sys_gpu_direct_pkts, 1, memory_order_relaxed);
+            unsigned dev = (unsigned)comm->comm_dev_idx;
+            if (dev < VXFEC_MAX_DEVS)
+                atomic_fetch_add_explicit(&vxf_st_rail_rx_gpu_direct_pkts[dev], 1, memory_order_relaxed);
+        }
+    }
     slot->last_pkt_ns = now_ns;
     slot->rx_pkt_cnt++;
     if (need_win_ack && slot->probe_rx_ns == 0u)
@@ -2691,6 +3510,81 @@ static void rx_apply_direct_sys_sym(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *sl
         rx_send_win_ack(comm, slot);
 }
 
+static void rx_apply_direct_rep_sym(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *slot, uint32_t port, uint32_t rep_ord,
+                                    const uint8_t *pay, bool need_win_ack, uint64_t now_ns)
+{
+    if (!slot || !pay)
+        return;
+    if (port < VXFEC_IBV_MAX_QPS && slot->rx_qp_pkts[port] < UINT16_MAX)
+        slot->rx_qp_pkts[port]++;
+    uint32_t esi = slot->K + rep_ord;
+    slot->last_pkt_ns = now_ns;
+    slot->rx_pkt_cnt++;
+    if (need_win_ack && slot->probe_rx_ns == 0u)
+        slot->probe_rx_ns = now_ns;
+    if (!slot->tail_seen && esi < UINT32_MAX && esi + 1u > slot->max_init_esi_plus1)
+        slot->max_init_esi_plus1 = esi + 1u;
+
+    /* After promotion the sender uses tagged packets for every RaptorQ repair.
+     * A headerless repair still in flight therefore belongs to the old RS8 epoch. */
+    if (slot->codec_promoted || slot->flags == WIRE_FLAG_NOFEC_GBN || slot->flags == WIRE_FLAG_SACK_ONLY) {
+        if (need_win_ack && slot->rx_sys_cnt < slot->K)
+            rx_send_win_ack(comm, slot);
+        return;
+    }
+    if (slot->flags == WIRE_FLAG_RS_CAUCHY8 && esi >= 256u) {
+        if (need_win_ack && slot->rx_sys_cnt < slot->K)
+            rx_send_win_ack(comm, slot);
+        return;
+    }
+
+    uint32_t max_rep_cap = (slot->K > UINT32_MAX - 64u) ? UINT32_MAX : (slot->K + 64u);
+    if (max_rep_cap < 256u)
+        max_rep_cap = 256u;
+    if (slot->rx_rep_cnt >= max_rep_cap) {
+        if (need_win_ack && slot->rx_sys_cnt < slot->K)
+            rx_send_win_ack(comm, slot);
+        return;
+    }
+
+    for (uint32_t r = 0; r < slot->rx_rep_cnt; r++) {
+        if (slot->rep_esis[r] == esi)
+            goto check_ack;
+    }
+
+    if (slot->rx_rep_cnt == slot->rep_cap) {
+        uint32_t ncap = slot->rep_cap ? (slot->rep_cap * 2u) : 32u;
+        if (ncap > max_rep_cap)
+            ncap = max_rep_cap;
+        uint32_t *ne = (uint32_t *)malloc(ncap * sizeof(uint32_t));
+        uint8_t *nd = (uint8_t *)malloc((size_t)ncap * slot->sym_T);
+        if (!ne || !nd) {
+            free(nd);
+            free(ne);
+            return;
+        }
+        if (slot->rx_rep_cnt > 0u) {
+            memcpy(ne, slot->rep_esis, slot->rx_rep_cnt * sizeof(uint32_t));
+            memcpy(nd, slot->rep_data, (size_t)slot->rx_rep_cnt * slot->sym_T);
+        }
+        free(slot->rep_esis);
+        free(slot->rep_data);
+        slot->rep_esis = ne;
+        slot->rep_data = nd;
+        slot->rep_cap = ncap;
+    }
+    uint32_t idx = slot->rx_rep_cnt++;
+    slot->rep_esis[idx] = esi;
+    memcpy(slot->rep_data + (size_t)idx * slot->sym_T, pay, slot->sym_T);
+    if (esi > slot->max_rep_esi)
+        slot->max_rep_esi = esi;
+
+check_ack:;
+    uint32_t ack_cadence = (slot->num_gens > 1u) ? VXFEC_SLICE_WIN_ACK_PKTS : VXFEC_WIN_ACK_PKTS;
+    if (slot->rx_sys_cnt < slot->K && (need_win_ack || (slot->rx_pkt_cnt - slot->last_acked_pkts) >= ack_cadence))
+        rx_send_win_ack(comm, slot);
+}
+
 static void rx_replay_early_rdma_syms(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *s, uint64_t now_ns)
 {
     vxfec_rx_req_t *req = s->bound_req;
@@ -2698,14 +3592,30 @@ static void rx_replay_early_rdma_syms(vxfec_recv_comm_t *comm, vxfec_rx_slot_t *
         return;
     uint32_t dst = 0u;
     for (uint32_t i = 0; i < req->early_rdma_cnt; i++) {
-        uint32_t packed = req->early_rdma_syms[i];
-        uint16_t g = (uint16_t)(packed >> 17u);
-        bool need_ack = ((packed >> 16u) & 1u) != 0u;
-        uint32_t e = packed & 0xffffu;
-        if (g == s->gen_idx)
-            rx_apply_direct_sys_sym(comm, s, e, need_ack, now_ns);
-        else
-            req->early_rdma_syms[dst++] = packed;
+        uint64_t entry = req->early_rdma_syms[i];
+        uint32_t port = (uint32_t)(entry >> 32u);
+        uint32_t packed = (uint32_t)entry;
+        if ((packed & (1u << 31u)) != 0u) {
+            uint16_t g = (uint16_t)((packed >> 15u) & 0x3fu);
+            bool need_ack = ((packed >> 14u) & 1u) != 0u;
+            uint32_t rep_slot = (packed >> 6u) & 0xffu;
+            uint32_t rep_ord = packed & 0x3fu;
+            if (g == s->gen_idx) {
+                if (comm->ibv_rep_buf)
+                    rx_apply_direct_rep_sym(comm, s, port, rep_ord, comm->ibv_rep_buf + (size_t)rep_slot * VXFEC_MAX_SYM_T,
+                                            need_ack, now_ns);
+            } else {
+                req->early_rdma_syms[dst++] = entry;
+            }
+        } else {
+            uint16_t g = (uint16_t)(packed >> 17u);
+            bool need_ack = ((packed >> 16u) & 1u) != 0u;
+            uint32_t e = packed & 0xffffu;
+            if (g == s->gen_idx)
+                rx_apply_direct_sys_sym(comm, s, port, e, need_ack, now_ns);
+            else
+                req->early_rdma_syms[dst++] = entry;
+        }
     }
     req->early_rdma_cnt = dst;
 }
@@ -2755,9 +3665,13 @@ static vxfec_rx_slot_t *rx_find_or_create_slot(vxfec_recv_comm_t *comm, const vx
     uint32_t i = (uint32_t)free_idx;
     vxfec_rx_slot_t *s = &comm->slots[i];
     memset(s, 0, sizeof(*s));
-    s->sys_bitmap = (uint8_t *)calloc(((size_t)exp_k + 7u) / 8u, 1u);
-    if (!s->sys_bitmap)
-        return NULL;
+    if (exp_k <= 256u) {
+        s->sys_bitmap = s->inline_bitmap;
+    } else {
+        s->sys_bitmap = (uint8_t *)calloc(((size_t)exp_k + 7u) / 8u, 1u);
+        if (!s->sys_bitmap)
+            return NULL;
+    }
     s->slot_idx = (uint8_t)i;
     s->active = true;
     s->msg_seq = hdr->msg_seq;
@@ -2868,7 +3782,7 @@ static void rx_process_wire_pkt(vxfec_recv_comm_t *comm, uint32_t p, const uint8
             vxfec_rx_req_t *req = &comm->rx_pool[r];
             if (req->in_use && !req->done && req->tag == hdr.tag && req->expected_tag_seq == hdr.tag_seq) {
                 req->status = ncclRemoteError;
-                req->done = true;
+                rx_mark_req_done_locked(comm, req);
                 matched_req = true;
                 break;
             }
@@ -3009,9 +3923,13 @@ static void rx_process_wire_pkt(vxfec_recv_comm_t *comm, uint32_t p, const uint8
         }
         if (hdr.sym_len != exp_len || pay_avail < (size_t)exp_len)
             return;
+        if (exp_len > 0u)
+            atomic_fetch_add_explicit(&vxf_st_rx_sys_pkts, 1, memory_order_relaxed);
 
         slot->last_pkt_ns = now_ns;
         slot->rx_pkt_cnt++;
+        if (p < VXFEC_MAX_PORTS && slot->rx_qp_pkts[p] < UINT16_MAX)
+            slot->rx_qp_pkts[p]++;
         if (need_win_ack && slot->probe_rx_ns == 0u)
             slot->probe_rx_ns = now_ns;
         if (!slot->tail_seen && hdr.esi < UINT32_MAX && hdr.esi + 1u > slot->max_init_esi_plus1)
@@ -3024,8 +3942,8 @@ static void rx_process_wire_pkt(vxfec_recv_comm_t *comm, uint32_t p, const uint8
         }
 
         if (!(slot->sys_bitmap[e >> 3u] & (1u << (e & 7u)))) {
-            if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->vk_buf &&
-                !rx_slot_overflows_req(slot)) {
+            if (slot->direct_vram && slot->bound_req && slot->bound_req->mr && slot->bound_req->mr->ptr_type == NCCL_PTR_CUDA &&
+                vxf_mr_can_gpu_rw(slot->bound_req->mr) && !rx_slot_overflows_req(slot)) {
                 size_t sub_off = (size_t)((uintptr_t)slot->bound_req->dst_ptr - (uintptr_t)slot->bound_req->mr->base_ptr) +
                                  slot->gen_offset + off;
                 if (exp_len > 0u && !vxf_mr_vk_write(slot->bound_req->mr, sub_off, pay, exp_len)) {
@@ -3060,6 +3978,8 @@ static void rx_process_wire_pkt(vxfec_recv_comm_t *comm, uint32_t p, const uint8
 
         slot->last_pkt_ns = now_ns;
         slot->rx_pkt_cnt++;
+        if (p < VXFEC_MAX_PORTS && slot->rx_qp_pkts[p] < UINT16_MAX)
+            slot->rx_qp_pkts[p]++;
         if (need_win_ack && slot->probe_rx_ns == 0u)
             slot->probe_rx_ns = now_ns;
         if (!slot->tail_seen && hdr.esi < UINT32_MAX && hdr.esi + 1u > slot->max_init_esi_plus1)
@@ -3161,6 +4081,22 @@ static void rx_quiesce_broken_ibv(vxfec_recv_comm_t *comm)
     if ((!comm->ibv_ep || !vxfec_ibv_ep_has_error(comm->ibv_ep)) && !comm->ibv_failed)
         return;
     comm->ibv_failed = true;
+    if (comm->ibv_ep) {
+        /* A posted CTS exposes the receive buffer until the peer QPs stop. */
+        if (!vxfec_ibv_ep_destroy(comm->ibv_ep))
+            return;
+        comm->ibv_ep = NULL;
+        if (comm->ibv_rep_mr) {
+            vxfec_ibv_mr_dereg(comm->ibv_rep_mr);
+            comm->ibv_rep_mr = NULL;
+        }
+        free(comm->ibv_rep_buf);
+        comm->ibv_rep_buf = NULL;
+        if (comm->ibv_ref) {
+            vxf_ibv_ref_release(comm->ibv_ref);
+            comm->ibv_ref = NULL;
+        }
+    }
 #if VXFEC_ENABLE_SIM
     while (comm->delay_q && comm->delay_cnt > 0u) {
         const vxfec_delay_data_t *dd = &comm->delay_q[comm->delay_head];
@@ -3199,14 +4135,7 @@ static void rx_quiesce_broken_ibv(vxfec_recv_comm_t *comm)
         vxfec_rx_req_t *req = &comm->rx_pool[r];
         if (req->in_use && !req->done) {
             req->status = ncclSystemError;
-            req->done = true;
-        }
-    }
-    if (comm->ibv_ep && vxfec_ibv_ep_destroy(comm->ibv_ep)) {
-        comm->ibv_ep = NULL;
-        if (comm->ibv_ref) {
-            vxf_ibv_ref_release(comm->ibv_ref);
-            comm->ibv_ref = NULL;
+            rx_mark_req_done_locked(comm, req);
         }
     }
 }
@@ -3296,20 +4225,22 @@ static void rx_receive_header(vxfec_recv_comm_t *comm, const uint8_t *buf, size_
         pkt->len = (uint16_t)len;
         memcpy(pkt->data, buf, len);
         if (++comm->header_delay_cnt == 1u)
-            vxf_rx_bg_schedule_delay();
+            vxf_rx_bg_schedule_delay(comm->dev_idx);
         return;
     }
 #endif
     rx_process_wire_pkt(comm, 0u, buf, len, false, now_ns);
 }
 
-void vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns)
+bool vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns)
 {
+    bool did = false;
 #if VXFEC_ENABLE_SIM
-    (void)vxf_rx_deliver_due_headers(comm, now_ns);
+    if (vxf_rx_deliver_due_headers(comm, now_ns))
+        did = true;
 #endif
     if (comm->ctrl_fd < 0)
-        return;
+        return did;
     uint8_t cbuf[sizeof(vxfec_wire_hdr_ext_t)];
     for (;;) {
 #if VXFEC_ENABLE_SIM
@@ -3319,8 +4250,10 @@ void vxf_rx_drain_ctrl_wire(vxfec_recv_comm_t *comm, uint64_t now_ns)
         ssize_t n = recv(comm->ctrl_fd, cbuf, sizeof(cbuf), MSG_DONTWAIT);
         if (n <= 0)
             break;
+        did = true;
         rx_receive_header(comm, cbuf, (size_t)n, now_ns);
     }
+    return did;
 }
 
 void vxf_rx_bg_peek_data_ports(vxfec_recv_comm_t *comm)
@@ -3370,72 +4303,129 @@ static uint32_t rx_batch_capacity(vxfec_recv_comm_t *comm, uint64_t delay_ns, ui
     return max;
 }
 
-static void rx_process_rdma_imm(vxfec_recv_comm_t *comm, uint32_t imm, uint64_t now_ns)
+static void rx_process_rdma_imm(vxfec_recv_comm_t *comm, uint32_t port, uint32_t imm, uint64_t now_ns)
 {
-    bool sliced = false, need_ack = false;
-    uint8_t rslot = 0u, token = 0u;
+    bool sliced = false, is_repair = false, need_ack = false;
+    uint8_t rslot = 0u, token = 0u, rep_slot = 0u;
     uint16_t gen_idx = 0u;
-    uint32_t esi = 0u;
-    unpack_rdma_imm(imm, &sliced, &rslot, &token, &need_ack, &gen_idx, &esi);
-    if (rslot >= NCCL_NET_MAX_REQUESTS || token == 0u || esi > 0xffffu || gen_idx >= 16384u)
+    uint32_t esi_or_ord = 0u;
+    unpack_rdma_imm(imm, comm->features, &sliced, &is_repair, &rslot, &token, &need_ack, &rep_slot, &gen_idx, &esi_or_ord);
+    if (rslot >= NCCL_NET_MAX_REQUESTS || token == 0u || esi_or_ord > 0xffffu)
         return;
 
     vxfec_rx_req_t *req = &comm->rx_pool[rslot];
     if (!req->in_use || req->done || !req->rdma_cts_sent || req->cts_token != token)
         return;
+    if (is_repair && !comm->ibv_rep_buf)
+        return;
     rx_confirm_handshake(comm);
 
-    for (uint32_t w = 0; w < VXFEC_RX_WIRE_SLOTS / 64u; w++) {
-        uint64_t m = comm->active_slot_mask[w];
-        while (m) {
-            uint32_t i = w * 64u + (uint32_t)__builtin_ctzll(m);
-            m &= m - 1ULL;
-            vxfec_rx_slot_t *s = &comm->slots[i];
-            if (s->active && s->bound_req == req && s->gen_idx == gen_idx && (!sliced || s->num_gens > 1u)) {
-                if (!s->direct_vram && s->sys_stage == NULL)
-                    s->direct_vram = true;
-                rx_apply_direct_sys_sym(comm, s, esi, need_ack, now_ns);
-                return;
+    vxfec_rx_slot_t *hit = NULL;
+    if (gen_idx < 64u && req->gen_to_slot[gen_idx] >= 0) {
+        vxfec_rx_slot_t *cand = &comm->slots[req->gen_to_slot[gen_idx]];
+        if (cand->active && cand->bound_req == req && cand->gen_idx == gen_idx && (!sliced || cand->num_gens > 1u))
+            hit = cand;
+    }
+    if (!hit) {
+        for (uint32_t w = 0; w < VXFEC_RX_WIRE_SLOTS / 64u && !hit; w++) {
+            uint64_t m = comm->active_slot_mask[w];
+            while (m) {
+                uint32_t i = w * 64u + (uint32_t)__builtin_ctzll(m);
+                m &= m - 1ULL;
+                vxfec_rx_slot_t *s = &comm->slots[i];
+                if (s->active && s->bound_req == req && s->gen_idx == gen_idx && (!sliced || s->num_gens > 1u)) {
+                    hit = s;
+                    break;
+                }
             }
         }
     }
+    if (hit) {
+        if (!hit->direct_vram && hit->sys_stage == NULL)
+            hit->direct_vram = true;
+        if (is_repair)
+            rx_apply_direct_rep_sym(comm, hit, port, esi_or_ord, comm->ibv_rep_buf + (size_t)rep_slot * VXFEC_MAX_SYM_T, need_ack,
+                                    now_ns);
+        else
+            rx_apply_direct_sys_sym(comm, hit, port, esi_or_ord, need_ack, now_ns);
+        return;
+    }
 
-    if (req->expected_num_gens > 0u && rx_req_test_gen_bit(req, gen_idx))
+    if (req->expected_num_gens > 0u && (gen_idx >= req->expected_num_gens || rx_req_test_gen_bit(req, gen_idx)))
         return;
 
-    uint32_t packed = ((uint32_t)gen_idx << 17u) | ((need_ack ? 1u : 0u) << 16u) | (esi & 0xffffu);
+    uint32_t packed = is_repair ? ((1u << 31u) | ((uint32_t)(gen_idx & 0x3fu) << 15u) | ((need_ack ? 1u : 0u) << 14u) |
+                                   ((uint32_t)rep_slot << 6u) | (esi_or_ord & 0x3fu))
+                                : (((uint32_t)gen_idx << 17u) | ((need_ack ? 1u : 0u) << 16u) | (esi_or_ord & 0xffffu));
+    uint64_t entry = ((uint64_t)(port & 0xffu) << 32u) | (uint64_t)packed;
     if (req->early_rdma_cnt == req->early_rdma_cap) {
         uint32_t ncap = req->early_rdma_cap ? (req->early_rdma_cap * 2u) : 64u;
         if (ncap > 65536u)
             return;
-        uint32_t *nb = (uint32_t *)realloc(req->early_rdma_syms, (size_t)ncap * sizeof(*nb));
+        uint64_t *nb = (uint64_t *)realloc(req->early_rdma_syms, (size_t)ncap * sizeof(*nb));
         if (!nb)
             return;
         req->early_rdma_syms = nb;
         req->early_rdma_cap = ncap;
     }
-    req->early_rdma_syms[req->early_rdma_cnt++] = packed;
+    req->early_rdma_syms[req->early_rdma_cnt++] = entry;
 }
 
-static void rx_receive_rdma_imm(vxfec_recv_comm_t *comm, uint32_t port, uint32_t imm, uint64_t now_ns, uint64_t delay_ns)
+#if VXFEC_ENABLE_SIM
+/* insert into delay_q sorted by deliver_ns while preserving per-port FIFO order */
+static vxfec_delay_data_t *rx_alloc_delay_slot(vxfec_recv_comm_t *comm, uint32_t port, uint64_t now_ns, uint64_t delay_ns,
+                                               bool asym_links)
+{
+    if (!comm->delay_q)
+        comm->delay_q = calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
+    if (!comm->delay_q || comm->delay_cnt == VXFEC_DELAY_RING) {
+        atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
+        return NULL;
+    }
+    uint64_t deliver_ns = now_ns + delay_ns;
+    if (asym_links) {
+        if (port < VXFEC_MAX_PORTS) {
+            if (deliver_ns < comm->port_last_deliver_ns[port])
+                deliver_ns = comm->port_last_deliver_ns[port];
+            comm->port_last_deliver_ns[port] = deliver_ns;
+        }
+        uint32_t pos = comm->delay_cnt++;
+        while (pos > 0u) {
+            uint32_t prev_idx = (comm->delay_head + pos - 1u) & (VXFEC_DELAY_RING - 1u);
+            if (comm->delay_q[prev_idx].deliver_ns <= deliver_ns)
+                break;
+            uint32_t cur_idx = (comm->delay_head + pos) & (VXFEC_DELAY_RING - 1u);
+            comm->delay_q[cur_idx] = comm->delay_q[prev_idx];
+            pos--;
+        }
+        if (comm->delay_cnt == 1u)
+            vxf_rx_bg_schedule_delay(comm->dev_idx);
+        vxfec_delay_data_t *slot = &comm->delay_q[(comm->delay_head + pos) & (VXFEC_DELAY_RING - 1u)];
+        slot->deliver_ns = deliver_ns;
+        return slot;
+    }
+    if (comm->delay_cnt > 0u) {
+        uint32_t prev = (comm->delay_head + comm->delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
+        if (deliver_ns < comm->delay_q[prev].deliver_ns)
+            deliver_ns = comm->delay_q[prev].deliver_ns;
+    }
+    uint32_t tail = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
+    if (comm->delay_cnt == 1u)
+        vxf_rx_bg_schedule_delay(comm->dev_idx);
+    vxfec_delay_data_t *slot = &comm->delay_q[tail];
+    slot->deliver_ns = deliver_ns;
+    return slot;
+}
+#endif
+
+static void rx_receive_rdma_imm(vxfec_recv_comm_t *comm, uint32_t port, uint32_t imm, uint64_t now_ns, uint64_t delay_ns,
+                                bool asym_links)
 {
 #if VXFEC_ENABLE_SIM
     if (delay_ns || comm->delay_cnt) {
-        if (!comm->delay_q)
-            comm->delay_q = calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
-        if (!comm->delay_q || comm->delay_cnt == VXFEC_DELAY_RING) {
-            atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
+        vxfec_delay_data_t *entry = rx_alloc_delay_slot(comm, port, now_ns, delay_ns, asym_links);
+        if (!entry)
             return;
-        }
-        uint64_t deliver_ns = now_ns + delay_ns;
-        if (comm->delay_cnt > 0u) {
-            uint32_t prev = (comm->delay_head + comm->delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
-            if (deliver_ns < comm->delay_q[prev].deliver_ns)
-                deliver_ns = comm->delay_q[prev].deliver_ns;
-        }
-        uint32_t tail = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
-        vxfec_delay_data_t *entry = &comm->delay_q[tail];
-        entry->deliver_ns = deliver_ns;
         entry->port_idx = port;
         entry->rdma_imm = imm;
         entry->len = 0u;
@@ -3444,32 +4434,24 @@ static void rx_receive_rdma_imm(vxfec_recv_comm_t *comm, uint32_t port, uint32_t
         return;
     }
 #else
-    (void)port;
     (void)delay_ns;
+    (void)asym_links;
 #endif
-    rx_process_rdma_imm(comm, imm, now_ns);
+    rx_process_rdma_imm(comm, port, imm, now_ns);
 }
 
 static void rx_receive_data(vxfec_recv_comm_t *comm, uint32_t port, const uint8_t *pkt, size_t len, bool ecn, uint64_t now_ns,
-                            uint64_t delay_ns)
+                            uint64_t delay_ns, bool asym_links)
 {
 #if VXFEC_ENABLE_SIM
     if (delay_ns || comm->delay_cnt) {
-        if (!comm->delay_q)
-            comm->delay_q = calloc(VXFEC_DELAY_RING, sizeof(*comm->delay_q));
-        if (!comm->delay_q || comm->delay_cnt == VXFEC_DELAY_RING || len > sizeof(comm->delay_q[0].data)) {
+        if (len > sizeof(comm->delay_q[0].data)) {
             atomic_fetch_add_explicit(&vxf_st_sim_dropped_pkts, 1, memory_order_relaxed);
             return;
         }
-        uint64_t deliver_ns = now_ns + delay_ns;
-        if (comm->delay_cnt > 0u) {
-            uint32_t prev = (comm->delay_head + comm->delay_cnt - 1u) & (VXFEC_DELAY_RING - 1u);
-            if (deliver_ns < comm->delay_q[prev].deliver_ns)
-                deliver_ns = comm->delay_q[prev].deliver_ns;
-        }
-        uint32_t tail = (comm->delay_head + comm->delay_cnt++) & (VXFEC_DELAY_RING - 1u);
-        vxfec_delay_data_t *entry = &comm->delay_q[tail];
-        entry->deliver_ns = deliver_ns;
+        vxfec_delay_data_t *entry = rx_alloc_delay_slot(comm, port, now_ns, delay_ns, asym_links);
+        if (!entry)
+            return;
         entry->port_idx = port;
         entry->rdma_imm = 0u;
         entry->len = (uint16_t)len;
@@ -3478,40 +4460,51 @@ static void rx_receive_data(vxfec_recv_comm_t *comm, uint32_t port, const uint8_
         memcpy(entry->data, pkt, len);
         return;
     }
+#else
+    (void)delay_ns;
+    (void)asym_links;
 #endif
     rx_process_wire_pkt(comm, port, pkt, len, ecn, now_ns);
 }
 
-void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
+bool vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
 {
     if (comm->ibv_failed || (comm->ibv_ep && vxfec_ibv_ep_has_error(comm->ibv_ep))) {
         rx_quiesce_broken_ibv(comm);
-        return;
+        return false;
     }
 
+    bool did_work = false;
     uint64_t now_ns = mono_ns();
     uint64_t delay_ns = vxf_sim_delay_ns();
-    vxf_rx_drain_ctrl_wire(comm, now_ns);
+    bool asym_links = vxf_sim_asym_enabled();
+    if (vxf_rx_drain_ctrl_wire(comm, now_ns))
+        did_work = true;
 
     if (comm->ibv_ep) {
-        vxfec_ibv_rx_wc_t wcs[64];
+        vxfec_ibv_rx_wc_t wcs[VXFEC_IBV_POLL_MAX];
+        uint32_t repost_slots[VXFEC_IBV_POLL_MAX];
         for (;;) {
-            uint32_t capacity = rx_batch_capacity(comm, delay_ns, 64u);
+            uint32_t capacity = rx_batch_capacity(comm, delay_ns, VXFEC_IBV_POLL_MAX);
             if (!capacity)
                 break;
             uint32_t nw = vxfec_ibv_ep_poll_rx(comm->ibv_ep, wcs, capacity);
             for (uint32_t i = 0; i < nw; i++) {
+                repost_slots[i] = wcs[i].slot_id;
                 uint32_t qp_idx = vxfec_ibv_slot_qp(wcs[i].slot_id);
+                uint64_t p_delay = asym_links ? vxf_sim_port_delay_ns(qp_idx) : delay_ns;
                 if (wcs[i].is_rdma_imm)
-                    rx_receive_rdma_imm(comm, qp_idx, wcs[i].imm_data, now_ns, delay_ns);
+                    rx_receive_rdma_imm(comm, qp_idx, wcs[i].imm_data, now_ns, p_delay, asym_links);
                 else
-                    rx_receive_data(comm, qp_idx, wcs[i].data, wcs[i].byte_len, false, now_ns, delay_ns);
-                if (!vxfec_ibv_ep_repost_rx(comm->ibv_ep, wcs[i].slot_id))
-                    break;
+                    rx_receive_data(comm, qp_idx, wcs[i].data, wcs[i].byte_len, false, now_ns, p_delay, asym_links);
+            }
+            if (nw > 0u) {
+                did_work = true;
+                (void)vxfec_ibv_ep_repost_rx_batch(comm->ibv_ep, repost_slots, nw);
             }
             if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
                 rx_quiesce_broken_ibv(comm);
-                return;
+                return did_work;
             }
             if (nw == 0u)
                 break;
@@ -3529,13 +4522,15 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
         vxfec_rx_udp_batch_t *rb = ensure_rx_udp_batch(comm);
         if (!rb)
             break;
+        uint64_t p_delay = asym_links ? vxf_sim_port_delay_ns(p) : delay_ns;
         for (;;) {
-            uint32_t capacity = rx_batch_capacity(comm, delay_ns, VXFEC_RX_BATCH);
+            uint32_t capacity = rx_batch_capacity(comm, p_delay, VXFEC_RX_BATCH);
             if (!capacity)
                 break;
             int n = recvmmsg(comm->fds[p], rb->msgs, capacity, MSG_DONTWAIT, NULL);
             if (n <= 0)
                 break;
+            did_work = true;
 
             for (int i = 0; i < n; i++) {
                 bool is_ecn_ce = extract_rx_ecn_ce(&rb->msgs[i].msg_hdr);
@@ -3544,7 +4539,7 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
                 size_t len = rb->msgs[i].msg_len;
                 const uint8_t *pkt = rb->pkt_bufs + (size_t)i * rb->pkt_stride;
 
-                rx_receive_data(comm, p, pkt, len, is_ecn_ce, now_ns, delay_ns);
+                rx_receive_data(comm, p, pkt, len, is_ecn_ce, now_ns, p_delay, asym_links);
             }
         }
     }
@@ -3555,7 +4550,7 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
         if (now_ns < front->deliver_ns)
             break;
         if (front->is_rdma_imm)
-            rx_process_rdma_imm(comm, front->rdma_imm, now_ns);
+            rx_process_rdma_imm(comm, front->port_idx, front->rdma_imm, now_ns);
         else
             rx_process_wire_pkt(comm, front->port_idx, front->data, front->len, front->is_ecn_ce, now_ns);
         comm->delay_head = (comm->delay_head + 1u) & (VXFEC_DELAY_RING - 1u);
@@ -3572,6 +4567,33 @@ void vxf_progress_recv_comm(vxfec_recv_comm_t *comm)
                 rx_evaluate_slot(comm, &comm->slots[i], now_ns);
         }
     }
+
+    for (uint32_t r = 0; r < NCCL_NET_MAX_REQUESTS; r++) {
+        vxfec_rx_req_t *req = &comm->rx_pool[r];
+        if (!req->in_use || req->done || !req->cts_sent_any)
+            continue;
+        bool has_progress = (req->early_rdma_cnt > 0u || req->gens_completed > 0u);
+        if (!has_progress) {
+            for (uint32_t w = 0; w < VXFEC_RX_WIRE_SLOTS / 64u && !has_progress; w++) {
+                uint64_t m = comm->active_slot_mask[w];
+                while (m) {
+                    uint32_t i = w * 64u + (uint32_t)__builtin_ctzll(m);
+                    m &= m - 1ULL;
+                    if (comm->slots[i].active && comm->slots[i].bound_req == req) {
+                        has_progress = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (has_progress) {
+            req->cts_sent_any = false;
+        } else if (now_ns > req->cts_last_tx_ns && (now_ns - req->cts_last_tx_ns) >= 2000000ULL) {
+            req->cts_last_tx_ns = now_ns;
+            rx_emit_cts_pkt(comm, req, 1);
+        }
+    }
+    return did_work;
 }
 
 static bool tx_req_has_recovery_data(const vxfec_tx_slot_t *r)
@@ -3623,7 +4645,7 @@ static void tx_fail_req(vxfec_send_comm_t *comm, vxfec_tx_slot_t *req, ncclResul
             (!comm->ibv_failed && (!comm->ibv_ep || vxfec_ibv_ep_tx_done(comm->ibv_ep, ureq->ibv_target_seq)))) {
             ureq->ibv_zc_pending = false;
             vxf_free_ureq_zc_jobs(ureq);
-            ureq->done = true;
+            tx_mark_ureq_done_locked(comm, ureq);
         }
     }
 }
@@ -3631,27 +4653,35 @@ static void tx_fail_req(vxfec_send_comm_t *comm, vxfec_tx_slot_t *req, ncclResul
 static bool tx_can_use_rdma_write(const vxfec_send_comm_t *comm, const vxfec_tx_user_req_t *ureq, uint32_t K)
 {
     if (!comm->ibv_ep || comm->ibv_failed || !ureq->has_rdma_cts || ureq->src_ibv_lkey == 0u || ureq->msg_total_bytes == 0u ||
-        ureq->num_gens > 16384u)
+        ureq->num_gens > 8192u)
         return false;
     if (ureq->num_gens > 1u) {
         if (K > 128u)
             return false;
-    } else if (K > 0x1fffffu) {
+    } else if (K > 0x10000u) {
         return false;
     }
-    uint32_t pmtu = vxfec_ibv_ep_path_mtu(comm->ibv_ep);
-    return pmtu == 0u || ureq->sym_T <= pmtu;
+    uint64_t max_msg = vxfec_ibv_ep_max_msg_bytes(comm->ibv_ep);
+    return max_msg == 0ULL || (uint64_t)ureq->sym_T <= max_msg;
 }
 
 static void tx_apply_rdma_cts_to_ureq(vxfec_send_comm_t *comm, vxfec_tx_user_req_t *ureq, uint64_t remote_iova,
-                                      uint32_t remote_rkey, uint32_t max_bytes, uint8_t rslot, uint8_t token)
+                                      uint32_t remote_rkey, uint32_t max_bytes, uint64_t rep_iova, uint32_t rep_rkey,
+                                      uint16_t rep_slots, uint8_t rslot, uint8_t token)
 {
-    if (!ureq || ureq->src_ibv_lkey == 0u || ureq->msg_total_bytes == 0u || ureq->msg_total_bytes > max_bytes || token == 0u ||
+    if (!ureq)
+        return;
+    ureq->cts_resolved = true;
+    ureq->cts_wait_until_ns = 0ULL;
+    if (token == 0u || ureq->src_ibv_lkey == 0u || ureq->msg_total_bytes == 0u || ureq->msg_total_bytes > max_bytes ||
         rslot >= NCCL_NET_MAX_REQUESTS)
         return;
     ureq->has_rdma_cts = true;
     ureq->rdma_iova = remote_iova;
     ureq->rdma_rkey = remote_rkey;
+    ureq->rdma_rep_iova = rep_iova;
+    ureq->rdma_rep_rkey = rep_rkey;
+    ureq->rdma_rep_slots = rep_slots;
     ureq->rdma_rslot = rslot;
     ureq->rdma_token = token;
 
@@ -3667,6 +4697,9 @@ static void tx_apply_rdma_cts_to_ureq(vxfec_send_comm_t *comm, vxfec_tx_user_req
             slot->use_rdma_write = true;
             slot->rdma_gen_iova = remote_iova + gen_off;
             slot->rdma_rkey = remote_rkey;
+            slot->rdma_rep_iova = rep_iova;
+            slot->rdma_rep_rkey = rep_rkey;
+            slot->rdma_rep_slots = rep_slots;
             slot->rdma_rslot = rslot;
             slot->rdma_token = token;
         }
@@ -3683,22 +4716,40 @@ static void tx_handle_rdma_cts(vxfec_send_comm_t *comm, const uint8_t *buf, size
     uint32_t tag_seq = cts.hdr.K;
     uint8_t rslot = (uint8_t)cts.hdr.sack_cnt;
     uint8_t token = cts.hdr.flags & 0x7u;
-    if (tag_seq == 0u || token == 0u || rslot >= NCCL_NET_MAX_REQUESTS)
+    uint64_t rep_iova = 0;
+    uint32_t rep_rkey = 0;
+    uint16_t rep_slots = 0;
+    if ((comm->features & VXFEC_HELLO_RDMA_REPAIR) && cts.hdr.ir_count <= VXFEC_RX_IBV_REP_SLOTS) {
+        rep_iova = ((uint64_t)cts.hdr.ecn_ce_pkts << 32u) | (uint64_t)cts.hdr.rx_pkts;
+        rep_rkey = cts.hdr.ecn_port_mask;
+        rep_slots = (uint16_t)cts.hdr.ir_count;
+    }
+    if (tag_seq == 0u || rslot >= NCCL_NET_MAX_REQUESTS)
+        return;
+    if (token == 0u && (cts.remote_rkey != 0u || cts.max_bytes != 0u))
         return;
 
     for (uint32_t u = 0; u < NCCL_NET_MAX_REQUESTS; u++) {
         vxfec_tx_user_req_t *ureq = &comm->user_tx_pool[u];
         if (ureq->in_use && !ureq->failed && !ureq->done && ureq->tag == tag && ureq->tag_seq == tag_seq) {
-            tx_apply_rdma_cts_to_ureq(comm, ureq, cts.remote_iova, cts.remote_rkey, cts.max_bytes, rslot, token);
+            tx_apply_rdma_cts_to_ureq(comm, ureq, cts.remote_iova, cts.remote_rkey, cts.max_bytes, rep_iova, rep_rkey, rep_slots,
+                                      rslot, token);
             return;
         }
     }
+
+    /* ignore stale duplicate CTS for already-retired tag_seq */
+    if (seq_before(tag_seq, vxf_peek_tag_seq(&comm->tag_map, tag)))
+        return;
 
     for (uint32_t i = 0; i < VXFEC_CTS_RING; i++) {
         if (comm->cts_ring[i].valid && comm->cts_ring[i].tag == tag && comm->cts_ring[i].tag_seq == tag_seq) {
             comm->cts_ring[i].remote_iova = cts.remote_iova;
             comm->cts_ring[i].remote_rkey = cts.remote_rkey;
             comm->cts_ring[i].max_bytes = cts.max_bytes;
+            comm->cts_ring[i].rep_iova = rep_iova;
+            comm->cts_ring[i].rep_rkey = rep_rkey;
+            comm->cts_ring[i].rep_slots = rep_slots;
             comm->cts_ring[i].rslot = rslot;
             comm->cts_ring[i].token = token;
             return;
@@ -3712,6 +4763,9 @@ static void tx_handle_rdma_cts(vxfec_send_comm_t *comm, const uint8_t *buf, size
         .remote_iova = cts.remote_iova,
         .remote_rkey = cts.remote_rkey,
         .max_bytes = cts.max_bytes,
+        .rep_iova = rep_iova,
+        .rep_rkey = rep_rkey,
+        .rep_slots = rep_slots,
         .rslot = rslot,
         .token = token,
     };
@@ -3750,6 +4804,11 @@ static void tx_spawn_ready_generations(vxfec_send_comm_t *comm)
                 continue;
             if (ureq->next_gen_to_spawn >= ureq->num_gens || ureq->active_gens >= per_req_cap)
                 continue;
+            if (!ureq->has_rdma_cts && ureq->cts_wait_until_ns != 0ULL) {
+                if (mono_ns() < ureq->cts_wait_until_ns)
+                    continue;
+                ureq->cts_wait_until_ns = 0ULL;
+            }
 
             free_mask = ~comm->active_tx_mask;
             if (free_mask == 0ULL)
@@ -3793,6 +4852,9 @@ static void tx_spawn_ready_generations(vxfec_send_comm_t *comm)
                 req->use_rdma_write = true;
                 req->rdma_gen_iova = ureq->rdma_iova + gen_off;
                 req->rdma_rkey = ureq->rdma_rkey;
+                req->rdma_rep_iova = ureq->rdma_rep_iova;
+                req->rdma_rep_rkey = ureq->rdma_rep_rkey;
+                req->rdma_rep_slots = ureq->rdma_rep_slots;
                 req->rdma_rslot = ureq->rdma_rslot;
                 req->rdma_token = ureq->rdma_token;
             }
@@ -3820,19 +4882,18 @@ static void tx_spawn_ready_generations(vxfec_send_comm_t *comm)
     }
 }
 
-static bool tx_poll_gpu_repair(vxfec_tx_slot_t *req)
+static int tx_poll_gpu_repair(vxfec_tx_slot_t *req)
 {
     int status = vxf_gpu_job_poll(req->tx_gpu);
-    if (status == 0)
-        return false;
+    if (status == 0 || status == VXF_GPURT_POLL_UNSAFE)
+        return status;
     if (status > 0) {
         req->tx_gpu_ready = true;
     } else {
-        vxf_gpu_job_free(req->tx_gpu);
-        req->tx_gpu = NULL;
+        tx_release_gpu_repair(req);
         req->tx_gpu_failed = true;
     }
-    return true;
+    return 1;
 }
 
 static void tx_account_repair_slice(vxfec_tx_slot_t *req, uint32_t count, bool proactive, uint64_t now_ns)
@@ -3852,8 +4913,9 @@ static void tx_account_repair_slice(vxfec_tx_slot_t *req, uint32_t count, bool p
     req->last_send_ns = now_ns;
 }
 
-static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
+static bool tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
 {
+    bool did_work = false;
     uint64_t waiting_mask = 0ULL;
     for (;;) {
         vxfec_tx_slot_t *req = NULL;
@@ -3868,9 +4930,21 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
             vxfec_tx_slot_t *r = &comm->tx_pool[s];
             if (!r->wire_active || r->done || !tx_req_has_paced_work(r))
                 continue;
-            if (r->tx_gpu && !r->tx_gpu_ready && !tx_poll_gpu_repair(r)) {
-                waiting_mask |= (1ULL << s);
-                continue;
+            if (r->tx_gpu && !r->tx_gpu_ready) {
+                int status = tx_poll_gpu_repair(r);
+                if (status == VXF_GPURT_POLL_UNSAFE) {
+                    tx_fail_req(comm, r, ncclSystemError);
+                    /* failing one generation can deactivate the selected sibling */
+                    if (req && !(comm->active_tx_mask & (1ULL << selected))) {
+                        req = NULL;
+                        cand = comm->active_tx_mask & ~waiting_mask;
+                    }
+                    continue;
+                }
+                if (status == 0) {
+                    waiting_mask |= (1ULL << s);
+                    continue;
+                }
             }
             bool is_rec = r->initial_tail_sent;
             if (!req || (is_rec && !best_is_rec) || (is_rec == best_is_rec && seq_before(r->msg_seq, best_seq))) {
@@ -3893,12 +4967,14 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
             req->last_send_ns = now_ns;
             tx_send_tail(req);
             req->initial_tail_sent = true;
+            did_work = true;
             continue;
         }
 
         if (req->need_recovery_tail && !req->tx_gpu && !tx_req_has_recovery_data(req)) {
             tx_send_tail(req);
             req->need_recovery_tail = false;
+            did_work = true;
             continue;
         }
 
@@ -3929,6 +5005,7 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
             break;
         }
 
+        uint32_t init_max_pkts = max_pkts;
         if (req->tx_gpu) {
             uint32_t remaining = req->tx_gpu_count - req->tx_gpu_offset;
             uint32_t n = (remaining > max_pkts) ? max_pkts : remaining;
@@ -3939,7 +5016,7 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
                             (!proactive || req->tx_proactive_cursor + n < req->proactive_target || more_gens);
             bool zc_out = req->tx_gpu->used_vram_out && req->tx_gpu->out_ibv_lkey != 0u;
             const uint8_t *out =
-                zc_out ? (const uint8_t *)(uintptr_t)req->tx_gpu->out_ibv_iova : vxfec_vk_buf_staging_ptr(req->tx_gpu->out_buf);
+                zc_out ? (const uint8_t *)(uintptr_t)req->tx_gpu->out_ibv_iova : (const uint8_t *)vxf_gpu_job_out_ptr(req->tx_gpu);
             uint32_t out_lkey = zc_out ? req->tx_gpu->out_ibv_lkey : 0u;
             if (!tx_spray_coded_repairs(req, req->tx_gpu_flags, req->tx_gpu_esi + req->tx_gpu_offset, n,
                                         out + (size_t)req->tx_gpu_offset * req->tx_gpu_stride, req->tx_gpu_stride, out_lkey,
@@ -3950,15 +5027,8 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
             tx_account_repair_slice(req, n, proactive, now_ns);
             req->tx_gpu_offset += n;
             max_pkts -= n;
-            if (req->tx_gpu_offset == req->tx_gpu_count) {
-                if (zc_out && req->parent && req->parent->ibv_zc_pending) {
-                    req->tx_gpu->next = req->parent->zc_gpu_head;
-                    req->parent->zc_gpu_head = req->tx_gpu;
-                } else {
-                    vxf_gpu_job_free(req->tx_gpu);
-                }
-                req->tx_gpu = NULL;
-            }
+            if (req->tx_gpu_offset == req->tx_gpu_count)
+                tx_release_gpu_repair(req);
             if (n < remaining || (!proactive && req->ir_rem > 0u))
                 atomic_fetch_add_explicit(&vxf_st_tx_paced_slices, 1, memory_order_relaxed);
         }
@@ -4088,18 +5158,52 @@ static void tx_drain_paced(vxfec_send_comm_t *comm, uint64_t now_ns)
                 tx_send_tail(req);
                 req->initial_tail_sent = true;
                 now_ns = req->burst_end_tx_ns;
+                did_work = true;
                 continue;
             }
         }
 
+        if (max_pkts < init_max_pkts)
+            did_work = true;
         if (max_pkts == 0u)
             break;
     }
+    return did_work;
+}
+
+static void tx_normalize_port_weights(vxfec_send_comm_t *comm, uint32_t pinned_floor_mask)
+{
+    int32_t peak = 0;
+    for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+        if (comm->port_weights[p] > peak)
+            peak = comm->port_weights[p];
+    }
+    if (peak > 0 && peak < VXFEC_PORT_WEIGHT_MAX) {
+        int32_t mult = VXFEC_PORT_WEIGHT_MAX / peak;
+        if (mult > 1) {
+            for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+                if (((pinned_floor_mask >> p) & 1u) != 0u)
+                    continue;
+                int32_t nw = comm->port_weights[p] * mult;
+                comm->port_weights[p] = (nw <= VXFEC_PORT_WEIGHT_MAX) ? nw : VXFEC_PORT_WEIGHT_MAX;
+            }
+        }
+    }
+    bool nonuniform = false;
+    for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+        if (comm->port_weights[p] != VXFEC_PORT_WEIGHT_MAX) {
+            nonuniform = true;
+            break;
+        }
+    }
+    comm->has_nonuniform_weights = nonuniform;
 }
 
 static void tx_update_ecn_port_weights(vxfec_tx_slot_t *req, uint32_t reported_mask, uint32_t delta_ce)
 {
     vxfec_send_comm_t *comm = req->comm;
+    if (!comm || comm->num_ports <= 1u)
+        return;
     uint32_t hot_ports = 0u;
     if (delta_ce > 0u) {
         hot_ports = reported_mask & ~req->win_ecn_port_mask;
@@ -4108,10 +5212,111 @@ static void tx_update_ecn_port_weights(vxfec_tx_slot_t *req, uint32_t reported_m
             hot_ports = reported_mask;
         if (hot_ports == 0u)
             return;
+        for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+            if (((hot_ports >> p) & 1u) != 0u)
+                comm->port_weights[p] = (comm->port_weights[p] > 2) ? (comm->port_weights[p] / 2) : 1;
+        }
+        tx_normalize_port_weights(comm, hot_ports | comm->loss_evicted_mask);
+        return;
     }
-    if (hot_ports != 0u || comm->has_nonuniform_weights)
-        comm->has_nonuniform_weights =
-            harq_update_port_weights(comm->port_weights, comm->num_ports, hot_ports, VXFEC_PORT_WEIGHT_MAX);
+    if (!comm->has_nonuniform_weights)
+        return;
+    bool nonuniform = false;
+    for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+        bool loss_pinned = (((comm->loss_evicted_mask >> p) & 1u) != 0u);
+        if (!loss_pinned && comm->port_weights[p] < VXFEC_PORT_WEIGHT_MAX)
+            comm->port_weights[p]++;
+        if (comm->port_weights[p] != VXFEC_PORT_WEIGHT_MAX)
+            nonuniform = true;
+    }
+    comm->has_nonuniform_weights = nonuniform;
+}
+
+/* unified ECN + per-port/per-QP tail-drop loss attribution for RoCEv2 UC and multi-port Clos UDP */
+static void tx_update_port_feedback(vxfec_tx_slot_t *req, uint32_t reported_mask, uint32_t delta_ce, const uint8_t *ctrl_pay,
+                                    size_t pay_len, bool has_loss, uint16_t min_loss_delta)
+{
+    vxfec_send_comm_t *comm = req->comm;
+    if (!comm || comm->num_ports <= 1u)
+        return;
+
+    uint32_t ecn_hot = 0u;
+    if (delta_ce > 0u) {
+        ecn_hot = reported_mask & ~req->win_ecn_port_mask;
+        req->win_ecn_port_mask |= reported_mask;
+        if (ecn_hot == 0u && (reported_mask & (reported_mask - 1u)) == 0u)
+            ecn_hot = reported_mask;
+    }
+
+    uint32_t num_buckets = (comm->ibv_ep != NULL && !comm->ibv_failed)
+                               ? vxfec_ibv_ep_num_qps(comm->ibv_ep)
+                               : ((comm->num_ports <= VXFEC_MAX_PORTS) ? comm->num_ports : VXFEC_MAX_PORTS);
+    uint32_t active_mask = 0u;
+    for (uint32_t q = 0; q < num_buckets; q++) {
+        if (req->tx_qp_pkts[q] > 0u) {
+            for (uint32_t p = q; p < comm->num_ports && p < 32u; p += num_buckets)
+                active_mask |= (1u << p);
+        }
+    }
+
+    uint32_t loss_hot = 0u;
+    if (has_loss && ctrl_pay != NULL && num_buckets > 1u) {
+        size_t need_bytes =
+            (comm->ibv_ep != NULL && !comm->ibv_failed) ? (sizeof(uint16_t) * VXFEC_IBV_MAX_QPS) : (sizeof(uint16_t) * num_buckets);
+        if (pay_len >= need_bytes) {
+            uint16_t rx_cnts[VXFEC_MAX_PORTS];
+            memcpy(rx_cnts, ctrl_pay, (size_t)num_buckets * sizeof(uint16_t));
+
+            uint32_t cand_loss = 0u;
+            for (uint32_t q = 0; q < num_buckets; q++) {
+                uint16_t sent_q = req->tx_qp_pkts[q];
+                uint16_t lost_q = (sent_q > rx_cnts[q]) ? (uint16_t)(sent_q - rx_cnts[q]) : 0u;
+                if (lost_q > req->win_qp_lost[q] && (uint16_t)(lost_q - req->win_qp_lost[q]) >= min_loss_delta) {
+                    req->win_qp_lost[q] = lost_q;
+                    for (uint32_t p = q; p < comm->num_ports && p < 32u; p += num_buckets)
+                        cand_loss |= (1u << p);
+                }
+            }
+            if (cand_loss != 0u && cand_loss != active_mask) {
+                loss_hot = cand_loss;
+                if (delta_ce == 0u)
+                    atomic_fetch_add_explicit(&vxf_st_tx_cnp_events, 1, memory_order_relaxed);
+            }
+        }
+    }
+
+    uint32_t hot_ports = ecn_hot | loss_hot;
+    if (delta_ce > 0u || has_loss) {
+        if (hot_ports == 0u)
+            return;
+        comm->loss_evicted_mask |= loss_hot;
+        for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+            if (((loss_hot >> p) & 1u) != 0u)
+                comm->port_weights[p] = 1;
+            else if (((ecn_hot >> p) & 1u) != 0u)
+                comm->port_weights[p] = (comm->port_weights[p] > 2) ? (comm->port_weights[p] / 2) : 1;
+        }
+        tx_normalize_port_weights(comm, hot_ports | comm->loss_evicted_mask);
+        return;
+    }
+
+    if (!comm->has_nonuniform_weights)
+        return;
+
+    /* loss-evicted ports only step up when a probe packet actually traversed them cleanly; ECN-only ports step up normally */
+    bool nonuniform = false;
+    for (uint32_t p = 0; p < comm->num_ports && p < VXFEC_MAX_PORTS; p++) {
+        bool loss_pinned = (((comm->loss_evicted_mask >> p) & 1u) != 0u);
+        bool probed = (((active_mask >> p) & 1u) != 0u);
+        if (comm->port_weights[p] < VXFEC_PORT_WEIGHT_MAX && (!loss_pinned || probed)) {
+            comm->port_weights[p]++;
+            if (comm->port_weights[p] >= VXFEC_PORT_WEIGHT_MAX)
+                comm->loss_evicted_mask &= ~(1u << p);
+        }
+        if (comm->port_weights[p] != VXFEC_PORT_WEIGHT_MAX)
+            nonuniform = true;
+    }
+    comm->has_nonuniform_weights = nonuniform;
 }
 
 /* seed retry RTT from first cold-flight feedback while leaving congestion control to probe/DONE samples */
@@ -4125,7 +5330,8 @@ static void tx_bootstrap_srtt(vxfec_tx_slot_t *req, uint64_t now_ns)
 /* suppress duplicate feedback while repairs covering the same holes are still queued or in flight */
 static bool tx_recovery_in_flight(const vxfec_send_comm_t *comm, uint32_t pending, uint64_t last_tx_ns, uint64_t now_ns)
 {
-    uint64_t window_ns = clamp_u64(comm->pacer.srtt_ns, 300000ULL, 20000000ULL);
+    uint64_t hi = (comm->pacer.srtt_ns > 15000000ULL) ? 150000000ULL : 20000000ULL;
+    uint64_t window_ns = clamp_u64(comm->pacer.srtt_ns, 300000ULL, hi);
     return pending || (last_tx_ns && now_ns - last_tx_ns < window_ns);
 }
 
@@ -4192,6 +5398,12 @@ static void tx_quiesce_broken_ibv(vxfec_send_comm_t *comm)
     bool qps_gone = vxfec_ibv_ep_destroy(comm->ibv_ep);
     if (qps_gone) {
         comm->ibv_ep = NULL;
+        if (comm->ibv_rep_mr) {
+            vxfec_ibv_mr_dereg(comm->ibv_rep_mr);
+            comm->ibv_rep_mr = NULL;
+        }
+        free(comm->ibv_rep_buf);
+        comm->ibv_rep_buf = NULL;
         if (comm->ibv_ref) {
             vxf_ibv_ref_release(comm->ibv_ref);
             comm->ibv_ref = NULL;
@@ -4229,17 +5441,18 @@ static void tx_quiesce_broken_ibv(vxfec_send_comm_t *comm)
             if (qps_gone || !ureq->ibv_zc_pending) {
                 ureq->ibv_zc_pending = false;
                 vxf_free_ureq_zc_jobs(ureq);
-                ureq->done = true;
+                tx_mark_ureq_done_locked(comm, ureq);
             }
         }
     }
 }
 
-void vxf_progress_send_comm(vxfec_send_comm_t *comm)
+bool vxf_progress_send_comm(vxfec_send_comm_t *comm)
 {
-    uint8_t ctrl_buf[sizeof(vxfec_ctrl_pkt_t) + VXFEC_SACK_MAX * sizeof(uint32_t)];
+    uint8_t ctrl_buf[sizeof(vxfec_ctrl_pkt_t) + VXFEC_SACK_MAX * sizeof(uint32_t) + VXFEC_MAX_PORTS * sizeof(uint16_t)];
     uint64_t now_ns = mono_ns();
     uint64_t delay_ns = vxf_sim_delay_ns();
+    bool did_work = false;
 
     if (comm->ibv_ep) {
         vxfec_ibv_ep_drain_tx(comm->ibv_ep);
@@ -4250,6 +5463,7 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
             ssize_t r = recv(comm->ctrl_fd, ctrl_buf, sizeof(ctrl_buf), MSG_DONTWAIT);
             if (r <= 0)
                 break;
+            did_work = true;
             if ((size_t)r < sizeof(vxfec_ctrl_pkt_t))
                 continue;
             vxfec_ctrl_pkt_t ctrl;
@@ -4258,18 +5472,50 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                 tx_ack_abort_locked(comm, ctrl.msg_seq, ctrl.tag);
         }
         tx_retransmit_aborts_locked(comm, now_ns);
-        return;
+        return did_work;
     }
 
     uint32_t cur_epoch = vxf_sim_epoch();
     if (comm->cfg_epoch != cur_epoch)
         vxf_init_send_comm_pacer(comm, now_ns);
 
-    tx_spawn_ready_generations(comm);
-
+    vxfec_ibv_rx_wc_t ibv_cwcs[32];
+    uint32_t ibv_cidx = 0u, ibv_ccnt = 0u;
     for (;;) {
         ssize_t n = -1;
-        bool can_recv = comm->ctrl_fd >= 0;
+        if (comm->ibv_ep && !comm->ibv_failed) {
+            if (ibv_cidx >= ibv_ccnt) {
+                ibv_cidx = 0u;
+                ibv_ccnt = vxfec_ibv_ep_poll_rx(comm->ibv_ep, ibv_cwcs, 32u);
+                if (vxfec_ibv_ep_has_error(comm->ibv_ep)) {
+                    tx_quiesce_broken_ibv(comm);
+                    return did_work;
+                }
+            }
+            if (ibv_cidx < ibv_ccnt) {
+                did_work = true;
+                const vxfec_ibv_rx_wc_t *cwc = &ibv_cwcs[ibv_cidx++];
+                uint32_t clen = (cwc->byte_len <= sizeof(ctrl_buf)) ? cwc->byte_len : 0u;
+                if (clen > 0u) {
+                    memcpy(ctrl_buf, cwc->data, clen);
+                    n = (ssize_t)clen;
+                }
+                if (ibv_cidx == ibv_ccnt) {
+                    uint32_t cslots[32];
+                    for (uint32_t k = 0; k < ibv_ccnt; k++)
+                        cslots[k] = ibv_cwcs[k].slot_id;
+                    if (!vxfec_ibv_ep_repost_rx_batch(comm->ibv_ep, cslots, ibv_ccnt)) {
+                        tx_quiesce_broken_ibv(comm);
+                        return did_work;
+                    }
+                    ibv_ccnt = 0u;
+                    ibv_cidx = 0u;
+                }
+                if (n <= 0)
+                    continue;
+            }
+        }
+        bool can_recv = (n <= 0) && (comm->ctrl_fd >= 0);
 #if VXFEC_ENABLE_SIM
         can_recv = can_recv && comm->ctrl_delay_cnt < VXFEC_DELAY_RING;
 #endif
@@ -4316,6 +5562,7 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
         }
         if ((size_t)n < sizeof(vxfec_ctrl_pkt_t))
             continue;
+        did_work = true;
         vxfec_ctrl_pkt_t ctrl;
         memcpy(&ctrl, ctrl_buf, sizeof(ctrl));
         if (ctrl.magic != VXFEC_NET_MAGIC || ctrl.cookie != comm->cookie || ctrl.pkt_type == PKT_HELLO_ACK)
@@ -4375,7 +5622,10 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                     rtt_ns = (raw_rtt > dwell_ns) ? (raw_rtt - dwell_ns) : 1000ULL;
                     req->ack_probe_tx_ns = 0u;
                 }
-                if (harq_pacer_on_ack(&comm->pacer, acked_b, rtt_ns, newly_rx, delta_ce))
+                /* once SWRR has deflected off hot ports, <= 3.1% marks from weight=1 probes pin the hot port without throttling
+                 * clean spines */
+                uint32_t pacer_ce = (comm->has_nonuniform_weights && newly_rx >= 32u && delta_ce * 32u <= newly_rx) ? 0u : delta_ce;
+                if (harq_pacer_on_ack(&comm->pacer, acked_b, rtt_ns, newly_rx, pacer_ce))
                     atomic_fetch_add_explicit(&vxf_st_tx_cnp_events, 1, memory_order_relaxed);
                 tx_bootstrap_srtt(req, now_ns);
                 tx_update_ecn_port_weights(req, ctrl.ecn_port_mask, delta_ce);
@@ -4393,13 +5643,22 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
             uint32_t delta_ce = (ctrl.ecn_ce_pkts > req->win_ecn_ce) ? (ctrl.ecn_ce_pkts - req->win_ecn_ce) : 0u;
             uint32_t raw_rx = ctrl.rx_pkts ? ctrl.rx_pkts : ctrl.K;
             uint32_t delta_rx = (raw_rx > req->win_rx_pkts) ? (raw_rx - req->win_rx_pkts) : 0u;
+            uint32_t pacer_ce = (comm->has_nonuniform_weights && delta_rx >= 32u && delta_ce * 32u <= delta_rx) ? 0u : delta_ce;
             uint64_t rem_acked_b = (req->total_bytes > req->win_acked_bytes) ? (req->total_bytes - req->win_acked_bytes) : 0u;
-            if (rem_acked_b > 0u || delta_ce > 0u || rtt_ns > 0u || req->win_rx_pkts == 0u) {
-                if (harq_pacer_on_ack(&comm->pacer, rem_acked_b, rtt_ns, delta_rx ? delta_rx : 1u, delta_ce))
+            if (rem_acked_b > 0u || pacer_ce > 0u || rtt_ns > 0u || req->win_rx_pkts == 0u) {
+                if (harq_pacer_on_ack(&comm->pacer, rem_acked_b, rtt_ns, delta_rx ? delta_rx : 1u, pacer_ce))
                     atomic_fetch_add_explicit(&vxf_st_tx_cnp_events, 1, memory_order_relaxed);
             }
-            if (delta_rx > 0u || delta_ce > 0u)
-                tx_update_ecn_port_weights(req, ctrl.ecn_port_mask, delta_ce);
+            uint32_t sum_tx_pkts = 0u;
+            for (uint32_t q = 0; q < VXFEC_MAX_PORTS; q++)
+                sum_tx_pkts += req->tx_qp_pkts[q];
+            bool any_pkt_lost = (ctrl.esi > 0u) || (((ctrl.flags & 1u) != 0u) && sum_tx_pkts > raw_rx);
+            if (delta_rx > 0u || delta_ce > 0u || any_pkt_lost) {
+                size_t pay_len = (size_t)n - sizeof(ctrl);
+                uint16_t min_loss = ((ctrl.flags & 1u) != 0u) ? 1u : 2u;
+                tx_update_port_feedback(req, ctrl.ecn_port_mask, delta_ce, (pay_len > 0u) ? (ctrl_buf + sizeof(ctrl)) : NULL,
+                                        pay_len, any_pkt_lost, min_loss);
+            }
 
             comm->loss_ewma = harq_ewma_update(comm->loss_ewma, ctrl.K, ctrl.esi, 0.20);
 
@@ -4416,7 +5675,7 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                     if (!ureq->ibv_zc_pending || !comm->ibv_ep || vxfec_ibv_ep_tx_done(comm->ibv_ep, ureq->ibv_target_seq)) {
                         ureq->ibv_zc_pending = false;
                         vxf_free_ureq_zc_jobs(ureq);
-                        ureq->done = true;
+                        tx_mark_ureq_done_locked(comm, ureq);
                     }
                 } else {
                     tx_spawn_ready_generations(comm);
@@ -4425,8 +5684,24 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
         } else if (ctrl.pkt_type == PKT_ERR) {
             tx_fail_req(comm, req, ncclRemoteError);
         } else if (ctrl.pkt_type == PKT_SACK) {
-            tx_queue_sack(req, ctrl.sack_cnt, ctrl_buf + sizeof(ctrl), (size_t)n - sizeof(ctrl), now_ns);
+            if (!req->initial_tail_sent)
+                continue;
+            uint32_t delta_ce = (ctrl.ecn_ce_pkts > req->win_ecn_ce) ? (ctrl.ecn_ce_pkts - req->win_ecn_ce) : 0u;
+            req->win_ecn_ce += delta_ce;
+            size_t pay_len = (size_t)n - sizeof(ctrl);
+            size_t sack_b = (size_t)(ctrl.sack_cnt > VXFEC_SACK_MAX ? VXFEC_SACK_MAX : ctrl.sack_cnt) * sizeof(uint32_t);
+            const uint8_t *port_pay = (pay_len > sack_b) ? (ctrl_buf + sizeof(ctrl) + sack_b) : NULL;
+            size_t port_pay_len = (pay_len > sack_b) ? (pay_len - sack_b) : 0u;
+            tx_update_port_feedback(req, ctrl.ecn_port_mask, delta_ce, port_pay, port_pay_len, true, 1u);
+            tx_queue_sack(req, ctrl.sack_cnt, ctrl_buf + sizeof(ctrl), pay_len, now_ns);
         } else if (ctrl.pkt_type == PKT_HARQ_IR) {
+            if (!req->initial_tail_sent)
+                continue;
+            uint32_t delta_ce = (ctrl.ecn_ce_pkts > req->win_ecn_ce) ? (ctrl.ecn_ce_pkts - req->win_ecn_ce) : 0u;
+            req->win_ecn_ce += delta_ce;
+            size_t pay_len = (size_t)n - sizeof(ctrl);
+            tx_update_port_feedback(req, ctrl.ecn_port_mask, delta_ce, (pay_len > 0u) ? (ctrl_buf + sizeof(ctrl)) : NULL, pay_len,
+                                    true, 1u);
             uint32_t count = ctrl.ir_count ? ctrl.ir_count : 1u;
             uint8_t codec_flag = ctrl.flags & WIRE_CODEC_MASK;
             bool is_dup = ctrl.esi == req->last_ir_ctrl_esi && count <= req->last_ir_ctrl_cnt &&
@@ -4459,6 +5734,8 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                 req->retx_or_ir_sent = true;
             }
         } else if (ctrl.pkt_type == PKT_GBN_NACK) {
+            if (!req->initial_tail_sent)
+                continue;
             tx_bootstrap_srtt(req, now_ns);
             uint32_t first_miss = (ctrl.esi < req->K) ? ctrl.esi : 0u;
             req->ack_probe_tx_ns = 0u;
@@ -4470,7 +5747,12 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
         }
     }
 
-    tx_drain_paced(comm, now_ns);
+    uint64_t pre_spawn_mask = comm->active_tx_mask;
+    tx_spawn_ready_generations(comm);
+    if (comm->active_tx_mask != pre_spawn_mask)
+        did_work = true;
+    if (tx_drain_paced(comm, now_ns))
+        did_work = true;
     now_ns = mono_ns();
 
     uint64_t rto_ns = tx_tail_rto_ns(comm);
@@ -4495,13 +5777,15 @@ void vxf_progress_send_comm(vxfec_send_comm_t *comm)
                     if (!ureq->ibv_zc_pending || vxfec_ibv_ep_tx_done(comm->ibv_ep, ureq->ibv_target_seq)) {
                         ureq->ibv_zc_pending = false;
                         vxf_free_ureq_zc_jobs(ureq);
-                        ureq->done = true;
+                        tx_mark_ureq_done_locked(comm, ureq);
+                        did_work = true;
                     }
                 }
             }
         }
         tx_quiesce_broken_ibv(comm);
     }
+    return did_work;
 }
 
 ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhandle, void **request)
@@ -4523,9 +5807,13 @@ ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhan
     vxf_progress_send_comm(comm);
     if (comm->ibv_failed) {
         bool need_bg = (comm->unacked_aborts > 0u && !comm->tx_bg_registered);
+        bool wake_bg = (comm->unacked_aborts > 0u && comm->tx_bg_registered);
+        int dev_idx = comm->dev_idx;
         pthread_mutex_unlock(&comm->mtx);
         if (need_bg)
             vxf_tx_bg_register(comm);
+        else if (wake_bg)
+            vxf_rail_wake(dev_idx);
         return ncclSystemError;
     }
 
@@ -4541,7 +5829,19 @@ ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhan
         return ncclSuccess;
     }
 
-    uint16_t sym_T = get_cfg_sym_t((uint32_t)size, comm->path_sym_limit);
+    vxfec_ibv_mr_t *ibv_mr =
+        (comm->ibv_ep && mr && comm->dev_idx >= 0 && (uint32_t)comm->dev_idx < vxf_num_devs) ? mr->ibv_mrs[comm->dev_idx] : NULL;
+    uint16_t eff_limit = comm->path_sym_limit;
+    if (comm->ibv_ep && !comm->ibv_failed && !ibv_mr) {
+        uint32_t stage_cap = vxfec_ibv_ep_tx_stage_cap(comm->ibv_ep);
+        if (stage_cap > sizeof(vxfec_wire_hdr_ext_t)) {
+            uint32_t st_lim = (stage_cap - (uint32_t)sizeof(vxfec_wire_hdr_ext_t)) & ~15u;
+            if (st_lim < eff_limit)
+                eff_limit = (uint16_t)st_lim;
+        }
+    }
+
+    uint16_t sym_T = get_cfg_sym_t((uint32_t)size, eff_limit, comm->ibv_ep != NULL && !comm->ibv_failed && ibv_mr != NULL);
     if (sym_T == 0u) {
         pthread_mutex_unlock(&comm->mtx);
         return ncclSystemError;
@@ -4549,9 +5849,6 @@ ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhan
 
     vxfec_tx_user_req_t *ureq = &comm->user_tx_pool[uslot];
     memset(ureq, 0, sizeof(*ureq));
-
-    vxfec_ibv_mr_t *ibv_mr =
-        (comm->ibv_ep && mr && comm->dev_idx >= 0 && (uint32_t)comm->dev_idx < vxf_num_devs) ? mr->ibv_mrs[comm->dev_idx] : NULL;
 
     if (ibv_mr) {
         ureq->src_ibv_ptr = (const uint8_t *)data;
@@ -4562,7 +5859,7 @@ ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhan
     if (size > 0 && mr && mr->ptr_type == NCCL_PTR_CUDA) {
         if (ibv_mr && ureq->src_ibv_dmabuf) {
             ureq->src_host = NULL;
-        } else if (mr->vk_buf) {
+        } else if (vxf_mr_can_gpu_rw(mr)) {
             ureq->bounce_buf = (uint8_t *)malloc((size_t)size);
             if (!ureq->bounce_buf) {
                 pthread_mutex_unlock(&comm->mtx);
@@ -4605,39 +5902,62 @@ ncclResult_t vxf_isend(void *sendComm, void *data, int size, int tag, void *mhan
             : 1u;
 
     ureq->kind = VXFEC_REQ_SEND;
-    ureq->in_use = true;
-    ureq->done = false;
+    atomic_store_explicit(&ureq->in_use, true, memory_order_release);
+    atomic_store_explicit(&ureq->done, false, memory_order_relaxed);
     ureq->comm = comm;
     ureq->tag = (uint32_t)tag;
     ureq->tag_seq = tag_seq;
     ureq->msg_total_bytes = (uint32_t)size;
     ureq->sym_T = sym_T;
     ureq->num_gens = num_gens;
+#if VXFEC_ENABLE_SIM
+    vxf_sim_bind_paired_fault(ureq);
+#endif
     ureq->status = ncclSuccess;
     ureq->mr = mr;
     ureq->mr_offset = (mr && mr->base_ptr && size > 0) ? (size_t)((uintptr_t)data - (uintptr_t)mr->base_ptr) : 0u;
     vxf_mr_retain(mr);
+    atomic_fetch_add_explicit(&comm->active_reqs, 1u, memory_order_seq_cst);
 
     if (ureq->src_ibv_lkey != 0u && size > 0) {
         for (uint32_t i = 0; i < VXFEC_CTS_RING; i++) {
             if (comm->cts_ring[i].valid && comm->cts_ring[i].tag == ureq->tag && comm->cts_ring[i].tag_seq == ureq->tag_seq) {
                 vxfec_cts_entry_t ce = comm->cts_ring[i];
                 comm->cts_ring[i].valid = false;
-                tx_apply_rdma_cts_to_ureq(comm, ureq, ce.remote_iova, ce.remote_rkey, ce.max_bytes, ce.rslot, ce.token);
+                tx_apply_rdma_cts_to_ureq(comm, ureq, ce.remote_iova, ce.remote_rkey, ce.max_bytes, ce.rep_iova, ce.rep_rkey,
+                                          ce.rep_slots, ce.rslot, ce.token);
                 break;
             }
         }
     }
+    if (ureq->src_ibv_lkey != 0u && ((ureq->src_ibv_dmabuf && size > 0) || (uint32_t)size >= VXFEC_RDMA_HOST_CTS_MIN) &&
+        comm->ibv_ep && !comm->ibv_failed && !ureq->cts_resolved) {
+        uint64_t wait_ns = ureq->src_ibv_dmabuf ? 5000000000ULL : 500000ULL;
+        ureq->cts_wait_until_ns = mono_ns() + wait_ns;
+    }
 
     atomic_fetch_add_explicit(&vxf_st_tx_messages, 1, memory_order_relaxed);
+    uint64_t histogram_epoch = atomic_load_explicit(&vxf_send_histogram_epoch, memory_order_relaxed);
+    if (histogram_epoch & 1u)
+        vxf_record_send_size(histogram_epoch, (uint32_t)size);
 
-    tx_spawn_ready_generations(comm);
-    tx_drain_paced(comm, mono_ns());
-    tx_quiesce_broken_ibv(comm);
+    bool rw_active = vxf_rail_workers_active();
+    uint32_t rw_cfg = atomic_load_explicit(&vxf_cfg_rail_workers, memory_order_relaxed);
+    bool defer_to_rail = comm->tx_bg_registered && rw_active && ((rw_cfg >= 2u && size > 0) || size >= 65536);
+    if (!defer_to_rail) {
+        tx_spawn_ready_generations(comm);
+        tx_drain_paced(comm, mono_ns());
+        tx_quiesce_broken_ibv(comm);
+    }
     bool need_bg = (comm->unacked_aborts > 0u && !comm->tx_bg_registered);
+    bool wake_rail = (!need_bg && comm->tx_bg_registered &&
+                      (comm->unacked_aborts > 0u || (rw_active && !atomic_load_explicit(&ureq->done, memory_order_relaxed))));
+    int dev_idx = comm->dev_idx;
     pthread_mutex_unlock(&comm->mtx);
     if (need_bg)
         vxf_tx_bg_register(comm);
+    else if (wake_rail)
+        vxf_rail_wake(dev_idx);
     if (atomic_exchange_explicit(&vxf_retired_lc_reap_needed, false, memory_order_acq_rel))
         vxf_reap_retired_listeners(false);
 
@@ -4687,9 +6007,11 @@ ncclResult_t vxf_irecv(void *recvComm, int n, void **data, int *sizes, int *tags
 
     vxfec_rx_req_t *req = &comm->rx_pool[rslot];
     memset(req, 0, sizeof(*req));
+    for (uint32_t g = 0u; g < 64u; g++)
+        req->gen_to_slot[g] = -1;
     req->kind = VXFEC_REQ_RECV;
-    req->in_use = true;
-    req->done = false;
+    atomic_store_explicit(&req->in_use, true, memory_order_release);
+    atomic_store_explicit(&req->done, false, memory_order_relaxed);
     req->comm = comm;
     req->tag = (uint32_t)tags[0];
     req->expected_tag_seq = tag_seq;
@@ -4699,12 +6021,13 @@ ncclResult_t vxf_irecv(void *recvComm, int n, void **data, int *sizes, int *tags
     req->mr = mr;
     req->rslot_idx = (uint8_t)rslot;
     vxf_mr_retain(mr);
+    atomic_fetch_add_explicit(&comm->active_reqs, 1u, memory_order_seq_cst);
 
     for (uint32_t a = 0; a < VXFEC_ABORT_RING; a++) {
         if (comm->peer_aborts[a].tag_seq == req->expected_tag_seq && comm->peer_aborts[a].tag == req->tag) {
             comm->peer_aborts[a].tag_seq = 0u;
             req->status = ncclRemoteError;
-            req->done = true;
+            rx_mark_req_done_locked(comm, req);
             break;
         }
     }
@@ -4736,47 +6059,56 @@ ncclResult_t vxf_irecv(void *recvComm, int n, void **data, int *sizes, int *tags
         }
     }
 
-    if (!req->done && !already_has_slots && sizes[0] > 0 && comm->ibv_ep && !comm->ibv_failed && mr &&
-        mr->ptr_type == NCCL_PTR_CUDA && mr->vk_buf && comm->dev_idx >= 0 && (uint32_t)comm->dev_idx < vxf_num_devs &&
-        mr->ibv_mrs[comm->dev_idx] && mr->ibv_can_rwrite[comm->dev_idx] && vxfec_ibv_mr_is_dmabuf(mr->ibv_mrs[comm->dev_idx]) &&
-        !vxf_sim_gpu_rx_fault_armed()) {
-        vxfec_ibv_mr_t *imr = mr->ibv_mrs[comm->dev_idx];
-        uint32_t rkey = vxfec_ibv_mr_rkey(imr);
-        if (rkey != 0u) {
-            uint8_t tok = (comm->next_cts_token[rslot] + 1u) & 0x7u;
-            if (tok == 0u)
-                tok = 1u;
-            comm->next_cts_token[rslot] = tok;
-            req->cts_token = tok;
-            req->rdma_cts_sent = true;
-
-            size_t sub_off = (size_t)((uintptr_t)data[0] - (uintptr_t)mr->base_ptr);
-            struct {
-                uint64_t remote_iova;
-                uint32_t remote_rkey;
-                uint32_t max_bytes;
-            } cts_pay = {
-                .remote_iova = vxfec_ibv_mr_iova(imr) + sub_off,
-                .remote_rkey = rkey,
-                .max_bytes = (uint32_t)sizes[0],
-            };
-            vxfec_ctrl_pkt_t chdr = {
-                .magic = VXFEC_NET_MAGIC,
-                .cookie = comm->cookie,
-                .pkt_type = PKT_RDMA_CTS,
-                .flags = tok,
-                .sack_cnt = (uint16_t)rslot,
-                .msg_seq = 0u,
-                .tag = req->tag,
-                .K = req->expected_tag_seq,
-            };
-            rx_send_ctrl(comm, &chdr, &cts_pay, sizeof(cts_pay), 2);
+    if (!req->done && !already_has_slots && sizes[0] > 0 && comm->ibv_ep && !comm->ibv_failed) {
+        bool want_rdma_cts = false;
+        if (mr && comm->dev_idx >= 0 && (uint32_t)comm->dev_idx < vxf_num_devs && mr->ibv_mrs[comm->dev_idx] &&
+            mr->ibv_can_rwrite[comm->dev_idx]) {
+            if (mr->ptr_type == NCCL_PTR_CUDA) {
+                want_rdma_cts =
+                    vxf_mr_can_gpu_rw(mr) && vxfec_ibv_mr_is_dmabuf(mr->ibv_mrs[comm->dev_idx]) && !vxf_sim_gpu_rx_fault_armed();
+            } else if (mr->ptr_type == NCCL_PTR_HOST) {
+                want_rdma_cts = ((uint32_t)sizes[0] >= VXFEC_RDMA_HOST_CTS_MIN);
+            }
         }
+        if (want_rdma_cts) {
+            vxfec_ibv_mr_t *imr = mr->ibv_mrs[comm->dev_idx];
+            uint32_t rkey = vxfec_ibv_mr_rkey(imr);
+            if (rkey != 0u) {
+                uint64_t rep_iova = 0ULL;
+                uint32_t rep_rkey = 0u;
+                uint32_t rep_slots = 0u;
+                if ((comm->features & VXFEC_HELLO_RDMA_REPAIR) && rx_ibv_ensure_rep_mr(comm)) {
+                    rep_iova = vxfec_ibv_mr_iova(comm->ibv_rep_mr);
+                    rep_rkey = vxfec_ibv_mr_rkey(comm->ibv_rep_mr);
+                    rep_slots = VXFEC_RX_IBV_REP_SLOTS;
+                }
+                uint8_t tok = (comm->next_cts_token[rslot] + 1u) & 0x7u;
+                if (tok == 0u)
+                    tok = 1u;
+                comm->next_cts_token[rslot] = tok;
+                size_t sub_off = (size_t)((uintptr_t)data[0] - (uintptr_t)mr->base_ptr);
+                req->cts_token = tok;
+                req->rdma_cts_sent = true;
+                req->cts_remote_iova = vxfec_ibv_mr_iova(imr) + sub_off;
+                req->cts_remote_rkey = rkey;
+                req->cts_rep_iova = rep_iova;
+                req->cts_rep_rkey = rep_rkey;
+                req->cts_rep_slots = (uint16_t)rep_slots;
+            }
+        }
+        req->cts_sent_any = true;
+        req->cts_last_tx_ns = mono_ns();
+        rx_emit_cts_pkt(comm, req, 2);
     }
 
-    if (!req->done)
+    bool rw_active = vxf_rail_workers_active();
+    if (!atomic_load_explicit(&req->done, memory_order_relaxed) && !(comm->bg_registered && rw_active))
         vxf_progress_recv_comm(comm);
+    bool wake_rail = comm->bg_registered && rw_active && !atomic_load_explicit(&req->done, memory_order_relaxed);
+    int dev_idx = comm->dev_idx;
     pthread_mutex_unlock(&comm->mtx);
+    if (wake_rail)
+        vxf_rail_wake(dev_idx);
     if (atomic_exchange_explicit(&vxf_retired_lc_reap_needed, false, memory_order_acq_rel))
         vxf_reap_retired_listeners(false);
 
@@ -4786,13 +6118,43 @@ ncclResult_t vxf_irecv(void *recvComm, int n, void **data, int *sizes, int *tags
 
 ncclResult_t vxf_iflush(void *recvComm, int n, void **data, int *sizes, void **mhandles, void **request)
 {
-    (void)recvComm;
-    (void)n;
-    (void)data;
-    (void)sizes;
-    (void)mhandles;
     if (!request)
         return ncclInvalidArgument;
+    *request = NULL;
+    if (recvComm) {
+        vxfec_recv_comm_t *rc = (vxfec_recv_comm_t *)recvComm;
+        pthread_mutex_lock(&rc->mtx);
+        if (rc->ibv_failed || (rc->ibv_ep && vxfec_ibv_ep_has_error(rc->ibv_ep))) {
+            pthread_mutex_unlock(&rc->mtx);
+            return ncclSystemError;
+        }
+        bool has_ibv = (rc->ibv_ep != NULL);
+        int dev = rc->dev_idx;
+        pthread_mutex_unlock(&rc->mtx);
+        /*
+         * UC QPs do not support remote IBV_WR_RDMA_READ; flush posted
+         * writes on GPU DMA-BUF registrations with a local BAR1 readback
+         */
+        if (has_ibv && dev >= 0 && (uint32_t)dev < VXFEC_MAX_DEVS && sizes && mhandles) {
+            for (int i = 0; i < n; i++) {
+                vxfec_mr_t *mr = (vxfec_mr_t *)mhandles[i];
+                if (!mr || sizes[i] <= 0)
+                    continue;
+                vxfec_ibv_mr_t *imr = mr->ibv_mrs[dev];
+                if (!imr || !vxfec_ibv_mr_is_dmabuf(imr))
+                    continue;
+
+                uintptr_t base = (uintptr_t)mr->base_ptr;
+                uintptr_t addr = (data && data[i]) ? (uintptr_t)data[i] : base;
+                size_t len = ((size_t)sizes[i] < 4u) ? (size_t)sizes[i] : 4u;
+                uint8_t sink[4];
+                vxfec_ibv_dev_ref_t *ref = mr->ibv_refs[dev];
+                if (addr < base || addr - base > mr->size || len > mr->size - (addr - base) || !ref || !ref->ctx ||
+                    !vxfec_ibv_mr_read_to_host(ref->ctx, imr, addr - base, sink, len))
+                    return ncclSystemError;
+            }
+        }
+    }
     *request = (void *)&g_flush_sentinel;
     return ncclSuccess;
 }
@@ -4812,37 +6174,50 @@ ncclResult_t vxf_test(void *request, int *done, int *sizes)
     if (kind == VXFEC_REQ_SEND) {
         vxfec_tx_user_req_t *ureq = (vxfec_tx_user_req_t *)request;
         vxfec_send_comm_t *sc = ureq->comm;
-        if (!sc)
+        if (!sc || !atomic_load_explicit(&ureq->in_use, memory_order_acquire))
             return ncclInvalidUsage;
-        pthread_mutex_lock(&sc->mtx);
-        if (!ureq->in_use || ureq->comm != sc) {
+        if (!atomic_load_explicit(&ureq->done, memory_order_acquire) && sc->tx_bg_registered && vxf_rail_workers_active()) {
+            if (pthread_mutex_trylock(&sc->mtx) != 0)
+                return ncclSuccess;
+        } else {
+            pthread_mutex_lock(&sc->mtx);
+        }
+        if (!atomic_load_explicit(&ureq->in_use, memory_order_relaxed) || ureq->comm != sc) {
             pthread_mutex_unlock(&sc->mtx);
             return ncclInvalidUsage;
         }
-        if (!ureq->done)
+        if (!atomic_load_explicit(&ureq->done, memory_order_relaxed))
             vxf_progress_send_comm(sc);
-        bool is_done = ureq->done;
+        bool is_done =
+            atomic_load_explicit(&ureq->done, memory_order_relaxed) && vxf_gpu_finish_direct_jobs(&ureq->direct_jobs, false);
         ncclResult_t st = ncclSuccess;
         int total = 0;
         vxfec_mr_t *mr = NULL;
         uint8_t *bbuf = NULL;
+        vxfec_gpu_job_t *zc_jobs = NULL;
         if (is_done) {
             st = ureq->status;
             total = (int)ureq->msg_total_bytes;
-            vxf_free_ureq_zc_jobs(ureq);
+            zc_jobs = ureq->zc_gpu_head;
+            ureq->zc_gpu_head = NULL;
             bbuf = ureq->bounce_buf;
             ureq->bounce_buf = NULL;
             mr = ureq->mr;
             ureq->mr = NULL;
-            ureq->in_use = false;
+            atomic_store_explicit(&ureq->in_use, false, memory_order_release);
         }
         bool need_bg = (sc->unacked_aborts > 0u && !sc->tx_bg_registered);
+        bool wake_bg = (!need_bg && sc->unacked_aborts > 0u && sc->tx_bg_registered);
+        int dev_idx = sc->dev_idx;
         pthread_mutex_unlock(&sc->mtx);
         if (need_bg)
             vxf_tx_bg_register(sc);
+        else if (wake_bg)
+            vxf_rail_wake(dev_idx);
         if (atomic_exchange_explicit(&vxf_retired_lc_reap_needed, false, memory_order_acq_rel))
             vxf_reap_retired_listeners(false);
         if (is_done) {
+            free_zc_gpu_job_list(zc_jobs);
             free(bbuf);
             vxf_mr_release(mr);
             if (st != ncclSuccess)
@@ -4857,15 +6232,21 @@ ncclResult_t vxf_test(void *request, int *done, int *sizes)
     if (kind == VXFEC_REQ_RECV) {
         vxfec_rx_req_t *req = (vxfec_rx_req_t *)request;
         vxfec_recv_comm_t *rc = req->comm;
-        if (!rc)
+        if (!rc || !atomic_load_explicit(&req->in_use, memory_order_acquire))
             return ncclInvalidUsage;
-        pthread_mutex_lock(&rc->mtx);
-        if (!req->in_use || req->comm != rc) {
+        if (!atomic_load_explicit(&req->done, memory_order_acquire) && rc->bg_registered && vxf_rail_workers_active()) {
+            if (pthread_mutex_trylock(&rc->mtx) != 0)
+                return ncclSuccess;
+        } else {
+            pthread_mutex_lock(&rc->mtx);
+        }
+        if (!atomic_load_explicit(&req->in_use, memory_order_relaxed) || req->comm != rc) {
             pthread_mutex_unlock(&rc->mtx);
             return ncclInvalidUsage;
         }
-        vxf_progress_recv_comm(rc);
-        if (req->done) {
+        if (!atomic_load_explicit(&req->done, memory_order_relaxed))
+            vxf_progress_recv_comm(rc);
+        if (atomic_load_explicit(&req->done, memory_order_relaxed) && vxf_gpu_finish_direct_jobs(&req->direct_jobs, false)) {
             ncclResult_t st = req->status;
             int actual = req->actual_size;
             free(req->early_rdma_syms);
@@ -4874,7 +6255,7 @@ ncclResult_t vxf_test(void *request, int *done, int *sizes)
             req->heap_gen_bits = NULL;
             vxfec_mr_t *mr = req->mr;
             req->mr = NULL;
-            req->in_use = false;
+            atomic_store_explicit(&req->in_use, false, memory_order_release);
             pthread_mutex_unlock(&rc->mtx);
             if (atomic_exchange_explicit(&vxf_retired_lc_reap_needed, false, memory_order_acq_rel))
                 vxf_reap_retired_listeners(false);

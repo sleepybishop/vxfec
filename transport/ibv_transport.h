@@ -128,13 +128,6 @@ bool vxfec_ibv_ep_peer_has_ctrl_rx(const vxfec_ibv_ep_t *ep);
 bool vxfec_ibv_ep_send_pkt(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *hdr, uint32_t hdr_len, const void *payload,
                            uint32_t pay_len, uint32_t pay_lkey);
 uint32_t vxfec_ibv_ep_send_pkt_batch(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const vxfec_ibv_send_wr_desc_t *pkts, uint32_t count);
-static inline bool vxfec_ibv_ep_send_pkt_ex(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *hdr, uint32_t hdr_len,
-                                            const void *payload, uint32_t pay_len, uint32_t pay_lkey, bool force_signal)
-{
-    vxfec_ibv_send_wr_desc_t d = {
-        .hdr = hdr, .payload = payload, .hdr_len = hdr_len, .pay_len = pay_len, .pay_lkey = pay_lkey, .force_signal = force_signal};
-    return vxfec_ibv_ep_send_pkt_batch(ep, qp_idx, &d, 1u) == 1u;
-}
 bool vxfec_ibv_ep_send_ctrl_inline(vxfec_ibv_ep_t *ep, const void *buf, uint32_t len);
 bool vxfec_ibv_ep_rdma_write_imm(vxfec_ibv_ep_t *ep, uint32_t qp_idx, const void *src_addr, uint32_t byte_len, uint32_t lkey,
                                  uint64_t remote_addr, uint32_t rkey, uint32_t imm_host_order);

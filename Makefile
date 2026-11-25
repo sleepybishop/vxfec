@@ -11,11 +11,11 @@ AR          ?= ar
 VULKAN_LIBS ?= -lvulkan
 
 ARCH_FLAGS  ?= -march=native
-CPPFLAGS    += -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64
+override CPPFLAGS += -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64
 ifneq ($(wildcard /usr/include/infiniband/verbs.h),)
-CPPFLAGS    += -DVXFEC_HAVE_IBVERBS
+override CPPFLAGS += -DVXFEC_HAVE_IBVERBS
 ifneq ($(shell printf '#include <infiniband/verbs.h>\nint x = sizeof(((struct ibv_port_attr *)0)->active_speed_ex);\n' | $(CC) -x c - -c -o /dev/null 2>/dev/null && echo 1),)
-CPPFLAGS    += -DVXFEC_HAVE_IBV_SPEED_EX
+override CPPFLAGS += -DVXFEC_HAVE_IBV_SPEED_EX
 endif
 endif
 INCLUDES     = -Iinclude -Ivk -Itransport -I$(NANORQ_DIR)/include -I$(NANORQ_DIR)/deps -I$(NANORQ_DIR)/deps/obl
@@ -23,6 +23,7 @@ CFLAGS      ?= -O3 -g -std=c11 -Wall -Wextra $(ARCH_FLAGS) -funroll-loops -ftree
 
 BUILD_DIR   ?= build
 OUT_PREFIX  ?=
+CUDA_HOME   ?= /usr/local/cuda
 ASAN_DIR     = build-asan
 LSAN_SUPP   ?= $(abspath t/lsan.supp)
 
@@ -61,6 +62,7 @@ NCCL_PLUGIN_OBJ = \
 	$(BUILD_DIR)/plugins/nccl_net_dev.o \
 	$(BUILD_DIR)/plugins/nccl_net_conn.o \
 	$(BUILD_DIR)/plugins/nccl_net_proto.o \
+	$(BUILD_DIR)/plugins/nccl_gpu_rt.o \
 	$(BUILD_DIR)/transport/ibv_transport.o
 NCCL_SO ?= $(OUT_PREFIX)libnccl-vxfec.so
 
@@ -103,6 +105,10 @@ $(BUILD_DIR)/obl/%.o: $(NANORQ_DIR)/deps/obl/%.c
 $(BUILD_DIR)/transport/%.o: transport/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(DEPFLAGS) $(INCLUDES) -c $< -o $@
+
+ifneq ($(wildcard $(CUDA_HOME)/include/cuda.h),)
+$(BUILD_DIR)/plugins/nccl_gpu_rt.o: override CPPFLAGS += -I$(CUDA_HOME)/include
+endif
 
 $(BUILD_DIR)/plugins/%.o: plugins/nccl/%.c
 	@mkdir -p $(dir $@)

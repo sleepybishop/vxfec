@@ -23,6 +23,7 @@
 enum {
     VXFEC_VK_EXT_NONE = 0,
     VXFEC_VK_EXT_DMABUF = 1,
+    VXFEC_VK_EXT_OPAQUE_FD = 2,
 };
 
 typedef struct {
@@ -54,6 +55,31 @@ typedef struct {
     uint32_t block_offset;
 } vxfec_mix_push_consts;
 
+enum {
+    VXFEC_VK_PIPE_VEC4_GF256 = 0,
+    VXFEC_VK_PIPE_VEC4_GF2,
+    VXFEC_VK_PIPE_VRAM_GF256,
+    VXFEC_VK_PIPE_VRAM_GF2,
+    VXFEC_VK_PIPE_MIX_VEC4,
+    VXFEC_VK_PIPE_MIX,
+    VXFEC_VK_PIPE_DIRECT_GF2_VEC4_16,
+    VXFEC_VK_PIPE_DIRECT_GF2_VEC4_32,
+    VXFEC_VK_PIPE_DIRECT_GF2_16,
+    VXFEC_VK_PIPE_DIRECT_GF2_32,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_8,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_16,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_32,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_8,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_16,
+    VXFEC_VK_PIPE_DIRECT_GF256_NIB_32,
+    VXFEC_VK_PIPE_WIRE_GF2_VEC4_16,
+    VXFEC_VK_PIPE_WIRE_GF2_VEC4_32,
+    VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_8,
+    VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_16,
+    VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_32,
+    VXFEC_VK_PIPE_COUNT,
+};
+
 struct vxfec_vk_buf {
     VkBuffer dev_buf;
     VkDeviceMemory dev_mem;
@@ -62,10 +88,13 @@ struct vxfec_vk_buf {
     void *stage_ptr;
     size_t bytes;
     size_t view_offset;
+    uint64_t retire_ticket;
     uint8_t ext_kind;
     bool owned_by_vk;
     bool zero_copy;
     bool imported_host;
+    void (*ext_free_fn)(void *);
+    void *ext_free_arg;
     struct vxfec_vk_buf *next_retired;
 };
 
@@ -88,6 +117,8 @@ struct vxfec_vk_ctx {
     uint32_t qfam;
 
     char dev_name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    char pci_bdf[32];
+    uint8_t device_uuid[VK_UUID_SIZE];
     uint32_t vendor_id;
     bool is_discrete;
     bool dedicated_compute;
@@ -103,6 +134,8 @@ struct vxfec_vk_ctx {
     bool has_timestamps;
     bool has_timeline_sem;
     bool has_ext_mem_fd;
+    bool has_opaque_fd;
+    bool opaque_fd_dedicated_only;
     bool has_dmabuf;
     bool has_dmabuf_export;
     bool dmabuf_dedicated_only;
@@ -146,29 +179,10 @@ struct vxfec_vk_ctx {
     VkDescriptorSet ds_mix;
     VkDescriptorSet ds_mix_aux;
 
-    VkPipeline pipe_vec4_gf256;
-    VkPipeline pipe_vec4_gf2;
-    VkPipeline pipe_vram_gf256;
-    VkPipeline pipe_vram_gf2;
-    VkPipeline pipe_mix_vec4;
-    VkPipeline pipe_mix;
-    VkPipeline pipe_direct_gf2_vec4_16;
-    VkPipeline pipe_direct_gf2_vec4_32;
-    VkPipeline pipe_direct_gf2_16;
-    VkPipeline pipe_direct_gf2_32;
-    VkPipeline pipe_direct_gf256_nib_vec4_8;
-    VkPipeline pipe_direct_gf256_nib_vec4_16;
-    VkPipeline pipe_direct_gf256_nib_8;
-    VkPipeline pipe_direct_gf256_nib_16;
-    VkPipeline pipe_wire_gf2_vec4_16;
-    VkPipeline pipe_wire_gf2_vec4_32;
-    VkPipeline pipe_wire_gf256_nib_vec4_8;
-    VkPipeline pipe_wire_gf256_nib_vec4_16;
+    VkPipeline pipes[VXFEC_VK_PIPE_COUNT];
 
-    vxfec_vk_buf *mix_tab_buf;
-    size_t mix_tab_cap;
-    vxfec_vk_buf *direct_tab_buf;
-    size_t direct_tab_cap;
+    vxfec_vk_buf *sync_tab_buf;
+    size_t sync_tab_cap;
 
     VkBuffer io_stage_buf;
     VkDeviceMemory io_stage_mem;
@@ -211,9 +225,14 @@ vxfec_vk_buf *vxfec_vk__upload_const_buf(vxfec_vk_ctx *ctx, const void *data, si
 
 uint32_t vxfec_vk__compute_tile_blocks(const vxfec_vk_ctx *ctx, uint32_t rows, uint32_t stride, uint32_t wg_x, uint32_t num_blocks);
 
-bool vxfec_vk__select_direct_plan(const vxfec_vk_ctx *ctx, bool pure_gf2, uint32_t tile_e, size_t d_bytes, size_t out_bytes,
-                                  uint32_t stride, uint32_t num_tiles, uint32_t num_blocks, VkPipeline *out_pipe,
-                                  uint32_t *out_stride_units, uint32_t *out_wg_x);
+bool vxfec_vk__select_vec4_grid(const vxfec_vk_ctx *ctx, uint32_t stride, uint64_t parallel_units, bool *out_vec4,
+                                uint32_t *out_stride_units, uint32_t *out_wg_x);
+void vxfec_vk__update_ssbo_ds(VkDevice dev, VkDescriptorSet ds, const VkDescriptorBufferInfo *dbis, uint32_t count);
+void vxfec_vk__cmd_mem_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
+                               VkAccessFlags src_access, VkAccessFlags dst_access);
+
+bool vxfec_vk__select_direct_plan(const vxfec_vk_ctx *ctx, bool pure_gf2, uint32_t tile_e, uint32_t stride, uint32_t num_tiles,
+                                  uint32_t num_blocks, VkPipeline *out_pipe, uint32_t *out_stride_units, uint32_t *out_wg_x);
 
 void vxfec_vk__record_mix_like_dispatches_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescriptorSet ds_mix, uint32_t rows,
                                               uint32_t stride_units, uint32_t wg_x, uint32_t num_esis, uint32_t y_count,
@@ -221,7 +240,7 @@ void vxfec_vk__record_mix_like_dispatches_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer
 
 bool vxfec_vk__record_direct_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescriptorSet ds_mix, const vxfec_vk_direct_desc *gd,
                                  vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks, vxfec_vk_buf *out_buf, bool upload_d,
-                                 bool download_out, bool record_ts);
+                                 bool download_out, bool upload_tab, bool record_ts);
 
 bool vxfec_vk__direct_pipelined(vxfec_vk_ctx *ctx, const vxfec_vk_direct_desc *gd, vxfec_vk_buf *d_buf, uint32_t stride,
                                 uint32_t num_blocks, vxfec_vk_buf *out_buf, bool upload_d, bool download_out, uint64_t *gpu_ns_out);
@@ -245,7 +264,23 @@ bool vxfec_vk__record_vram_repair_scatter_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer
 
 uint32_t vxfec_vk__choose_gf256_tile_e(uint32_t num_out);
 
-/* pack a dense rows x num_out GF(256) matrix Y into an 8/16-output nibble DirectTab256 */
+static inline void vxfec_vk__pack_nib_octet(const uint8_t *yc, uint32_t rem, uint32_t *out_lo, uint32_t *out_hi)
+{
+    uint32_t lo = 0u, hi = 0u;
+    uint32_t lim = (rem > 8u) ? 8u : rem;
+    for (uint32_t b = 0; b < lim; b++) {
+        uint8_t c = yc[b];
+        if (c != 0u) {
+            uint32_t sh = 4u * b;
+            lo |= ((uint32_t)(c & 0x0fu)) << sh;
+            hi |= ((uint32_t)(c >> 4u)) << sh;
+        }
+    }
+    *out_lo = lo;
+    *out_hi = hi;
+}
+
+/* pack a dense rows x num_out GF(256) matrix Y into an 8/16/32-output nibble DirectTab256 */
 bool vxfec_vk__emit_direct_gf256_tab(VkDeviceSize max_ssbo_range, const uint8_t *Y, size_t m_stride, uint32_t rows,
                                      uint32_t num_out, uint32_t **out_words, size_t *out_bytes, uint32_t *out_tiles,
                                      uint32_t *out_tile_e);

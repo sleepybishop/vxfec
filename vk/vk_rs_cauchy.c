@@ -26,6 +26,27 @@ static inline uint8_t gf256_inv_nz(uint8_t a)
     return GF2_8_EXP[255u - (uint32_t)GF2_8_LOG[a]];
 }
 
+static inline bool rs8_gen_dims_ok(vxfec_rs8_gen_t gen, uint32_t K, uint32_t M)
+{
+    if (K == 0u || M == 0u || K > 255u)
+        return false;
+    if (gen == VXFEC_RS8_GEN_CAUCHY)
+        return M <= 256u - K;
+    if (gen == VXFEC_RS8_GEN_CAUCHY_EXP)
+        return M <= 255u - K;
+    return false;
+}
+
+static inline uint8_t rs8_node_y(vxfec_rs8_gen_t gen, uint32_t M, uint32_t k)
+{
+    return (gen == VXFEC_RS8_GEN_CAUCHY_EXP) ? GF2_8_EXP[254u - k] : (uint8_t)(M + k);
+}
+
+static inline uint8_t rs8_node_x(vxfec_rs8_gen_t gen, uint32_t m)
+{
+    return (gen == VXFEC_RS8_GEN_CAUCHY_EXP) ? GF2_8_EXP[m] : (uint8_t)m;
+}
+
 static vxfec_rs8_plan *finalize_rs8_plan(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, uint32_t num_out, size_t m_stride, uint8_t *Y)
 {
     vxfec_rs8_plan *plan = (vxfec_rs8_plan *)calloc(1, sizeof(*plan));
@@ -69,9 +90,10 @@ static vxfec_rs8_plan *finalize_rs8_plan(vxfec_vk_ctx *ctx, uint32_t K, uint32_t
     return plan;
 }
 
-bool vxfec_rs8__encode_matrix(uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity, uint8_t *Y, size_t m_stride)
+bool vxfec_rs8__encode_matrix_gen(vxfec_rs8_gen_t gen, uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity,
+                                  uint8_t *Y, size_t m_stride)
 {
-    if (K == 0 || K > 255u || M == 0 || M > 256u - K || num_parity == 0 || num_parity > M || !Y || m_stride < num_parity)
+    if (!rs8_gen_dims_ok(gen, K, M) || num_parity == 0 || num_parity > M || !Y || m_stride < num_parity)
         return false;
     rs8_ensure_oblas();
 
@@ -83,29 +105,34 @@ bool vxfec_rs8__encode_matrix(uint32_t K, uint32_t M, const uint8_t *parity_m, u
     }
 
     memset(Y, 0, (size_t)K * m_stride);
-    /* nanors Cauchy node assignment: y_k = M + k, x_m = m */
     for (uint32_t k = 0; k < K; k++) {
-        uint8_t yk = (uint8_t)(M + k);
+        uint8_t yk = rs8_node_y(gen, M, k);
         uint8_t *row = Y + (size_t)k * m_stride;
         for (uint32_t p = 0; p < num_parity; p++) {
-            uint8_t xm = parity_m ? parity_m[p] : (uint8_t)p;
+            uint8_t xm = rs8_node_x(gen, parity_m ? (uint32_t)parity_m[p] : p);
             row[p] = gf256_inv_nz((uint8_t)(yk ^ xm));
         }
     }
     return true;
 }
 
-vxfec_rs8_plan *vxfec_rs8_encode_plan_new(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity)
+bool vxfec_rs8__encode_matrix(uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity, uint8_t *Y, size_t m_stride)
 {
-    if (K == 0 || K > 255u || M == 0 || M > 256u - K || num_parity == 0 || num_parity > M)
+    return vxfec_rs8__encode_matrix_gen(VXFEC_RS8_GEN_CAUCHY, K, M, parity_m, num_parity, Y, m_stride);
+}
+
+vxfec_rs8_plan *vxfec_rs8_encode_plan_new_ex(vxfec_vk_ctx *ctx, vxfec_rs8_gen_t gen, uint32_t K, uint32_t M,
+                                             const uint8_t *parity_m, uint32_t num_parity)
+{
+    if (!rs8_gen_dims_ok(gen, K, M) || num_parity == 0 || num_parity > M)
         return NULL;
 
     size_t m_stride = ((size_t)num_parity + 31u) & ~(size_t)31u;
-    uint8_t *Y = (uint8_t *)calloc((size_t)K * m_stride, 1u);
+    uint8_t *Y = (uint8_t *)malloc((size_t)K * m_stride);
     if (!Y)
         return NULL;
 
-    if (!vxfec_rs8__encode_matrix(K, M, parity_m, num_parity, Y, m_stride)) {
+    if (!vxfec_rs8__encode_matrix_gen(gen, K, M, parity_m, num_parity, Y, m_stride)) {
         free(Y);
         return NULL;
     }
@@ -113,10 +140,15 @@ vxfec_rs8_plan *vxfec_rs8_encode_plan_new(vxfec_vk_ctx *ctx, uint32_t K, uint32_
     return finalize_rs8_plan(ctx, K, M, num_parity, m_stride, Y);
 }
 
-bool vxfec_rs8__recovery_matrix(uint32_t K, uint32_t M, const uint8_t *erased_k, const uint8_t *parity_m, uint32_t e, uint8_t *Y,
-                                size_t m_stride)
+vxfec_rs8_plan *vxfec_rs8_encode_plan_new(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity)
 {
-    if (K == 0 || K > 255u || M == 0 || M > 256u - K || !erased_k || !parity_m || e == 0 || e > K || e > M || !Y || m_stride < e)
+    return vxfec_rs8_encode_plan_new_ex(ctx, VXFEC_RS8_GEN_CAUCHY, K, M, parity_m, num_parity);
+}
+
+bool vxfec_rs8__recovery_matrix_gen(vxfec_rs8_gen_t gen, uint32_t K, uint32_t M, const uint8_t *erased_k, const uint8_t *parity_m,
+                                    uint32_t e, uint8_t *Y, size_t m_stride)
+{
+    if (!rs8_gen_dims_ok(gen, K, M) || !erased_k || !parity_m || e == 0 || e > K || e > M || !Y || m_stride < e)
         return false;
     rs8_ensure_oblas();
     memset(Y, 0, (size_t)K * m_stride);
@@ -136,8 +168,8 @@ bool vxfec_rs8__recovery_matrix(uint32_t K, uint32_t M, const uint8_t *erased_k,
             return false;
         seen_k[k >> 3] |= (uint8_t)(1u << (k & 7u));
         seen_m[m >> 3] |= (uint8_t)(1u << (m & 7u));
-        y[i] = (uint8_t)(M + (uint32_t)k);
-        x[i] = m;
+        y[i] = rs8_node_y(gen, M, (uint32_t)k);
+        x[i] = rs8_node_x(gen, (uint32_t)m);
     }
 
     /* closed-form O(e^2) Cauchy inverse: (C_E^-1)[b, a] = (u[a] * v[b]) / (x[a] ^ y[b]) */
@@ -177,7 +209,7 @@ bool vxfec_rs8__recovery_matrix(uint32_t K, uint32_t M, const uint8_t *erased_k,
     for (uint32_t s = 0; s < K; s++) {
         if ((seen_k[s >> 3] >> (s & 7u)) & 1u)
             continue;
-        uint8_t ys = (uint8_t)(M + s);
+        uint8_t ys = rs8_node_y(gen, M, s);
         uint32_t nlog = 0u, dlog = 0u;
         for (uint32_t j = 0; j < e; j++) {
             nlog += (uint32_t)GF2_8_LOG[ys ^ y[j]];
@@ -195,23 +227,34 @@ bool vxfec_rs8__recovery_matrix(uint32_t K, uint32_t M, const uint8_t *erased_k,
     return true;
 }
 
-vxfec_rs8_plan *vxfec_rs8_decode_plan_new(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *erased_k,
-                                          const uint8_t *parity_m, uint32_t num_erased)
+bool vxfec_rs8__recovery_matrix(uint32_t K, uint32_t M, const uint8_t *erased_k, const uint8_t *parity_m, uint32_t e, uint8_t *Y,
+                                size_t m_stride)
 {
-    if (K == 0 || K > 255u || M == 0 || M > 256u - K || !erased_k || !parity_m || num_erased == 0 || num_erased > K ||
-        num_erased > M)
+    return vxfec_rs8__recovery_matrix_gen(VXFEC_RS8_GEN_CAUCHY, K, M, erased_k, parity_m, e, Y, m_stride);
+}
+
+vxfec_rs8_plan *vxfec_rs8_decode_plan_new_ex(vxfec_vk_ctx *ctx, vxfec_rs8_gen_t gen, uint32_t K, uint32_t M,
+                                             const uint8_t *erased_k, const uint8_t *parity_m, uint32_t num_erased)
+{
+    if (!rs8_gen_dims_ok(gen, K, M) || !erased_k || !parity_m || num_erased == 0 || num_erased > K || num_erased > M)
         return NULL;
 
     size_t m_stride = ((size_t)num_erased + 31u) & ~(size_t)31u;
-    uint8_t *Y = (uint8_t *)calloc((size_t)K * m_stride, 1u);
+    uint8_t *Y = (uint8_t *)malloc((size_t)K * m_stride);
     if (!Y)
         return NULL;
 
-    if (!vxfec_rs8__recovery_matrix(K, M, erased_k, parity_m, num_erased, Y, m_stride)) {
+    if (!vxfec_rs8__recovery_matrix_gen(gen, K, M, erased_k, parity_m, num_erased, Y, m_stride)) {
         free(Y);
         return NULL;
     }
     return finalize_rs8_plan(ctx, K, M, num_erased, m_stride, Y);
+}
+
+vxfec_rs8_plan *vxfec_rs8_decode_plan_new(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *erased_k,
+                                          const uint8_t *parity_m, uint32_t num_erased)
+{
+    return vxfec_rs8_decode_plan_new_ex(ctx, VXFEC_RS8_GEN_CAUCHY, K, M, erased_k, parity_m, num_erased);
 }
 
 void vxfec_rs8_plan_free(vxfec_vk_ctx *ctx, vxfec_rs8_plan *plan)
@@ -267,10 +310,10 @@ bool vxfec_rs8_exec_cpu(const vxfec_rs8_plan *plan, const uint8_t *in_rows, uint
     return true;
 }
 
-bool vxfec_rs8_encode_cpu(uint32_t K, uint32_t M, const uint8_t *sys_rows, uint32_t stride, const uint8_t *parity_m,
-                          uint32_t num_parity, uint8_t *parity_out)
+bool vxfec_rs8_encode_cpu_ex(vxfec_rs8_gen_t gen, uint32_t K, uint32_t M, const uint8_t *sys_rows, uint32_t stride,
+                             const uint8_t *parity_m, uint32_t num_parity, uint8_t *parity_out)
 {
-    vxfec_rs8_plan *plan = vxfec_rs8_encode_plan_new(NULL, K, M, parity_m, num_parity);
+    vxfec_rs8_plan *plan = vxfec_rs8_encode_plan_new_ex(NULL, gen, K, M, parity_m, num_parity);
     if (!plan)
         return false;
     bool ok = vxfec_rs8_exec_cpu(plan, sys_rows, stride, 1u, parity_out);
@@ -278,8 +321,14 @@ bool vxfec_rs8_encode_cpu(uint32_t K, uint32_t M, const uint8_t *sys_rows, uint3
     return ok;
 }
 
-bool vxfec_rs8_decode_compact_cpu(uint32_t K, uint32_t M, uint8_t *compact_k_rows, uint32_t stride, const uint8_t *erased_k,
-                                  const uint8_t *parity_m, uint32_t num_erased)
+bool vxfec_rs8_encode_cpu(uint32_t K, uint32_t M, const uint8_t *sys_rows, uint32_t stride, const uint8_t *parity_m,
+                          uint32_t num_parity, uint8_t *parity_out)
+{
+    return vxfec_rs8_encode_cpu_ex(VXFEC_RS8_GEN_CAUCHY, K, M, sys_rows, stride, parity_m, num_parity, parity_out);
+}
+
+bool vxfec_rs8_decode_compact_cpu_ex(vxfec_rs8_gen_t gen, uint32_t K, uint32_t M, uint8_t *compact_k_rows, uint32_t stride,
+                                     const uint8_t *erased_k, const uint8_t *parity_m, uint32_t num_erased)
 {
     if (!compact_k_rows || !erased_k || !parity_m || stride == 0 || num_erased == 0)
         return false;
@@ -291,7 +340,7 @@ bool vxfec_rs8_decode_compact_cpu(uint32_t K, uint32_t M, uint8_t *compact_k_row
     if (!recovered)
         return false;
 
-    vxfec_rs8_plan *plan = vxfec_rs8_decode_plan_new(NULL, K, M, erased_k, parity_m, num_erased);
+    vxfec_rs8_plan *plan = vxfec_rs8_decode_plan_new_ex(NULL, gen, K, M, erased_k, parity_m, num_erased);
     if (!plan) {
         free(recovered);
         return false;
@@ -305,6 +354,12 @@ bool vxfec_rs8_decode_compact_cpu(uint32_t K, uint32_t M, uint8_t *compact_k_row
     }
     free(recovered);
     return ok;
+}
+
+bool vxfec_rs8_decode_compact_cpu(uint32_t K, uint32_t M, uint8_t *compact_k_rows, uint32_t stride, const uint8_t *erased_k,
+                                  const uint8_t *parity_m, uint32_t num_erased)
+{
+    return vxfec_rs8_decode_compact_cpu_ex(VXFEC_RS8_GEN_CAUCHY, K, M, compact_k_rows, stride, erased_k, parity_m, num_erased);
 }
 
 bool vxfec_rs8_exec_pipelined(vxfec_vk_ctx *ctx, const vxfec_rs8_plan *plan, vxfec_vk_buf *d_buf, uint32_t stride,
@@ -329,17 +384,17 @@ uint64_t vxfec_rs8_exec_submit(vxfec_vk_ctx *ctx, const vxfec_rs8_plan *plan, vx
     return vxfec_vk__direct_submit(ctx, &plan->gpu, d_buf, stride, num_blocks, out_buf, upload_d, download_out);
 }
 
-uint64_t vxfec_rs8_submit_raw(vxfec_vk_ctx *ctx, bool is_decode, uint32_t K, uint32_t M, const uint8_t *erased_k,
-                              const uint8_t *parity_m, uint32_t num_out, vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks,
-                              vxfec_vk_buf *out_buf, bool upload_d, bool download_out)
+uint64_t vxfec_rs8_submit_raw_ex(vxfec_vk_ctx *ctx, vxfec_rs8_gen_t gen, bool is_decode, uint32_t K, uint32_t M,
+                                 const uint8_t *erased_k, const uint8_t *parity_m, uint32_t num_out, vxfec_vk_buf *d_buf,
+                                 uint32_t stride, uint32_t num_blocks, vxfec_vk_buf *out_buf, bool upload_d, bool download_out)
 {
-    if (!ctx || K == 0 || K > 255u || M == 0 || M > 256u - K || num_out == 0 || num_out > M)
+    if (!ctx || !rs8_gen_dims_ok(gen, K, M) || num_out == 0 || num_out > M)
         return 0;
 
     size_t m_stride = ((size_t)num_out + 31u) & ~(size_t)31u;
     uint8_t Y[256 * 256];
-    bool ok = is_decode ? vxfec_rs8__recovery_matrix(K, M, erased_k, parity_m, num_out, Y, m_stride)
-                        : vxfec_rs8__encode_matrix(K, M, parity_m, num_out, Y, m_stride);
+    bool ok = is_decode ? vxfec_rs8__recovery_matrix_gen(gen, K, M, erased_k, parity_m, num_out, Y, m_stride)
+                        : vxfec_rs8__encode_matrix_gen(gen, K, M, parity_m, num_out, Y, m_stride);
     if (!ok)
         return 0;
 
@@ -358,12 +413,20 @@ uint64_t vxfec_rs8_submit_raw(vxfec_vk_ctx *ctx, bool is_decode, uint32_t K, uin
     return ticket;
 }
 
+uint64_t vxfec_rs8_submit_raw(vxfec_vk_ctx *ctx, bool is_decode, uint32_t K, uint32_t M, const uint8_t *erased_k,
+                              const uint8_t *parity_m, uint32_t num_out, vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks,
+                              vxfec_vk_buf *out_buf, bool upload_d, bool download_out)
+{
+    return vxfec_rs8_submit_raw_ex(ctx, VXFEC_RS8_GEN_CAUCHY, is_decode, K, M, erased_k, parity_m, num_out, d_buf, stride,
+                                   num_blocks, out_buf, upload_d, download_out);
+}
+
 uint64_t vxfec_rs8_encode_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M, const uint8_t *parity_m, uint32_t num_parity,
                                       vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes, vxfec_vk_buf *work_d_buf,
                                       uint32_t stride, vxfec_vk_buf *out_buf, bool download_out)
 {
-    if (!ctx || !ctx->has_timeline_sem || !ctx->timeline_sem || !parity_m || !src_vram || !work_d_buf || !out_buf || K == 0 ||
-        K > 255u || M == 0 || M > 256u - K || num_parity == 0 || num_parity > M || stride == 0 || (stride & 3u) != 0u)
+    if (!ctx || !ctx->has_timeline_sem || !ctx->timeline_sem || !src_vram || !work_d_buf || !out_buf || K == 0 || K > 255u ||
+        M == 0 || M > 256u - K || num_parity == 0 || num_parity > M || stride == 0 || (stride & 3u) != 0u)
         return 0;
 
     size_t d_bytes = (size_t)K * stride;
@@ -395,18 +458,6 @@ uint64_t vxfec_rs8_encode_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M,
     vxfec_vk_buf *tbuf = ctx->async_tab_bufs[slot];
     memcpy(vxfec_vk_buf_staging_ptr(tbuf), tab, tab_bytes);
     free(tab);
-
-    if (!tbuf->zero_copy) {
-        VkBufferCopy t_copy = {.srcOffset = 0, .dstOffset = 0, .size = tab_bytes};
-        vkCmdCopyBuffer(cmd, tbuf->stage_buf, tbuf->dev_buf, 1, &t_copy);
-        VkMemoryBarrier xfer_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0, NULL, 0,
-                             NULL);
-    }
 
     /* bind src_vram directly as SSBO 0 when full generation & aligned, else gather+pad into work_d_buf */
     size_t real_src_off = src_vram->view_offset + src_offset;
@@ -446,7 +497,7 @@ uint64_t vxfec_rs8_encode_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M,
         .pure_gf2 = false,
     };
     bool rec_ok = vxfec_vk__record_direct_cmd(ctx, cmd, ctx->async_ds_mix[slot], &desc, d_bind, stride, 1u, out_buf, false,
-                                              download_out, false);
+                                              download_out, true, false);
     if (ext_out)
         out_buf->owned_by_vk = false;
     if (!rec_ok) {
@@ -501,11 +552,6 @@ uint64_t vxfec_rs8_repair_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M,
     memcpy(vxfec_vk_buf_staging_ptr(tbuf), tab, tab_bytes);
     free(tab);
 
-    if (!tbuf->zero_copy) {
-        VkBufferCopy t_copy = {.srcOffset = 0, .dstOffset = 0, .size = tab_bytes};
-        vkCmdCopyBuffer(cmd, tbuf->stage_buf, tbuf->dev_buf, 1, &t_copy);
-    }
-
     uint32_t staged_rows[256];
     uint32_t miss_esis[256];
     for (uint32_t i = 0; i < num_erased; i++) {
@@ -536,8 +582,8 @@ uint64_t vxfec_rs8_repair_submit_vram(vxfec_vk_ctx *ctx, uint32_t K, uint32_t M,
         .tile_e = tile_e,
         .pure_gf2 = false,
     };
-    bool rec_ok =
-        vxfec_vk__record_direct_cmd(ctx, cmd, ctx->async_ds_mix[slot], &desc, work_d_buf, stride, 1u, out_buf, false, false, false);
+    bool rec_ok = vxfec_vk__record_direct_cmd(ctx, cmd, ctx->async_ds_mix[slot], &desc, work_d_buf, stride, 1u, out_buf, false,
+                                              false, true, false);
     if (rec_ok) {
         rec_ok = vxfec_vk__record_vram_repair_scatter_cmd(ctx, cmd, out_buf, stride, target_vram, target_offset, total_bytes,
                                                           stride, miss_esis, num_erased, ext_tgt);

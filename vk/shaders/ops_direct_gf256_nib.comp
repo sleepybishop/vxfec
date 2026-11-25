@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -35,8 +36,10 @@ layout(push_constant) uniform DirectPush {
 } pc;
 
 uint xtime4(uint v) {
-  uint hi = (v >> 7u) & 0x01010101u;
-  return ((v & 0x7f7f7f7fu) << 1u) ^ (hi * 0x1du);
+  uint m = v & 0x80808080u;
+  uint sh = (v << 1u) & 0xfefefefeu;
+  uint poly = m - (m >> 7u);
+  return sh ^ (poly & 0x1d1d1d1du);
 }
 
 #ifdef USE_VEC4
@@ -51,7 +54,7 @@ uint xtime_elem(uint v) {
 
 #define BUILD_NIB_TAB(t, base_val) \
   t[0] = ZERO_ELEM;                \
-  t[1] = base_val;                 \
+  t[1] = (base_val);               \
   t[2] = xtime_elem(t[1]);         \
   t[3] = t[2] ^ t[1];              \
   t[4] = xtime_elem(t[2]);         \
@@ -64,20 +67,48 @@ uint xtime_elem(uint v) {
   t[11] = t[10] ^ t[1];            \
   t[12] = t[8] ^ t[4];             \
   t[13] = t[12] ^ t[1];            \
-  t[14] = t[12] ^ t[2];            \
+  t[14] = t[12] ^ t[2];             \
   t[15] = t[14] ^ t[1];
 
-#define ACCUM_NIB8(w, b0, b1, b2, b3, b4, b5, b6, b7) \
-  if ((w) != 0u) {                                    \
-    b0 ^= t[(w) & 0xfu];                              \
-    b1 ^= t[((w) >> 4u) & 0xfu];                      \
-    b2 ^= t[((w) >> 8u) & 0xfu];                      \
-    b3 ^= t[((w) >> 12u) & 0xfu];                     \
-    b4 ^= t[((w) >> 16u) & 0xfu];                     \
-    b5 ^= t[((w) >> 20u) & 0xfu];                     \
-    b6 ^= t[((w) >> 24u) & 0xfu];                     \
-    b7 ^= t[(w) >> 28u];                              \
+#define ACCUM_NIB8(word_, b0, b1, b2, b3, b4, b5, b6, b7) \
+  {                                                       \
+    uint w_ = (word_);                                    \
+    if ((w_ & 0xffffu) != 0u) {                           \
+      b0 ^= t[w_ & 0xfu];                                 \
+      b1 ^= t[(w_ >> 4u) & 0xfu];                         \
+      b2 ^= t[(w_ >> 8u) & 0xfu];                         \
+      b3 ^= t[(w_ >> 12u) & 0xfu];                        \
+    }                                                     \
+    if ((w_ >> 16u) != 0u) {                              \
+      b4 ^= t[(w_ >> 16u) & 0xfu];                        \
+      b5 ^= t[(w_ >> 20u) & 0xfu];                        \
+      b6 ^= t[(w_ >> 24u) & 0xfu];                        \
+      b7 ^= t[w_ >> 28u];                                 \
+    }                                                     \
   }
+
+#define ACCUM_GF2_8(src, word_, b0, b1, b2, b3, b4, b5, b6, b7) \
+  {                                                             \
+    uint w_ = (word_);                                          \
+    if ((w_ & 0xffffu) != 0u) {                                 \
+      if ((w_ & 0x00000001u) != 0u) b0 ^= (src);                \
+      if ((w_ & 0x00000010u) != 0u) b1 ^= (src);                \
+      if ((w_ & 0x00000100u) != 0u) b2 ^= (src);                \
+      if ((w_ & 0x00001000u) != 0u) b3 ^= (src);                \
+    }                                                           \
+    if ((w_ >> 16u) != 0u) {                                    \
+      if ((w_ & 0x00010000u) != 0u) b4 ^= (src);                \
+      if ((w_ & 0x00100000u) != 0u) b5 ^= (src);                \
+      if ((w_ & 0x01000000u) != 0u) b6 ^= (src);                \
+      if ((w_ & 0x10000000u) != 0u) b7 ^= (src);                \
+    }                                                           \
+  }
+
+ELEM_T shift4_elem(ELEM_T v1) {
+  ELEM_T v2 = xtime_elem(v1);
+  ELEM_T v4 = xtime_elem(v2);
+  return xtime_elem(xtime_elem(v4));
+}
 
 void main() {
   uint unit_idx = gl_GlobalInvocationID.x;
@@ -94,38 +125,101 @@ void main() {
 
   ELEM_T a0 = ZERO_ELEM, a1 = ZERO_ELEM, a2 = ZERO_ELEM, a3 = ZERO_ELEM;
   ELEM_T a4 = ZERO_ELEM, a5 = ZERO_ELEM, a6 = ZERO_ELEM, a7 = ZERO_ELEM;
-#if TILE_E == 16
+#if TILE_E >= 16
   ELEM_T a8 = ZERO_ELEM, a9 = ZERO_ELEM, a10 = ZERO_ELEM, a11 = ZERO_ELEM;
   ELEM_T a12 = ZERO_ELEM, a13 = ZERO_ELEM, a14 = ZERO_ELEM, a15 = ZERO_ELEM;
+#endif
+#if TILE_E == 32
+  ELEM_T a16 = ZERO_ELEM, a17 = ZERO_ELEM, a18 = ZERO_ELEM, a19 = ZERO_ELEM;
+  ELEM_T a20 = ZERO_ELEM, a21 = ZERO_ELEM, a22 = ZERO_ELEM, a23 = ZERO_ELEM;
+  ELEM_T a24 = ZERO_ELEM, a25 = ZERO_ELEM, a26 = ZERO_ELEM, a27 = ZERO_ELEM;
+  ELEM_T a28 = ZERO_ELEM, a29 = ZERO_ELEM, a30 = ZERO_ELEM, a31 = ZERO_ELEM;
 
+  for (uint k = span.x; k < span.y; k += 3u) {
+    uvec4 cmd0 = tab[k];
+    uvec4 cmd1 = tab[k + 1u];
+    uvec4 cmd2 = tab[k + 2u];
+    ELEM_T src = d[block_base + cmd0.x * pc.stride_units];
+    uint lo_or = cmd0.y | cmd0.z | cmd0.w | cmd1.x;
+    uint hi_or = cmd1.y | cmd1.z | cmd1.w | cmd2.x;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd0.y, a0, a1, a2, a3, a4, a5, a6, a7)
+      ACCUM_GF2_8(src, cmd0.z, a8, a9, a10, a11, a12, a13, a14, a15)
+      ACCUM_GF2_8(src, cmd0.w, a16, a17, a18, a19, a20, a21, a22, a23)
+      ACCUM_GF2_8(src, cmd1.x, a24, a25, a26, a27, a28, a29, a30, a31)
+    } else {
+      ELEM_T cur_base = src;
+      [[dont_unroll]] for (uint hp = 0u; hp < 2u; hp++) {
+        uint w0 = (hp == 0u) ? cmd0.y : cmd1.y;
+        uint w1 = (hp == 0u) ? cmd0.z : cmd1.z;
+        uint w2 = (hp == 0u) ? cmd0.w : cmd1.w;
+        uint w3 = (hp == 0u) ? cmd1.x : cmd2.x;
+        if ((w0 | w1 | w2 | w3) != 0u) {
+          ELEM_T t[16];
+          BUILD_NIB_TAB(t, cur_base)
+          ACCUM_NIB8(w0, a0, a1, a2, a3, a4, a5, a6, a7)
+          ACCUM_NIB8(w1, a8, a9, a10, a11, a12, a13, a14, a15)
+          ACCUM_NIB8(w2, a16, a17, a18, a19, a20, a21, a22, a23)
+          ACCUM_NIB8(w3, a24, a25, a26, a27, a28, a29, a30, a31)
+          if (hp == 0u && hi_or != 0u) {
+            cur_base = xtime_elem(t[8]);
+          }
+        } else if (hp == 0u) {
+          cur_base = shift4_elem(cur_base);
+        }
+      }
+    }
+  }
+#elif TILE_E == 16
   for (uint k = span.x; k < span.y; k += 2u) {
     uvec4 cmd0 = tab[k];
     uvec4 cmd1 = tab[k + 1u];
     ELEM_T src = d[block_base + cmd0.x * pc.stride_units];
-    ELEM_T t[16];
-    BUILD_NIB_TAB(t, src)
-    ACCUM_NIB8(cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
-    ACCUM_NIB8(cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
-
-    if ((cmd1.x | cmd1.y) != 0u) {
-      ELEM_T hi_base = xtime_elem(t[8]);
-      BUILD_NIB_TAB(t, hi_base)
-      ACCUM_NIB8(cmd1.x, a0, a1, a2, a3, a4, a5, a6, a7)
-      ACCUM_NIB8(cmd1.y, a8, a9, a10, a11, a12, a13, a14, a15)
+    uint lo_or = cmd0.z | cmd0.w;
+    uint hi_or = cmd1.x | cmd1.y;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
+      ACCUM_GF2_8(src, cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
+    } else {
+      ELEM_T t[16];
+      ELEM_T hi_base;
+      if (lo_or != 0u) {
+        BUILD_NIB_TAB(t, src)
+        ACCUM_NIB8(cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
+        ACCUM_NIB8(cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
+        hi_base = xtime_elem(t[8]);
+      } else {
+        hi_base = shift4_elem(src);
+      }
+      if (hi_or != 0u) {
+        BUILD_NIB_TAB(t, hi_base)
+        ACCUM_NIB8(cmd1.x, a0, a1, a2, a3, a4, a5, a6, a7)
+        ACCUM_NIB8(cmd1.y, a8, a9, a10, a11, a12, a13, a14, a15)
+      }
     }
   }
 #else
   for (uint k = span.x; k < span.y; k++) {
     uvec4 cmd = tab[k];
     ELEM_T src = d[block_base + cmd.x * pc.stride_units];
-    ELEM_T t[16];
-    BUILD_NIB_TAB(t, src)
-    ACCUM_NIB8(cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
-
-    if (cmd.z != 0u) {
-      ELEM_T hi_base = xtime_elem(t[8]);
-      BUILD_NIB_TAB(t, hi_base)
-      ACCUM_NIB8(cmd.z, a0, a1, a2, a3, a4, a5, a6, a7)
+    uint lo_or = cmd.y;
+    uint hi_or = cmd.z;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
+    } else {
+      ELEM_T t[16];
+      ELEM_T hi_base;
+      if (lo_or != 0u) {
+        BUILD_NIB_TAB(t, src)
+        ACCUM_NIB8(cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
+        hi_base = xtime_elem(t[8]);
+      } else {
+        hi_base = shift4_elem(src);
+      }
+      if (hi_or != 0u) {
+        BUILD_NIB_TAB(t, hi_base)
+        ACCUM_NIB8(cmd.z, a0, a1, a2, a3, a4, a5, a6, a7)
+      }
     }
   }
 #endif
@@ -140,7 +234,7 @@ void main() {
   if (rem > 5u) out_syms[out_idx + 5u * pc.stride_units] = a5;
   if (rem > 6u) out_syms[out_idx + 6u * pc.stride_units] = a6;
   if (rem > 7u) out_syms[out_idx + 7u * pc.stride_units] = a7;
-#if TILE_E == 16
+#if TILE_E >= 16
   if (rem > 8u) out_syms[out_idx + 8u * pc.stride_units] = a8;
   if (rem > 9u) out_syms[out_idx + 9u * pc.stride_units] = a9;
   if (rem > 10u) out_syms[out_idx + 10u * pc.stride_units] = a10;
@@ -149,5 +243,23 @@ void main() {
   if (rem > 13u) out_syms[out_idx + 13u * pc.stride_units] = a13;
   if (rem > 14u) out_syms[out_idx + 14u * pc.stride_units] = a14;
   if (rem > 15u) out_syms[out_idx + 15u * pc.stride_units] = a15;
+#endif
+#if TILE_E == 32
+  if (rem > 16u) out_syms[out_idx + 16u * pc.stride_units] = a16;
+  if (rem > 17u) out_syms[out_idx + 17u * pc.stride_units] = a17;
+  if (rem > 18u) out_syms[out_idx + 18u * pc.stride_units] = a18;
+  if (rem > 19u) out_syms[out_idx + 19u * pc.stride_units] = a19;
+  if (rem > 20u) out_syms[out_idx + 20u * pc.stride_units] = a20;
+  if (rem > 21u) out_syms[out_idx + 21u * pc.stride_units] = a21;
+  if (rem > 22u) out_syms[out_idx + 22u * pc.stride_units] = a22;
+  if (rem > 23u) out_syms[out_idx + 23u * pc.stride_units] = a23;
+  if (rem > 24u) out_syms[out_idx + 24u * pc.stride_units] = a24;
+  if (rem > 25u) out_syms[out_idx + 25u * pc.stride_units] = a25;
+  if (rem > 26u) out_syms[out_idx + 26u * pc.stride_units] = a26;
+  if (rem > 27u) out_syms[out_idx + 27u * pc.stride_units] = a27;
+  if (rem > 28u) out_syms[out_idx + 28u * pc.stride_units] = a28;
+  if (rem > 29u) out_syms[out_idx + 29u * pc.stride_units] = a29;
+  if (rem > 30u) out_syms[out_idx + 30u * pc.stride_units] = a30;
+  if (rem > 31u) out_syms[out_idx + 31u * pc.stride_units] = a31;
 #endif
 }

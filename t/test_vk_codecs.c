@@ -1732,6 +1732,165 @@ cleanup:
     return ok;
 }
 
+static bool test_buf_fill_offset(vxfec_vk_ctx *ctx)
+{
+    const size_t sz = 262144u + 24u;
+    vxfec_vk_buf *vb = vxfec_vk_buf_new(ctx, sz, false);
+    uint8_t *host = (uint8_t *)malloc(sz);
+    if (!vb || !host) {
+        vxfec_vk_buf_free(ctx, vb);
+        free(host);
+        return false;
+    }
+    bool ok = vxfec_vk_buf_fill_offset(ctx, vb, 0u, sz, 0xa55a3cc3u) && vxfec_vk_buf_fill_offset(ctx, vb, 17u, 105u, 0x11223344u) &&
+              vxfec_vk_buf_read_offset(ctx, vb, 0u, host, sz);
+    if (ok) {
+        uint8_t p0[4], p1[4];
+        uint32_t v0 = 0xa55a3cc3u, v1 = 0x11223344u;
+        memcpy(p0, &v0, 4u);
+        memcpy(p1, &v1, 4u);
+        for (size_t i = 0; i < sz; i++) {
+            uint8_t exp = (i >= 17u && i < 122u) ? p1[i & 3u] : p0[i & 3u];
+            if (host[i] != exp) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        const vxfec_vk_span spans[2] = {{.offset = 64u, .bytes = 128u}, {.offset = 4096u, .bytes = 256u}};
+        uint64_t tk = vxfec_vk_buf_fill_spans_submit(ctx, vb, spans, 2u, 0x55667788u);
+        ok = tk != 0u && vxfec_vk_wait(ctx, tk, UINT64_MAX) && vxfec_vk_buf_fill_spans(ctx, vb, spans, 1u, 0x99aabbccu) &&
+             vxfec_vk_buf_read_offset(ctx, vb, 0u, host, sz);
+        if (ok) {
+            uint8_t p2[4], p3[4];
+            uint32_t v2 = 0x55667788u, v3 = 0x99aabbccu;
+            memcpy(p2, &v2, 4u);
+            memcpy(p3, &v3, 4u);
+            for (size_t i = 64u; i < 192u && ok; i++)
+                if (host[i] != p3[i & 3u])
+                    ok = false;
+            for (size_t i = 4096u; i < 4352u && ok; i++)
+                if (host[i] != p2[i & 3u])
+                    ok = false;
+        }
+    }
+    free(host);
+    vxfec_vk_buf_free(ctx, vb);
+    return ok;
+}
+
+static bool test_cauchy_rs8_exp_gen(vxfec_vk_ctx *ctx)
+{
+    /* verify exact nanors A_{m,k} = 1 / (a^(254-k) + a^m) entries via unit systematic vectors */
+    const uint32_t K0 = 8u, M0 = 4u, stride0 = 4u;
+    uint8_t sys0[8 * 4] = {0};
+    uint8_t par0[4 * 4] = {0};
+    uint8_t pm0[4] = {0, 1, 2, 3};
+    nanorq_core_init();
+    for (uint32_t j = 0; j < K0; j++) {
+        memset(sys0, 0, sizeof(sys0));
+        sys0[j * stride0] = 1u;
+        if (!vxfec_rs8_encode_cpu_ex(VXFEC_RS8_GEN_CAUCHY_EXP, K0, M0, sys0, stride0, pm0, M0, par0))
+            return false;
+        for (uint32_t i = 0; i < M0; i++) {
+            uint8_t denom = (uint8_t)(GF2_8_EXP[254u - j] ^ GF2_8_EXP[i]);
+            uint8_t exp = GF2_8_EXP[255u - (uint32_t)GF2_8_LOG[denom]];
+            if (par0[i * stride0] != exp)
+                return false;
+        }
+        /* cross-library regression against nanors (RS8_USE_GAMESTREAM=0, K=8, M=4):
+         * unit vector j=1 yields first parity byte 166 and recovers original byte 1 */
+        if (j == 1u) {
+            if (par0[0] != 166u)
+                return false;
+            uint8_t comp0[8 * 4];
+            memcpy(comp0, sys0, sizeof(comp0));
+            memcpy(comp0 + stride0, par0, stride0);
+            uint8_t ek1[1] = {1u}, pm1[1] = {0u};
+            if (!vxfec_rs8_decode_compact_cpu_ex(VXFEC_RS8_GEN_CAUCHY_EXP, K0, M0, comp0, stride0, ek1, pm1, 1u) ||
+                comp0[stride0] != 1u)
+                return false;
+        }
+    }
+
+    /* K + M == 256 must be rejected for VXFEC_RS8_GEN_CAUCHY_EXP */
+    if (vxfec_rs8_encode_plan_new_ex(NULL, VXFEC_RS8_GEN_CAUCHY_EXP, 200u, 56u, pm0, 4u) != NULL)
+        return false;
+
+    static const struct {
+        uint32_t K, M, T, erasures;
+    } cases[] = {
+        {1, 1, 4, 1},
+        {10, 6, 20, 5},
+        {64, 16, 1280, 12},
+        {200, 55, 1280, 24},
+    };
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        uint32_t K = cases[ci].K, M = cases[ci].M, T = cases[ci].T, e = cases[ci].erasures;
+        uint8_t pm[64], ek[64], rpm[64];
+        for (uint32_t i = 0; i < M; i++)
+            pm[i] = (uint8_t)i;
+        for (uint32_t i = 0; i < e; i++) {
+            ek[i] = (uint8_t)((i * 3u) % K);
+            rpm[i] = (uint8_t)(M - 1u - i);
+        }
+        /* deduplicate ek if K < 3*e */
+        for (uint32_t i = 0; i < e; i++)
+            ek[i] = (uint8_t)i;
+
+        size_t sys_b = (size_t)K * T, par_b = (size_t)M * T, rec_b = (size_t)e * T;
+        uint8_t *sys = (uint8_t *)malloc(sys_b);
+        uint8_t *par_cpu = (uint8_t *)malloc(par_b);
+        uint8_t *compact = (uint8_t *)malloc(sys_b);
+        vxfec_vk_buf *d_buf = vxfec_vk_buf_new(ctx, sys_b, true);
+        vxfec_vk_buf *p_buf = vxfec_vk_buf_new(ctx, par_b, true);
+        vxfec_vk_buf *r_buf = vxfec_vk_buf_new(ctx, rec_b, true);
+        vxfec_rs8_plan *enc = vxfec_rs8_encode_plan_new_ex(ctx, VXFEC_RS8_GEN_CAUCHY_EXP, K, M, pm, M);
+        vxfec_rs8_plan *dec = vxfec_rs8_decode_plan_new_ex(ctx, VXFEC_RS8_GEN_CAUCHY_EXP, K, M, ek, rpm, e);
+        bool ok = sys && par_cpu && compact && d_buf && p_buf && r_buf && enc && dec;
+        if (ok) {
+            for (size_t i = 0; i < sys_b; i++)
+                sys[i] = (uint8_t)((i * 73u + (i >> 8) * 19u + 11u) & 0xffu);
+            memcpy(vxfec_vk_buf_staging_ptr(d_buf), sys, sys_b);
+            ok = vxfec_rs8_encode_cpu_ex(VXFEC_RS8_GEN_CAUCHY_EXP, K, M, sys, T, pm, M, par_cpu) &&
+                 vxfec_rs8_exec_pipelined(ctx, enc, d_buf, T, 1u, p_buf, true, true, NULL) &&
+                 memcmp(par_cpu, vxfec_vk_buf_staging_ptr(p_buf), par_b) == 0;
+        }
+        if (ok) {
+            memcpy(compact, sys, sys_b);
+            for (uint32_t i = 0; i < e; i++)
+                memcpy(compact + (size_t)ek[i] * T, par_cpu + (size_t)rpm[i] * T, T);
+            memcpy(vxfec_vk_buf_staging_ptr(d_buf), compact, sys_b);
+            ok = vxfec_rs8_exec_pipelined(ctx, dec, d_buf, T, 1u, r_buf, true, true, NULL);
+            const uint8_t *gpu_rec = (const uint8_t *)vxfec_vk_buf_staging_ptr(r_buf);
+            for (uint32_t i = 0; i < e && ok; i++)
+                if (memcmp(gpu_rec + (size_t)i * T, sys + (size_t)ek[i] * T, T) != 0)
+                    ok = false;
+            ok = ok && vxfec_rs8_decode_compact_cpu_ex(VXFEC_RS8_GEN_CAUCHY_EXP, K, M, compact, T, ek, rpm, e) &&
+                 memcmp(compact, sys, sys_b) == 0;
+            /* also exercise async submit_raw_ex */
+            if (ok && vxfec_vk_has_timeline(ctx)) {
+                memcpy(vxfec_vk_buf_staging_ptr(d_buf), sys, sys_b);
+                uint64_t tk = vxfec_rs8_submit_raw_ex(ctx, VXFEC_RS8_GEN_CAUCHY_EXP, false, K, M, NULL, pm, M, d_buf, T, 1u, p_buf,
+                                                      true, true);
+                ok = tk != 0u && vxfec_vk_wait(ctx, tk, UINT64_MAX) && memcmp(par_cpu, vxfec_vk_buf_staging_ptr(p_buf), par_b) == 0;
+            }
+        }
+        vxfec_rs8_plan_free(ctx, dec);
+        vxfec_rs8_plan_free(ctx, enc);
+        vxfec_vk_buf_free(ctx, r_buf);
+        vxfec_vk_buf_free(ctx, p_buf);
+        vxfec_vk_buf_free(ctx, d_buf);
+        free(compact);
+        free(par_cpu);
+        free(sys);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 int main(void)
 {
     if (!test_concurrent_first_use_init()) {
@@ -1889,6 +2048,20 @@ int main(void)
                "e=%u)\n",
                rs8_cases[i].K, rs8_cases[i].M, rs8_cases[i].T, rs8_cases[i].erasures);
     }
+
+    if (!test_cauchy_rs8_exp_gen(ctx)) {
+        fprintf(stderr, "FAIL: Cauchy RS8 exp-generator (1/(a^(254-i)+a^j)) test\n");
+        vxfec_vk_ctx_free(ctx);
+        return 1;
+    }
+    printf("PASS: Cauchy RS8 exp-generator (1/(a^(254-i)+a^j)) CPU + GPU encode/decode\n");
+
+    if (!test_buf_fill_offset(ctx)) {
+        fprintf(stderr, "FAIL: vxfec_vk_buf_fill_offset test\n");
+        vxfec_vk_ctx_free(ctx);
+        return 1;
+    }
+    printf("PASS: GPU-resident vkCmdFillBuffer aligned + unaligned sub-range fill\n");
 
     vxfec_vk_ctx_free(ctx);
     printf("All vxfec Vulkan codec tests passed!\n");

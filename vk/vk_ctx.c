@@ -2,6 +2,7 @@
 #include "vk_spv.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #if !defined(_WIN32)
@@ -78,61 +79,76 @@ static bool build_all_pipelines(vxfec_vk_ctx *ctx)
         VkPipelineLayout layout;
         const uint32_t *spv;
         size_t bytes;
-        VkPipeline *dst;
-    } specs[] = {
-        {ctx->pl_run, spv_ops_run_vec4_gf256, spv_ops_run_vec4_gf256_bytes, &ctx->pipe_vec4_gf256},
-        {ctx->pl_run, spv_ops_run_vec4_gf2, spv_ops_run_vec4_gf2_bytes, &ctx->pipe_vec4_gf2},
-        {ctx->pl_run, spv_ops_run_vram_gf256, spv_ops_run_vram_gf256_bytes, &ctx->pipe_vram_gf256},
-        {ctx->pl_run, spv_ops_run_vram_gf2, spv_ops_run_vram_gf2_bytes, &ctx->pipe_vram_gf2},
-        {ctx->pl_mix, spv_ops_mix_vec4, spv_ops_mix_vec4_bytes, &ctx->pipe_mix_vec4},
-        {ctx->pl_mix, spv_ops_mix, spv_ops_mix_bytes, &ctx->pipe_mix},
-        {ctx->pl_mix, spv_ops_direct_gf2_vec4_16, spv_ops_direct_gf2_vec4_16_bytes, &ctx->pipe_direct_gf2_vec4_16},
-        {ctx->pl_mix, spv_ops_direct_gf2_vec4_32, spv_ops_direct_gf2_vec4_32_bytes, &ctx->pipe_direct_gf2_vec4_32},
-        {ctx->pl_mix, spv_ops_direct_gf2_16, spv_ops_direct_gf2_16_bytes, &ctx->pipe_direct_gf2_16},
-        {ctx->pl_mix, spv_ops_direct_gf2_32, spv_ops_direct_gf2_32_bytes, &ctx->pipe_direct_gf2_32},
-        {ctx->pl_mix, spv_ops_direct_gf256_nib_vec4_8, spv_ops_direct_gf256_nib_vec4_8_bytes, &ctx->pipe_direct_gf256_nib_vec4_8},
+        uint32_t idx;
+        uint32_t req_shared;
+    } specs[VXFEC_VK_PIPE_COUNT] = {
+        {ctx->pl_run, spv_ops_run_vec4_gf256, spv_ops_run_vec4_gf256_bytes, VXFEC_VK_PIPE_VEC4_GF256, 0u},
+        {ctx->pl_run, spv_ops_run_vec4_gf2, spv_ops_run_vec4_gf2_bytes, VXFEC_VK_PIPE_VEC4_GF2, 0u},
+        {ctx->pl_run, spv_ops_run_vram_gf256, spv_ops_run_vram_gf256_bytes, VXFEC_VK_PIPE_VRAM_GF256, 0u},
+        {ctx->pl_run, spv_ops_run_vram_gf2, spv_ops_run_vram_gf2_bytes, VXFEC_VK_PIPE_VRAM_GF2, 0u},
+        {ctx->pl_mix, spv_ops_mix_vec4, spv_ops_mix_vec4_bytes, VXFEC_VK_PIPE_MIX_VEC4, 0u},
+        {ctx->pl_mix, spv_ops_mix, spv_ops_mix_bytes, VXFEC_VK_PIPE_MIX, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf2_vec4_16, spv_ops_direct_gf2_vec4_16_bytes, VXFEC_VK_PIPE_DIRECT_GF2_VEC4_16, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf2_vec4_32, spv_ops_direct_gf2_vec4_32_bytes, VXFEC_VK_PIPE_DIRECT_GF2_VEC4_32, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf2_16, spv_ops_direct_gf2_16_bytes, VXFEC_VK_PIPE_DIRECT_GF2_16, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf2_32, spv_ops_direct_gf2_32_bytes, VXFEC_VK_PIPE_DIRECT_GF2_32, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf256_nib_vec4_8, spv_ops_direct_gf256_nib_vec4_8_bytes, VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_8,
+         0u},
         {ctx->pl_mix, spv_ops_direct_gf256_nib_vec4_16, spv_ops_direct_gf256_nib_vec4_16_bytes,
-         &ctx->pipe_direct_gf256_nib_vec4_16},
-        {ctx->pl_mix, spv_ops_direct_gf256_nib_8, spv_ops_direct_gf256_nib_8_bytes, &ctx->pipe_direct_gf256_nib_8},
-        {ctx->pl_mix, spv_ops_direct_gf256_nib_16, spv_ops_direct_gf256_nib_16_bytes, &ctx->pipe_direct_gf256_nib_16},
-        {ctx->pl_mix, spv_ops_wire_gf2_vec4_16, spv_ops_wire_gf2_vec4_16_bytes, &ctx->pipe_wire_gf2_vec4_16},
-        {ctx->pl_mix, spv_ops_wire_gf2_vec4_32, spv_ops_wire_gf2_vec4_32_bytes, &ctx->pipe_wire_gf2_vec4_32},
-        {ctx->pl_mix, spv_ops_wire_gf256_nib_vec4_8, spv_ops_wire_gf256_nib_vec4_8_bytes, &ctx->pipe_wire_gf256_nib_vec4_8},
-        {ctx->pl_mix, spv_ops_wire_gf256_nib_vec4_16, spv_ops_wire_gf256_nib_vec4_16_bytes, &ctx->pipe_wire_gf256_nib_vec4_16},
+         VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_16, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf256_nib_vec4_32, spv_ops_direct_gf256_nib_vec4_32_bytes,
+         VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_32, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf256_nib_8, spv_ops_direct_gf256_nib_8_bytes, VXFEC_VK_PIPE_DIRECT_GF256_NIB_8, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf256_nib_16, spv_ops_direct_gf256_nib_16_bytes, VXFEC_VK_PIPE_DIRECT_GF256_NIB_16, 0u},
+        {ctx->pl_mix, spv_ops_direct_gf256_nib_32, spv_ops_direct_gf256_nib_32_bytes, VXFEC_VK_PIPE_DIRECT_GF256_NIB_32, 0u},
+        {ctx->pl_mix, spv_ops_wire_gf2_vec4_16, spv_ops_wire_gf2_vec4_16_bytes, VXFEC_VK_PIPE_WIRE_GF2_VEC4_16, 0u},
+        {ctx->pl_mix, spv_ops_wire_gf2_vec4_32, spv_ops_wire_gf2_vec4_32_bytes, VXFEC_VK_PIPE_WIRE_GF2_VEC4_32, 0u},
+        {ctx->pl_mix, spv_ops_wire_gf256_nib_vec4_8, spv_ops_wire_gf256_nib_vec4_8_bytes, VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_8, 0u},
+        {ctx->pl_mix, spv_ops_wire_gf256_nib_vec4_16, spv_ops_wire_gf256_nib_vec4_16_bytes, VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_16,
+         0u},
+        {ctx->pl_mix, spv_ops_wire_gf256_nib_vec4_32, spv_ops_wire_gf256_nib_vec4_32_bytes, VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_32,
+         0u},
     };
-    enum { N_PIPES = sizeof(specs) / sizeof(specs[0]) };
 
-    VkShaderModule mods[N_PIPES] = {0};
-    VkComputePipelineCreateInfo cpcis[N_PIPES] = {0};
-    VkPipeline pipes[N_PIPES] = {0};
+    VkShaderModule mods[VXFEC_VK_PIPE_COUNT] = {0};
+    VkComputePipelineCreateInfo cpcis[VXFEC_VK_PIPE_COUNT] = {0};
+    VkPipeline pipes[VXFEC_VK_PIPE_COUNT] = {0};
+    uint32_t pipe_map[VXFEC_VK_PIPE_COUNT] = {0};
+    uint32_t n_create = 0;
     bool ok = true;
 
-    for (size_t i = 0; i < N_PIPES; i++) {
+    for (size_t i = 0; i < VXFEC_VK_PIPE_COUNT; i++) {
+        if (specs[i].req_shared > ctx->max_shared_bytes) {
+            ctx->pipes[specs[i].idx] = VK_NULL_HANDLE;
+            continue;
+        }
         VkShaderModuleCreateInfo smci = {
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .codeSize = specs[i].bytes,
             .pCode = specs[i].spv,
         };
-        if (vkCreateShaderModule(ctx->dev, &smci, NULL, &mods[i]) != VK_SUCCESS) {
+        if (vkCreateShaderModule(ctx->dev, &smci, NULL, &mods[n_create]) != VK_SUCCESS) {
             ok = false;
             break;
         }
-        cpcis[i].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpcis[i].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpcis[i].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpcis[i].stage.module = mods[i];
-        cpcis[i].stage.pName = "main";
-        cpcis[i].layout = specs[i].layout;
+        cpcis[n_create].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpcis[n_create].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpcis[n_create].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpcis[n_create].stage.module = mods[n_create];
+        cpcis[n_create].stage.pName = "main";
+        cpcis[n_create].layout = specs[i].layout;
+        pipe_map[n_create] = specs[i].idx;
+        n_create++;
     }
 
-    if (ok && vkCreateComputePipelines(ctx->dev, VK_NULL_HANDLE, N_PIPES, cpcis, NULL, pipes) != VK_SUCCESS)
+    if (ok && n_create > 0 && vkCreateComputePipelines(ctx->dev, VK_NULL_HANDLE, n_create, cpcis, NULL, pipes) != VK_SUCCESS)
         ok = false;
 
-    for (size_t i = 0; i < N_PIPES; i++) {
+    for (uint32_t i = 0; i < n_create; i++) {
         if (mods[i])
             vkDestroyShaderModule(ctx->dev, mods[i], NULL);
         if (ok) {
-            *specs[i].dst = pipes[i];
+            ctx->pipes[pipe_map[i]] = pipes[i];
         } else if (pipes[i]) {
             vkDestroyPipeline(ctx->dev, pipes[i], NULL);
         }
@@ -163,14 +179,36 @@ static bool vk_idle_confirmed(VkDevice dev)
     return res == VK_SUCCESS || res == VK_ERROR_DEVICE_LOST;
 }
 
+static void reap_retired_bufs_upto(vxfec_vk_ctx *ctx, uint64_t done_val, bool reap_all)
+{
+    vxfec_vk_buf **pp = &ctx->retired_bufs;
+    while (*pp) {
+        vxfec_vk_buf *b = *pp;
+        if (reap_all || b->retire_ticket <= done_val) {
+            *pp = b->next_retired;
+            b->next_retired = NULL;
+            vxfec_vk_buf_free(ctx, b);
+        } else {
+            pp = &b->next_retired;
+        }
+    }
+}
+
 static void reap_retired_bufs(vxfec_vk_ctx *ctx)
 {
-    while (ctx->retired_bufs) {
-        vxfec_vk_buf *b = ctx->retired_bufs;
-        ctx->retired_bufs = b->next_retired;
-        b->next_retired = NULL;
-        vxfec_vk_buf_free(ctx, b);
+    reap_retired_bufs_upto(ctx, UINT64_MAX, true);
+}
+
+static void reset_idle_state(vxfec_vk_ctx *ctx)
+{
+    ctx->last_submit_unconfirmed = false;
+    for (uint32_t i = 0; i < VXFEC_VK_ASYNC_SLOTS; i++)
+        ctx->async_slot_tickets[i] = 0;
+    if (ctx->pending_release_buf) {
+        ctx->pending_release_buf->owned_by_vk = false;
+        ctx->pending_release_buf = NULL;
     }
+    reap_retired_bufs(ctx);
 }
 
 static bool has_pending_async_slots(vxfec_vk_ctx *ctx)
@@ -202,14 +240,7 @@ static bool ensure_sync_cmd_idle(vxfec_vk_ctx *ctx)
     }
     if (!vk_idle_confirmed(ctx->dev))
         return false;
-    ctx->last_submit_unconfirmed = false;
-    for (uint32_t i = 0; i < VXFEC_VK_ASYNC_SLOTS; i++)
-        ctx->async_slot_tickets[i] = 0;
-    if (ctx->pending_release_buf) {
-        ctx->pending_release_buf->owned_by_vk = false;
-        ctx->pending_release_buf = NULL;
-    }
-    reap_retired_bufs(ctx);
+    reset_idle_state(ctx);
     return true;
 }
 
@@ -317,7 +348,8 @@ static bool has_dev_ext(const VkExtensionProperties *exts, uint32_t count, const
 
 static vxfec_vk_ctx *ctx_new_attempt(int *status, VkInstance shared_inst, const VkPhysicalDevice *devs, uint32_t dev_count,
                                      bool forced_dev, uint32_t forced_dev_idx, bool forced_qfam, uint32_t forced_qfam_idx,
-                                     int previous_score, int previous_index, int *selected_score, int *selected_index)
+                                     int dmabuf_fd, int previous_score, int previous_index, int *selected_score,
+                                     int *selected_index)
 {
     if (status)
         *status = VXFEC_VK_ERROR;
@@ -394,6 +426,16 @@ static vxfec_vk_ctx *ctx_new_attempt(int *status, VkInstance shared_inst, const 
         goto fail;
     }
 
+    VkPhysicalDeviceIDProperties id_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 p2_id = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &id_props,
+    };
+    vkGetPhysicalDeviceProperties2(ctx->phys, &p2_id);
+    memcpy(ctx->device_uuid, id_props.deviceUUID, VK_UUID_SIZE);
+
     VkPhysicalDeviceVulkan12Features f12_sup = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
     };
@@ -407,21 +449,24 @@ static vxfec_vk_ctx *ctx_new_attempt(int *status, VkInstance shared_inst, const 
     uint32_t ext_cnt = 0;
     const char *enabled_exts[5];
     uint32_t n_enabled_exts = 0;
+    bool sup_pci_bus = false;
     if (vkEnumerateDeviceExtensionProperties(ctx->phys, NULL, &ext_cnt, NULL) == VK_SUCCESS && ext_cnt > 0) {
         VkExtensionProperties *exts = (VkExtensionProperties *)calloc(ext_cnt, sizeof(*exts));
         if (exts && vkEnumerateDeviceExtensionProperties(ctx->phys, NULL, &ext_cnt, exts) == VK_SUCCESS) {
+            sup_pci_bus = has_dev_ext(exts, ext_cnt, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
             bool sup_ext_mem = has_dev_ext(exts, ext_cnt, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
-            if (has_dev_ext(exts, ext_cnt, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
-                has_dev_ext(exts, ext_cnt, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+            if (has_dev_ext(exts, ext_cnt, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
                 if (sup_ext_mem)
                     enabled_exts[n_enabled_exts++] = VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME;
                 enabled_exts[n_enabled_exts++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
-                enabled_exts[n_enabled_exts++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
                 ctx->has_ext_mem_fd = true;
-                ctx->has_dmabuf = true;
-                if (has_dev_ext(exts, ext_cnt, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
-                    enabled_exts[n_enabled_exts++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
-                    ctx->has_foreign_qfam = true;
+                if (has_dev_ext(exts, ext_cnt, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+                    enabled_exts[n_enabled_exts++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+                    ctx->has_dmabuf = true;
+                    if (has_dev_ext(exts, ext_cnt, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME)) {
+                        enabled_exts[n_enabled_exts++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
+                        ctx->has_foreign_qfam = true;
+                    }
                 }
             }
             if (has_dev_ext(exts, ext_cnt, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
@@ -432,6 +477,37 @@ static vxfec_vk_ctx *ctx_new_attempt(int *status, VkInstance shared_inst, const 
             }
         }
         free(exts);
+    }
+
+    if (sup_pci_bus) {
+        VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
+        };
+        VkPhysicalDeviceProperties2 p2_pci = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &pci_props,
+        };
+        vkGetPhysicalDeviceProperties2(ctx->phys, &p2_pci);
+        snprintf(ctx->pci_bdf, sizeof(ctx->pci_bdf), "%04x:%02x:%02x.%u", (unsigned)(pci_props.pciDomain & 0xffffu),
+                 (unsigned)(pci_props.pciBus & 0xffu), (unsigned)(pci_props.pciDevice & 0xffu),
+                 (unsigned)(pci_props.pciFunction & 0x7u));
+    }
+
+    if (ctx->has_ext_mem_fd) {
+        VkPhysicalDeviceExternalBufferInfo ebi_op = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+            .flags = 0,
+            .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        };
+        VkExternalBufferProperties ebp_op = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES,
+        };
+        vkGetPhysicalDeviceExternalBufferProperties(ctx->phys, &ebi_op, &ebp_op);
+        ctx->has_opaque_fd =
+            (ebp_op.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+        ctx->opaque_fd_dedicated_only =
+            (ebp_op.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) != 0;
     }
 
     if (ctx->has_dmabuf) {
@@ -495,6 +571,10 @@ static vxfec_vk_ctx *ctx_new_attempt(int *status, VkInstance shared_inst, const 
         ctx->pfn_get_host_ptr_props =
             (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(ctx->dev, "vkGetMemoryHostPointerPropertiesEXT");
     }
+
+    /* probe dmabuf compatibility before compiling compute pipelines */
+    if (dmabuf_fd >= 0 && !vxfec_vk_ctx_supports_dmabuf_fd(ctx, dmabuf_fd))
+        goto fail;
 
     VkCommandPoolCreateInfo cpci = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -713,15 +793,24 @@ bool vxfec_vk_ctx_supports_dmabuf_fd(vxfec_vk_ctx *ctx, int dmabuf_fd)
 #endif
 }
 
-static vxfec_vk_ctx *ctx_new_select(int *status, int dmabuf_fd)
+static vxfec_vk_ctx *ctx_new_select(int *status, int dmabuf_fd, bool explicit_dev, uint32_t explicit_dev_idx)
 {
     bool forced_dev = false, forced_qfam = false;
     uint32_t forced_dev_idx = 0, forced_qfam_idx = 0;
-    if (!parse_env_uint("VXFEC_VK_DEVICE", &forced_dev, &forced_dev_idx) ||
-        !parse_env_uint("VXFEC_VK_QUEUE_FAMILY", &forced_qfam, &forced_qfam_idx)) {
+    if (!parse_env_uint("VXFEC_VK_QUEUE_FAMILY", &forced_qfam, &forced_qfam_idx)) {
         if (status)
             *status = VXFEC_VK_ERROR;
         return NULL;
+    }
+    if (explicit_dev) {
+        forced_dev = true;
+        forced_dev_idx = explicit_dev_idx;
+    } else if (dmabuf_fd < 0) {
+        if (!parse_env_uint("VXFEC_VK_DEVICE", &forced_dev, &forced_dev_idx)) {
+            if (status)
+                *status = VXFEC_VK_ERROR;
+            return NULL;
+        }
     }
 
     VkApplicationInfo app = {
@@ -765,18 +854,14 @@ static vxfec_vk_ctx *ctx_new_select(int *status, int dmabuf_fd)
     for (;;) {
         int current_status = VXFEC_VK_ERROR;
         int selected_score = INT_MAX, selected_index = -1;
-        vxfec_vk_ctx *ctx = ctx_new_attempt(&current_status, inst, devs, dev_count, forced_dev, forced_dev_idx, forced_qfam,
-                                            forced_qfam_idx, previous_score, previous_index, &selected_score, &selected_index);
+        vxfec_vk_ctx *ctx =
+            ctx_new_attempt(&current_status, inst, devs, dev_count, forced_dev, forced_dev_idx, forced_qfam, forced_qfam_idx,
+                            dmabuf_fd, previous_score, previous_index, &selected_score, &selected_index);
         if (ctx) {
-            if (dmabuf_fd < 0 || vxfec_vk_ctx_supports_dmabuf_fd(ctx, dmabuf_fd)) {
-                free(devs);
-                if (status)
-                    *status = VXFEC_VK_OK;
-                return ctx;
-            }
-            /* preserve shared VkInstance while probing remaining physical devices */
-            ctx->instance = VK_NULL_HANDLE;
-            vxfec_vk_ctx_free(ctx);
+            free(devs);
+            if (status)
+                *status = VXFEC_VK_OK;
+            return ctx;
         }
         if (selected_index >= 0)
             attempted = true;
@@ -794,7 +879,12 @@ static vxfec_vk_ctx *ctx_new_select(int *status, int dmabuf_fd)
 
 vxfec_vk_ctx *vxfec_vk_ctx_new_status(int *status)
 {
-    return ctx_new_select(status, -1);
+    return ctx_new_select(status, -1, false, 0u);
+}
+
+vxfec_vk_ctx *vxfec_vk_ctx_new_at(uint32_t device_index, int *status)
+{
+    return ctx_new_select(status, -1, true, device_index);
 }
 
 vxfec_vk_ctx *vxfec_vk_ctx_new_for_dmabuf(int dmabuf_fd, int *status)
@@ -810,7 +900,7 @@ vxfec_vk_ctx *vxfec_vk_ctx_new_for_dmabuf(int dmabuf_fd, int *status)
             *status = VXFEC_VK_ERROR;
         return NULL;
     }
-    return ctx_new_select(status, dmabuf_fd);
+    return ctx_new_select(status, dmabuf_fd, false, 0u);
 #endif
 }
 
@@ -825,14 +915,7 @@ bool vxfec_vk_wait_idle(vxfec_vk_ctx *ctx)
         return false;
     if (!vk_idle_confirmed(ctx->dev))
         return false;
-    ctx->last_submit_unconfirmed = false;
-    for (uint32_t i = 0; i < VXFEC_VK_ASYNC_SLOTS; i++)
-        ctx->async_slot_tickets[i] = 0;
-    if (ctx->pending_release_buf) {
-        ctx->pending_release_buf->owned_by_vk = false;
-        ctx->pending_release_buf = NULL;
-    }
-    reap_retired_bufs(ctx);
+    reset_idle_state(ctx);
     return true;
 }
 
@@ -843,60 +926,20 @@ void vxfec_vk_ctx_free(vxfec_vk_ctx *ctx)
     if (ctx->dev) {
         if (!vk_idle_confirmed(ctx->dev))
             return;
-        ctx->last_submit_unconfirmed = false;
-        for (uint32_t i = 0; i < VXFEC_VK_ASYNC_SLOTS; i++)
-            ctx->async_slot_tickets[i] = 0;
-        if (ctx->pending_release_buf) {
-            ctx->pending_release_buf->owned_by_vk = false;
-            ctx->pending_release_buf = NULL;
-        }
-        reap_retired_bufs(ctx);
+        reset_idle_state(ctx);
         if (ctx->io_stage_ptr && ctx->io_stage_mem)
             vkUnmapMemory(ctx->dev, ctx->io_stage_mem);
         if (ctx->io_stage_buf)
             vkDestroyBuffer(ctx->dev, ctx->io_stage_buf, NULL);
         if (ctx->io_stage_mem)
             vkFreeMemory(ctx->dev, ctx->io_stage_mem, NULL);
-        vxfec_vk_buf_free(ctx, ctx->mix_tab_buf);
-        vxfec_vk_buf_free(ctx, ctx->direct_tab_buf);
+        vxfec_vk_buf_free(ctx, ctx->sync_tab_buf);
         for (uint32_t s = 0; s < VXFEC_VK_ASYNC_SLOTS; s++)
             vxfec_vk_buf_free(ctx, ctx->async_tab_bufs[s]);
-        if (ctx->pipe_vec4_gf256)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_vec4_gf256, NULL);
-        if (ctx->pipe_vec4_gf2)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_vec4_gf2, NULL);
-        if (ctx->pipe_vram_gf256)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_vram_gf256, NULL);
-        if (ctx->pipe_vram_gf2)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_vram_gf2, NULL);
-        if (ctx->pipe_mix_vec4)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_mix_vec4, NULL);
-        if (ctx->pipe_mix)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_mix, NULL);
-        if (ctx->pipe_direct_gf2_vec4_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf2_vec4_16, NULL);
-        if (ctx->pipe_direct_gf2_vec4_32)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf2_vec4_32, NULL);
-        if (ctx->pipe_direct_gf2_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf2_16, NULL);
-        if (ctx->pipe_direct_gf2_32)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf2_32, NULL);
-        if (ctx->pipe_direct_gf256_nib_vec4_8)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf256_nib_vec4_8, NULL);
-        if (ctx->pipe_direct_gf256_nib_vec4_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf256_nib_vec4_16, NULL);
-        if (ctx->pipe_direct_gf256_nib_8)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf256_nib_8, NULL);
-        if (ctx->pipe_direct_gf256_nib_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_direct_gf256_nib_16, NULL);
-        if (ctx->pipe_wire_gf2_vec4_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_wire_gf2_vec4_16, NULL);
-        if (ctx->pipe_wire_gf2_vec4_32)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_wire_gf2_vec4_32, NULL);
-        if (ctx->pipe_wire_gf256_nib_vec4_8)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_wire_gf256_nib_vec4_8, NULL);
-        if (ctx->pipe_wire_gf256_nib_vec4_16)
-            vkDestroyPipeline(ctx->dev, ctx->pipe_wire_gf256_nib_vec4_16, NULL);
+        for (uint32_t p = 0; p < VXFEC_VK_PIPE_COUNT; p++) {
+            if (ctx->pipes[p])
+                vkDestroyPipeline(ctx->dev, ctx->pipes[p], NULL);
+        }
         if (ctx->desc_pool)
             vkDestroyDescriptorPool(ctx->dev, ctx->desc_pool, NULL);
         if (ctx->pl_run)
@@ -925,6 +968,22 @@ void vxfec_vk_ctx_free(vxfec_vk_ctx *ctx)
 const char *vxfec_vk_device_name(const vxfec_vk_ctx *ctx)
 {
     return ctx ? ctx->dev_name : "";
+}
+
+bool vxfec_vk_device_uuid(const vxfec_vk_ctx *ctx, uint8_t out_uuid[16])
+{
+    if (!ctx || !out_uuid)
+        return false;
+    memcpy(out_uuid, ctx->device_uuid, 16);
+    return true;
+}
+
+bool vxfec_vk_device_pci_bus_info(const vxfec_vk_ctx *ctx, char *out_bdf, size_t cap)
+{
+    if (!ctx || !out_bdf || cap == 0u || !ctx->pci_bdf[0])
+        return false;
+    snprintf(out_bdf, cap, "%s", ctx->pci_bdf);
+    return true;
 }
 
 bool vxfec_vk_is_discrete(const vxfec_vk_ctx *ctx)
@@ -1056,6 +1115,8 @@ void vxfec_vk_buf_free(vxfec_vk_ctx *ctx, vxfec_vk_buf *buf)
         vkDestroyBuffer(ctx->dev, buf->dev_buf, NULL);
     if (buf->dev_mem)
         vkFreeMemory(ctx->dev, buf->dev_mem, NULL);
+    if (buf->ext_free_fn)
+        buf->ext_free_fn(buf->ext_free_arg);
     free(buf);
 }
 
@@ -1063,6 +1124,7 @@ void vxfec_vk__retire_buf(vxfec_vk_ctx *ctx, vxfec_vk_buf *buf)
 {
     if (!ctx || !buf)
         return;
+    buf->retire_ticket = ctx->timeline_submitted;
     buf->next_retired = ctx->retired_bufs;
     ctx->retired_bufs = buf;
 }
@@ -1264,11 +1326,129 @@ bool vxfec_vk_buf_copy(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst, const vxfec_vk_buf 
     return vxfec_vk_buf_copy_offset(ctx, dst, 0, src, 0, bytes);
 }
 
+vxfec_vk_buf *vxfec_vk_buf_import_opaque_fd_ex(vxfec_vk_ctx *ctx, int opaque_fd, size_t alloc_bytes, size_t view_bytes,
+                                               int32_t memory_type_index, void (*on_free)(void *), void *user_ctx)
+{
+#if defined(_WIN32)
+    (void)ctx;
+    (void)opaque_fd;
+    (void)alloc_bytes;
+    (void)view_bytes;
+    (void)memory_type_index;
+    (void)on_free;
+    (void)user_ctx;
+    return NULL;
+#else
+    if (!ctx || opaque_fd < 0 || view_bytes == 0 || alloc_bytes < view_bytes || !ctx->has_ext_mem_fd || !ctx->has_opaque_fd)
+        return NULL;
+
+    vxfec_vk_buf *b = (vxfec_vk_buf *)calloc(1, sizeof(*b));
+    if (!b)
+        return NULL;
+    b->bytes = view_bytes;
+    b->ext_kind = VXFEC_VK_EXT_OPAQUE_FD;
+    b->owned_by_vk = false;
+
+    VkExternalMemoryBufferCreateInfo embci = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+    };
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &embci,
+        .size = alloc_bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (vkCreateBuffer(ctx->dev, &bci, NULL, &b->dev_buf) != VK_SUCCESS) {
+        free(b);
+        return NULL;
+    }
+
+    VkMemoryDedicatedRequirements ded_req = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+    };
+    VkMemoryRequirements2 mr2 = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+        .pNext = &ded_req,
+    };
+    VkBufferMemoryRequirementsInfo2 bmri = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+        .buffer = b->dev_buf,
+    };
+    vkGetBufferMemoryRequirements2(ctx->dev, &bmri, &mr2);
+    if (mr2.memoryRequirements.size > alloc_bytes) {
+        vxfec_vk_buf_free(ctx, b);
+        return NULL;
+    }
+
+    uint32_t mem_idx = 0;
+    if (memory_type_index >= 0) {
+        if ((uint32_t)memory_type_index >= 32u ||
+            ((mr2.memoryRequirements.memoryTypeBits >> (uint32_t)memory_type_index) & 1u) == 0u) {
+            vxfec_vk_buf_free(ctx, b);
+            return NULL;
+        }
+        mem_idx = (uint32_t)memory_type_index;
+    } else if (!find_mem_type(ctx->phys, mr2.memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &mem_idx)) {
+        vxfec_vk_buf_free(ctx, b);
+        return NULL;
+    }
+
+    /* dup before vkAllocateMemory so caller retains ownership of opaque_fd on any failure */
+    int vk_fd = dup(opaque_fd);
+    if (vk_fd < 0) {
+        vxfec_vk_buf_free(ctx, b);
+        return NULL;
+    }
+
+    bool use_ded = ctx->opaque_fd_dedicated_only || ded_req.requiresDedicatedAllocation == VK_TRUE;
+    VkMemoryDedicatedAllocateInfo ded_ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        .buffer = b->dev_buf,
+    };
+    VkImportMemoryFdInfoKHR imfi = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .pNext = use_ded ? &ded_ai : NULL,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        .fd = vk_fd,
+    };
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &imfi,
+        .allocationSize = alloc_bytes,
+        .memoryTypeIndex = mem_idx,
+    };
+    if (vkAllocateMemory(ctx->dev, &mai, NULL, &b->dev_mem) != VK_SUCCESS) {
+        close(vk_fd);
+        vxfec_vk_buf_free(ctx, b);
+        return NULL;
+    }
+    if (vkBindBufferMemory(ctx->dev, b->dev_buf, b->dev_mem, 0) != VK_SUCCESS) {
+        vxfec_vk_buf_free(ctx, b);
+        return NULL;
+    }
+    close(opaque_fd);
+    b->ext_free_fn = on_free;
+    b->ext_free_arg = user_ctx;
+    return b;
+#endif
+}
+
+vxfec_vk_buf *vxfec_vk_buf_import_opaque_fd(vxfec_vk_ctx *ctx, int opaque_fd, size_t alloc_bytes, size_t view_bytes,
+                                            void (*on_free)(void *), void *user_ctx)
+{
+    return vxfec_vk_buf_import_opaque_fd_ex(ctx, opaque_fd, alloc_bytes, view_bytes, -1, on_free, user_ctx);
+}
+
 vxfec_vk_buf *vxfec_vk_buf_new_exportable(vxfec_vk_ctx *ctx, size_t bytes, bool is_dmabuf, int *out_fd)
 {
-    if (!ctx || bytes == 0 || !is_dmabuf || !out_fd || !ctx->has_ext_mem_fd || !ctx->has_dmabuf_export || !ctx->pfn_get_mem_fd)
+    if (!ctx || bytes == 0 || !is_dmabuf || !out_fd || !ctx->has_ext_mem_fd)
         return NULL;
     *out_fd = -1;
+
+    if (!ctx->has_dmabuf_export || !ctx->pfn_get_mem_fd)
+        return NULL;
 
     VkExternalMemoryHandleTypeFlagBits htype = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     VkExternalMemoryBufferCreateInfo embci = {
@@ -1628,8 +1808,6 @@ bool vxfec_vk_buf_read_offset(vxfec_vk_ctx *ctx, vxfec_vk_buf *src_vram, size_t 
         return false;
     bool transient_ext = (src_vram->ext_kind != VXFEC_VK_EXT_NONE && !src_vram->owned_by_vk);
     if (transient_ext) {
-        if (ctx->pending_owned_cnt >= VXFEC_VK_MAX_PENDING_OWNED)
-            return false;
         vxfec_vk__record_ext_acquire_cmd(ctx, ctx->cmd, src_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         ctx->pending_owned_bufs[ctx->pending_owned_cnt++] = src_vram;
         ctx->pending_release_buf = src_vram;
@@ -1660,8 +1838,6 @@ bool vxfec_vk_buf_write_offset(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst_vram, size_t
     memcpy(ctx->io_stage_ptr, src_host, bytes);
     bool transient_ext = (dst_vram->ext_kind != VXFEC_VK_EXT_NONE && !dst_vram->owned_by_vk);
     if (transient_ext) {
-        if (ctx->pending_owned_cnt >= VXFEC_VK_MAX_PENDING_OWNED)
-            return false;
         vxfec_vk__record_ext_acquire_cmd(ctx, ctx->cmd, dst_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         ctx->pending_owned_bufs[ctx->pending_owned_cnt++] = dst_vram;
         ctx->pending_release_buf = dst_vram;
@@ -1684,6 +1860,156 @@ bool vxfec_vk_buf_write_offset(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst_vram, size_t
     return vxfec_vk__submit_and_wait(ctx);
 }
 
+bool vxfec_vk_buf_fill_offset(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst_vram, size_t offset, size_t bytes, uint32_t pattern)
+{
+    if (!ctx || !dst_vram || bytes == 0 || offset > dst_vram->bytes || bytes > dst_vram->bytes - offset)
+        return false;
+    size_t real_off = dst_vram->view_offset + offset;
+    if (dst_vram->zero_copy && dst_vram->stage_ptr) {
+        if (!ensure_sync_cmd_idle(ctx) || !wait_async_idle(ctx))
+            return false;
+        uint8_t pbytes[4];
+        memcpy(pbytes, &pattern, 4u);
+        uint8_t *dst = (uint8_t *)dst_vram->stage_ptr + real_off;
+        size_t cur = 0u;
+        while (cur < bytes && ((real_off + cur) & 3u) != 0u) {
+            dst[cur] = pbytes[(real_off + cur) & 3u];
+            cur++;
+        }
+        for (; cur + 4u <= bytes; cur += 4u)
+            memcpy(dst + cur, &pattern, 4u);
+        while (cur < bytes) {
+            dst[cur] = pbytes[(real_off + cur) & 3u];
+            cur++;
+        }
+        return true;
+    }
+    if (((real_off | bytes) & 3u) != 0u) {
+        uint8_t tail[4];
+        memcpy(tail, &pattern, 4u);
+        size_t head = (4u - (real_off & 3u)) & 3u;
+        if (head > bytes)
+            head = bytes;
+        if (head > 0u && !vxfec_vk_buf_write_offset(ctx, dst_vram, offset, &tail[real_off & 3u], head))
+            return false;
+        size_t cur = head;
+        size_t bulk = (bytes - cur) & ~(size_t)3u;
+        if (bulk > 0u && !vxfec_vk_buf_fill_offset(ctx, dst_vram, offset + cur, bulk, pattern))
+            return false;
+        cur += bulk;
+        if (cur < bytes && !vxfec_vk_buf_write_offset(ctx, dst_vram, offset + cur, tail, bytes - cur))
+            return false;
+        return true;
+    }
+    if (!vxfec_vk__begin_cmd(ctx))
+        return false;
+    bool transient_ext = (dst_vram->ext_kind != VXFEC_VK_EXT_NONE && !dst_vram->owned_by_vk);
+    if (transient_ext) {
+        vxfec_vk__record_ext_acquire_cmd(ctx, ctx->cmd, dst_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        ctx->pending_owned_bufs[ctx->pending_owned_cnt++] = dst_vram;
+        ctx->pending_release_buf = dst_vram;
+    }
+    vkCmdFillBuffer(ctx->cmd, dst_vram->dev_buf, real_off, bytes, pattern);
+    if (transient_ext) {
+        vxfec_vk__record_ext_release_cmd(ctx, ctx->cmd, dst_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    } else {
+        VkMemoryBarrier fill_to_dev = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_to_dev, 0, NULL, 0,
+                             NULL);
+    }
+    return vxfec_vk__submit_and_wait(ctx);
+}
+
+static bool validate_fill_spans(const vxfec_vk_buf *dst_vram, const vxfec_vk_span *spans, size_t span_count, bool *out_all_aligned)
+{
+    bool aligned = true;
+    for (size_t i = 0; i < span_count; i++) {
+        if (spans[i].bytes == 0u || spans[i].offset > dst_vram->bytes || spans[i].bytes > dst_vram->bytes - spans[i].offset)
+            return false;
+        if ((((dst_vram->view_offset + spans[i].offset) | spans[i].bytes) & 3u) != 0u)
+            aligned = false;
+    }
+    *out_all_aligned = aligned;
+    return true;
+}
+
+static void record_aligned_fill_spans_cmd(VkCommandBuffer cmd, vxfec_vk_buf *dst_vram, const vxfec_vk_span *spans,
+                                          size_t span_count, uint32_t pattern)
+{
+    for (size_t i = 0; i < span_count; i++)
+        vkCmdFillBuffer(cmd, dst_vram->dev_buf, dst_vram->view_offset + spans[i].offset, spans[i].bytes, pattern);
+    VkMemoryBarrier fill_to_dev = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &fill_to_dev, 0, NULL, 0, NULL);
+}
+
+bool vxfec_vk_buf_fill_spans(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst_vram, const vxfec_vk_span *spans, size_t span_count,
+                             uint32_t pattern)
+{
+    if (!ctx || !dst_vram || (span_count > 0u && !spans))
+        return false;
+    if (span_count == 0u)
+        return true;
+    bool all_aligned = false;
+    if (!validate_fill_spans(dst_vram, spans, span_count, &all_aligned))
+        return false;
+    bool transient_ext = (dst_vram->ext_kind != VXFEC_VK_EXT_NONE && !dst_vram->owned_by_vk);
+    if (!all_aligned || (dst_vram->zero_copy && dst_vram->stage_ptr)) {
+        for (size_t i = 0; i < span_count; i++) {
+            if (!vxfec_vk_buf_fill_offset(ctx, dst_vram, spans[i].offset, spans[i].bytes, pattern))
+                return false;
+        }
+        return true;
+    }
+    if (!vxfec_vk__begin_cmd(ctx))
+        return false;
+    if (transient_ext) {
+        vxfec_vk__record_ext_acquire_cmd(ctx, ctx->cmd, dst_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        ctx->pending_owned_bufs[ctx->pending_owned_cnt++] = dst_vram;
+        ctx->pending_release_buf = dst_vram;
+        for (size_t i = 0; i < span_count; i++)
+            vkCmdFillBuffer(ctx->cmd, dst_vram->dev_buf, dst_vram->view_offset + spans[i].offset, spans[i].bytes, pattern);
+        vxfec_vk__record_ext_release_cmd(ctx, ctx->cmd, dst_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    } else {
+        record_aligned_fill_spans_cmd(ctx->cmd, dst_vram, spans, span_count, pattern);
+    }
+    return vxfec_vk__submit_and_wait(ctx);
+}
+
+uint64_t vxfec_vk_buf_fill_spans_submit(vxfec_vk_ctx *ctx, vxfec_vk_buf *dst_vram, const vxfec_vk_span *spans, size_t span_count,
+                                        uint32_t pattern)
+{
+    if (!ctx || !dst_vram || (span_count > 0u && !spans))
+        return 0u;
+    if (span_count == 0u)
+        return 1u;
+    bool all_aligned = false;
+    if (!validate_fill_spans(dst_vram, spans, span_count, &all_aligned))
+        return 0u;
+    bool transient_ext = (dst_vram->ext_kind != VXFEC_VK_EXT_NONE && !dst_vram->owned_by_vk);
+    if (!ctx->has_timeline_sem || !ctx->timeline_sem || !all_aligned || (dst_vram->zero_copy && dst_vram->stage_ptr) ||
+        transient_ext) {
+        return vxfec_vk_buf_fill_spans(ctx, dst_vram, spans, span_count, pattern) ? 1u : 0u;
+    }
+    uint32_t slot = 0;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!vxfec_vk__acquire_async_slot(ctx, &slot, &cmd))
+        return 0u;
+    record_aligned_fill_spans_cmd(cmd, dst_vram, spans, span_count, pattern);
+    return vxfec_vk__submit_async_slot(ctx, slot, cmd);
+}
+
 uint64_t vxfec_vk__read_gpu_ns(vxfec_vk_ctx *ctx)
 {
     if (!ctx->has_timestamps)
@@ -1702,7 +2028,7 @@ static size_t select_tile_cap(const vxfec_vk_ctx *ctx)
     if (!ctx->is_discrete)
         return 12ULL << 20;
     if (ctx->vendor_id == 0x1002u)
-        return 96ULL << 20; /* AMD RDNA Infinity Cache (64-96 MiB) */
+        return 64ULL << 20; /* AMD RDNA Infinity Cache (64-96 MiB) */
     if (ctx->vendor_id == 0x10deu)
         return 36ULL << 20; /* NVIDIA Hopper/Ada/Ampere L2 (40-96 MiB) */
     return 32ULL << 20;
@@ -1715,7 +2041,7 @@ uint32_t vxfec_vk__compute_tile_blocks(const vxfec_vk_ctx *ctx, uint32_t rows, u
     if ((uint64_t)wg_x * num_blocks > min_wgs) {
         size_t tile_cap = select_tile_cap(ctx);
         size_t blk_bytes = (size_t)rows * stride;
-        uint32_t max_tile = (blk_bytes < tile_cap) ? (uint32_t)(tile_cap / blk_bytes) : 1u;
+        uint32_t max_tile = (blk_bytes > 0u && blk_bytes < tile_cap) ? (uint32_t)(tile_cap / blk_bytes) : 1u;
         if (num_blocks > max_tile) {
             uint32_t n_tiles = (num_blocks + max_tile - 1u) / max_tile;
             tile_blks = (num_blocks + n_tiles - 1u) / n_tiles;
@@ -1728,7 +2054,7 @@ uint32_t vxfec_vk__compute_tile_blocks(const vxfec_vk_ctx *ctx, uint32_t rows, u
 
 bool vxfec_vk__ensure_staging_buf(vxfec_vk_ctx *ctx, vxfec_vk_buf **io_buf, size_t *io_cap, size_t need_bytes)
 {
-    bool is_sync_buf = (io_buf == &ctx->mix_tab_buf || io_buf == &ctx->direct_tab_buf);
+    bool is_sync_buf = (io_buf == &ctx->sync_tab_buf);
     if (is_sync_buf && !ensure_sync_cmd_idle(ctx))
         return false;
     if (*io_buf && *io_cap >= need_bytes)
@@ -1745,36 +2071,70 @@ bool vxfec_vk__ensure_staging_buf(vxfec_vk_ctx *ctx, vxfec_vk_buf **io_buf, size
     return true;
 }
 
-bool vxfec_vk__select_direct_plan(const vxfec_vk_ctx *ctx, bool pure_gf2, uint32_t tile_e, size_t d_bytes, size_t out_bytes,
-                                  uint32_t stride, uint32_t num_tiles, uint32_t num_blocks, VkPipeline *out_pipe,
-                                  uint32_t *out_stride_units, uint32_t *out_wg_x)
+bool vxfec_vk__select_vec4_grid(const vxfec_vk_ctx *ctx, uint32_t stride, uint64_t parallel_units, bool *out_vec4,
+                                uint32_t *out_stride_units, uint32_t *out_wg_x)
 {
-    (void)d_bytes;
-    (void)out_bytes;
-    bool can_vec4 = ((stride & 15u) == 0);
     bool use_vec4 = false;
     uint32_t min_wgs = ctx->is_discrete ? 256u : 32u;
-
-    if (can_vec4) {
+    if ((stride & 15u) == 0u) {
         uint32_t wg_x_vec4 = ((stride / 16u) + 31u) / 32u;
-        if ((uint64_t)wg_x_vec4 * num_tiles * num_blocks >= min_wgs)
+        if ((uint64_t)wg_x_vec4 * parallel_units >= min_wgs)
             use_vec4 = true;
     }
-
     uint32_t stride_units = use_vec4 ? (stride / 16u) : (stride / 4u);
     uint32_t wg_x = (stride_units + 31u) / 32u;
-    if (wg_x == 0 || wg_x > ctx->max_wg_x)
+    if (wg_x == 0u || wg_x > ctx->max_wg_x)
+        return false;
+    *out_vec4 = use_vec4;
+    *out_stride_units = stride_units;
+    *out_wg_x = wg_x;
+    return true;
+}
+
+void vxfec_vk__update_ssbo_ds(VkDevice dev, VkDescriptorSet ds, const VkDescriptorBufferInfo *dbis, uint32_t count)
+{
+    VkWriteDescriptorSet writes[4];
+    for (uint32_t i = 0; i < count && i < 4u; i++) {
+        writes[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = ds,
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &dbis[i],
+        };
+    }
+    vkUpdateDescriptorSets(dev, (count < 4u) ? count : 4u, writes, 0, NULL);
+}
+
+void vxfec_vk__cmd_mem_barrier(VkCommandBuffer cmd, VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
+                               VkAccessFlags src_access, VkAccessFlags dst_access)
+{
+    VkMemoryBarrier mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = src_access,
+        .dstAccessMask = dst_access,
+    };
+    vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+bool vxfec_vk__select_direct_plan(const vxfec_vk_ctx *ctx, bool pure_gf2, uint32_t tile_e, uint32_t stride, uint32_t num_tiles,
+                                  uint32_t num_blocks, VkPipeline *out_pipe, uint32_t *out_stride_units, uint32_t *out_wg_x)
+{
+    bool use_vec4 = false;
+    if (!vxfec_vk__select_vec4_grid(ctx, stride, (uint64_t)num_tiles * num_blocks, &use_vec4, out_stride_units, out_wg_x))
         return false;
 
     if (pure_gf2) {
-        *out_pipe = use_vec4 ? ((tile_e == 16u) ? ctx->pipe_direct_gf2_vec4_16 : ctx->pipe_direct_gf2_vec4_32)
-                             : ((tile_e == 16u) ? ctx->pipe_direct_gf2_16 : ctx->pipe_direct_gf2_32);
+        *out_pipe = use_vec4 ? ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_DIRECT_GF2_VEC4_16 : VXFEC_VK_PIPE_DIRECT_GF2_VEC4_32]
+                             : ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_DIRECT_GF2_16 : VXFEC_VK_PIPE_DIRECT_GF2_32];
+    } else if (tile_e == 32u) {
+        *out_pipe = use_vec4 ? ctx->pipes[VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_32] : ctx->pipes[VXFEC_VK_PIPE_DIRECT_GF256_NIB_32];
     } else {
-        *out_pipe = use_vec4 ? ((tile_e == 16u) ? ctx->pipe_direct_gf256_nib_vec4_16 : ctx->pipe_direct_gf256_nib_vec4_8)
-                             : ((tile_e == 16u) ? ctx->pipe_direct_gf256_nib_16 : ctx->pipe_direct_gf256_nib_8);
+        *out_pipe =
+            use_vec4 ? ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_16 : VXFEC_VK_PIPE_DIRECT_GF256_NIB_VEC4_8]
+                     : ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_DIRECT_GF256_NIB_16 : VXFEC_VK_PIPE_DIRECT_GF256_NIB_8];
     }
-    *out_stride_units = stride_units;
-    *out_wg_x = wg_x;
     return true;
 }
 
@@ -1808,7 +2168,7 @@ void vxfec_vk__record_mix_like_dispatches_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer
 
 bool vxfec_vk__record_direct_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescriptorSet ds_mix, const vxfec_vk_direct_desc *gd,
                                  vxfec_vk_buf *d_buf, uint32_t stride, uint32_t num_blocks, vxfec_vk_buf *out_buf, bool upload_d,
-                                 bool download_out, bool record_ts)
+                                 bool download_out, bool upload_tab, bool record_ts)
 {
     size_t d_bytes = 0, out_bytes = 0;
     if (!vxfec_vk__mul3(num_blocks, gd->rows, stride, &d_bytes) || !vxfec_vk__mul3(num_blocks, gd->num_esis, stride, &out_bytes) ||
@@ -1821,8 +2181,8 @@ bool vxfec_vk__record_direct_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescr
 
     VkPipeline pipe = VK_NULL_HANDLE;
     uint32_t stride_units = 0, wg_x = 0;
-    if (!vxfec_vk__select_direct_plan(ctx, gd->pure_gf2, gd->tile_e, d_bytes, out_bytes, stride, gd->num_tiles, num_blocks, &pipe,
-                                      &stride_units, &wg_x))
+    if (!vxfec_vk__select_direct_plan(ctx, gd->pure_gf2, gd->tile_e, stride, gd->num_tiles, num_blocks, &pipe, &stride_units,
+                                      &wg_x))
         return false;
 
     if (!vxfec_vk__ensure_owned_cmd(ctx, cmd, d_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1835,70 +2195,46 @@ bool vxfec_vk__record_direct_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescr
         {.buffer = gd->tab_buf->dev_buf, .offset = gd->tab_buf->view_offset, .range = gd->tab_bytes},
         {.buffer = out_buf->dev_buf, .offset = out_buf->view_offset, .range = out_bytes},
     };
-    VkWriteDescriptorSet writes[3] = {
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds_mix,
-         .dstBinding = 0,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[0]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds_mix,
-         .dstBinding = 1,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[1]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds_mix,
-         .dstBinding = 2,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[2]},
-    };
-    vkUpdateDescriptorSets(ctx->dev, 3, writes, 0, NULL);
+    vxfec_vk__update_ssbo_ds(ctx->dev, ds_mix, dbi, 3u);
 
     if (record_ts && ctx->has_timestamps) {
         vkCmdResetQueryPool(cmd, ctx->query_pool, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->query_pool, 0);
     }
 
+    bool did_xfer = false;
+    if (upload_tab && !gd->tab_buf->zero_copy) {
+        VkBufferCopy t_copy = {.srcOffset = 0, .dstOffset = gd->tab_buf->view_offset, .size = gd->tab_bytes};
+        vkCmdCopyBuffer(cmd, gd->tab_buf->stage_buf, gd->tab_buf->dev_buf, 1, &t_copy);
+        did_xfer = true;
+    }
     if (upload_d && !d_buf->zero_copy) {
         VkBufferCopy d_copy = {.srcOffset = 0, .dstOffset = d_buf->view_offset, .size = d_bytes};
         vkCmdCopyBuffer(cmd, d_buf->stage_buf, d_buf->dev_buf, 1, &d_copy);
-        VkMemoryBarrier xfer_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0, NULL, 0,
-                             NULL);
+        did_xfer = true;
+    }
+    if (did_xfer) {
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
     vxfec_vk__record_mix_like_dispatches_cmd(ctx, cmd, ds_mix, gd->rows, stride_units, wg_x, gd->num_esis, gd->num_tiles, 0u,
                                              num_blocks, pipe);
 
     if (download_out && !out_buf->zero_copy) {
-        VkMemoryBarrier mix_to_xfer = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mix_to_xfer, 0, NULL, 0,
-                             NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         VkBufferCopy out_copy = {.srcOffset = out_buf->view_offset, .dstOffset = 0, .size = out_bytes};
         vkCmdCopyBuffer(cmd, out_buf->dev_buf, out_buf->stage_buf, 1, &out_copy);
         vxfec_vk__record_transfer_to_host_cmd(cmd);
     } else {
-        VkMemoryBarrier post_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
-                             1, &post_mb, 0, NULL, 0, NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_HOST_BIT,
+                                  VK_ACCESS_SHADER_WRITE_BIT,
+                                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     }
 
     if (record_ts && ctx->has_timestamps)
@@ -1914,7 +2250,7 @@ bool vxfec_vk__direct_pipelined(vxfec_vk_ctx *ctx, const vxfec_vk_direct_desc *g
     if (!vxfec_vk__begin_cmd(ctx))
         return false;
     if (!vxfec_vk__record_direct_cmd(ctx, ctx->cmd, ctx->ds_mix, gd, d_buf, stride, num_blocks, out_buf, upload_d, download_out,
-                                     gpu_ns_out != NULL)) {
+                                     false, gpu_ns_out != NULL)) {
         ctx->pending_owned_cnt = 0;
         return false;
     }
@@ -1938,7 +2274,7 @@ uint64_t vxfec_vk__direct_submit(vxfec_vk_ctx *ctx, const vxfec_vk_direct_desc *
     if (!vxfec_vk__acquire_async_slot(ctx, &slot, &cmd))
         return 0;
     if (!vxfec_vk__record_direct_cmd(ctx, cmd, ctx->async_ds_mix[slot], gd, d_buf, stride, num_blocks, out_buf, upload_d,
-                                     download_out, false)) {
+                                     download_out, false, false)) {
         ctx->pending_owned_cnt = 0;
         (void)vkEndCommandBuffer(cmd);
         return 0;
@@ -1956,24 +2292,13 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
         return 0;
 
     if (!ctx->has_timeline_sem || !ctx->timeline_sem) {
-        if (!vxfec_vk__ensure_staging_buf(ctx, &ctx->direct_tab_buf, &ctx->direct_tab_cap, tab_bytes))
+        if (!vxfec_vk__ensure_staging_buf(ctx, &ctx->sync_tab_buf, &ctx->sync_tab_cap, tab_bytes))
             return 0;
-        memcpy(vxfec_vk_buf_staging_ptr(ctx->direct_tab_buf), tab_words, tab_bytes);
+        memcpy(vxfec_vk_buf_staging_ptr(ctx->sync_tab_buf), tab_words, tab_bytes);
         if (!vxfec_vk__begin_cmd(ctx))
             return 0;
-        if (!ctx->direct_tab_buf->zero_copy) {
-            VkBufferCopy t_copy = {.srcOffset = 0, .dstOffset = 0, .size = tab_bytes};
-            vkCmdCopyBuffer(ctx->cmd, ctx->direct_tab_buf->stage_buf, ctx->direct_tab_buf->dev_buf, 1, &t_copy);
-            VkMemoryBarrier xfer_mb = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            };
-            vkCmdPipelineBarrier(ctx->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0,
-                                 NULL, 0, NULL);
-        }
         vxfec_vk_direct_desc desc = {
-            .tab_buf = ctx->direct_tab_buf,
+            .tab_buf = ctx->sync_tab_buf,
             .tab_bytes = tab_bytes,
             .rows = rows,
             .num_esis = num_esis,
@@ -1982,7 +2307,7 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
             .pure_gf2 = pure_gf2,
         };
         if (!vxfec_vk__record_direct_cmd(ctx, ctx->cmd, ctx->ds_mix, &desc, d_buf, stride, num_blocks, out_buf, upload_d,
-                                         download_out, false)) {
+                                         download_out, true, false)) {
             ctx->pending_owned_cnt = 0;
             return 0;
         }
@@ -2000,17 +2325,6 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
     }
     vxfec_vk_buf *tbuf = ctx->async_tab_bufs[slot];
     memcpy(vxfec_vk_buf_staging_ptr(tbuf), tab_words, tab_bytes);
-    if (!tbuf->zero_copy) {
-        VkBufferCopy t_copy = {.srcOffset = 0, .dstOffset = 0, .size = tab_bytes};
-        vkCmdCopyBuffer(cmd, tbuf->stage_buf, tbuf->dev_buf, 1, &t_copy);
-        VkMemoryBarrier xfer_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0, NULL, 0,
-                             NULL);
-    }
     vxfec_vk_direct_desc desc = {
         .tab_buf = tbuf,
         .tab_bytes = tab_bytes,
@@ -2021,7 +2335,7 @@ uint64_t vxfec_vk__direct_submit_staged_words(vxfec_vk_ctx *ctx, const uint32_t 
         .pure_gf2 = pure_gf2,
     };
     if (!vxfec_vk__record_direct_cmd(ctx, cmd, ctx->async_ds_mix[slot], &desc, d_buf, stride, num_blocks, out_buf, upload_d,
-                                     download_out, false)) {
+                                     download_out, true, false)) {
         ctx->pending_owned_cnt = 0;
         (void)vkEndCommandBuffer(cmd);
         return 0;
@@ -2033,9 +2347,11 @@ bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer c
                                             vxfec_vk_buf *src_vram, size_t src_offset, size_t valid_bytes, uint32_t row_offset,
                                             uint32_t K, uint32_t sym_T, uint32_t dst_stride)
 {
+    size_t need_d = 0;
     if (!ctx || !cmd || !work_d_buf || !src_vram || K == 0 || sym_T == 0 || dst_stride < sym_T || (dst_stride & 3u) != 0u ||
         (d_bytes & 3u) != 0u || d_bytes > work_d_buf->bytes || valid_bytes > (size_t)K * sym_T || src_offset > src_vram->bytes ||
-        valid_bytes > src_vram->bytes - src_offset || ((size_t)(row_offset + K) * dst_stride) > d_bytes)
+        valid_bytes > src_vram->bytes - src_offset || !vxfec_vk__mul3((size_t)row_offset + (size_t)K, dst_stride, 1u, &need_d) ||
+        need_d > d_bytes)
         return false;
 
     if (!vxfec_vk__ensure_owned_cmd(ctx, cmd, work_d_buf, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -2054,12 +2370,8 @@ bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer c
     }
 
     if (did_fill && valid_bytes > 0u) {
-        VkMemoryBarrier fill_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0, NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT);
     }
 
     if (valid_bytes > 0u) {
@@ -2076,7 +2388,8 @@ bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer c
             vkCmdCopyBuffer(cmd, src_vram->dev_buf, work_d_buf->dev_buf, 1, &cpy);
         } else {
             uint32_t n_rows = (uint32_t)((valid_bytes + sym_T - 1u) / sym_T);
-            VkBufferCopy *copies = (VkBufferCopy *)malloc((size_t)n_rows * sizeof(*copies));
+            VkBufferCopy stack_copies[256];
+            VkBufferCopy *copies = (n_rows <= 256u) ? stack_copies : (VkBufferCopy *)malloc((size_t)n_rows * sizeof(*copies));
             if (!copies)
                 return false;
             for (uint32_t r = 0; r < n_rows; r++) {
@@ -2084,25 +2397,21 @@ bool vxfec_vk__record_vram_encode_input_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer c
                 size_t rem = valid_bytes - off;
                 copies[r] = (VkBufferCopy){
                     .srcOffset = src_vram->view_offset + src_offset + off,
-                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + r) * dst_stride,
+                    .dstOffset = work_d_buf->view_offset + ((size_t)row_offset + (size_t)r) * dst_stride,
                     .size = (rem > sym_T) ? sym_T : rem,
                 };
             }
             vkCmdCopyBuffer(cmd, src_vram->dev_buf, work_d_buf->dev_buf, n_rows, copies);
-            free(copies);
+            if (copies != stack_copies)
+                free(copies);
         }
 
         if (ext_src)
             vxfec_vk__record_ext_release_cmd(ctx, cmd, src_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, 0);
     }
 
-    VkMemoryBarrier xfer_to_comp = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_to_comp, 0, NULL, 0,
-                         NULL);
+    vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     return true;
 }
 
@@ -2113,10 +2422,22 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
 {
     if (out_ext_acquired)
         *out_ext_acquired = false;
+    size_t need_d = 0;
     if (!ctx || !cmd || !work_d_buf || !sys_bitmap || !target_vram || K == 0 || sym_T == 0 || dst_stride < sym_T ||
         (dst_stride & 3u) != 0u || (d_bytes & 3u) != 0u || d_bytes > work_d_buf->bytes || total_bytes > (size_t)K * sym_T ||
-        target_offset > target_vram->bytes || total_bytes > target_vram->bytes - target_offset)
+        target_offset > target_vram->bytes || total_bytes > target_vram->bytes - target_offset ||
+        !vxfec_vk__mul3((size_t)row_offset + (size_t)K, dst_stride, 1u, &need_d) || need_d > d_bytes)
         return false;
+
+    uint32_t total_rows = (uint32_t)(d_bytes / dst_stride);
+    if (num_staged_rows > 0u && staged_rows) {
+        if (!work_d_buf->zero_copy && work_d_buf->stage_buf == VK_NULL_HANDLE)
+            return false;
+        for (uint32_t i = 0; i < num_staged_rows; i++) {
+            if (staged_rows[i] >= total_rows)
+                return false;
+        }
+    }
 
     if (!vxfec_vk__ensure_owned_cmd(ctx, cmd, work_d_buf, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT))
@@ -2124,15 +2445,12 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
 
     if (!work_d_buf->zero_copy) {
         vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset, d_bytes, 0u);
-        VkMemoryBarrier fill_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0, NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT);
 
         if (num_staged_rows > 0u && staged_rows) {
-            VkBufferCopy *sc = (VkBufferCopy *)malloc((size_t)num_staged_rows * sizeof(*sc));
+            VkBufferCopy stack_sc[256];
+            VkBufferCopy *sc = (num_staged_rows <= 256u) ? stack_sc : (VkBufferCopy *)malloc((size_t)num_staged_rows * sizeof(*sc));
             if (!sc)
                 return false;
             for (uint32_t i = 0; i < num_staged_rows; i++) {
@@ -2144,20 +2462,29 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
                 };
             }
             vkCmdCopyBuffer(cmd, work_d_buf->stage_buf, work_d_buf->dev_buf, num_staged_rows, sc);
-            free(sc);
+            if (sc != stack_sc)
+                free(sc);
         }
     } else {
-        uint32_t total_rows = (uint32_t)(d_bytes / dst_stride);
-        uint8_t *is_staged = total_rows ? (uint8_t *)calloc(total_rows, 1u) : NULL;
-        if (total_rows > 0u && !is_staged)
-            return false;
+        uint8_t stack_staged[256];
+        uint8_t *is_staged = NULL;
+        if (total_rows > 0u) {
+            if (total_rows <= 256u) {
+                memset(stack_staged, 0, total_rows);
+                is_staged = stack_staged;
+            } else {
+                is_staged = (uint8_t *)calloc(total_rows, 1u);
+                if (!is_staged)
+                    return false;
+            }
+        }
         if (num_staged_rows > 0u && staged_rows) {
             for (uint32_t i = 0; i < num_staged_rows; i++) {
                 uint32_t sr = staged_rows[i];
-                if (sr < total_rows) {
-                    is_staged[sr] = 1u;
-                    if (dst_stride > sym_T && work_d_buf->stage_ptr)
-                        memset((uint8_t *)work_d_buf->stage_ptr + (size_t)sr * dst_stride + sym_T, 0, dst_stride - sym_T);
+                is_staged[sr] = 1u;
+                if (dst_stride > sym_T && work_d_buf->stage_ptr) {
+                    memset((uint8_t *)work_d_buf->stage_ptr + work_d_buf->view_offset + (size_t)sr * dst_stride + sym_T, 0,
+                           dst_stride - sym_T);
                 }
             }
         }
@@ -2180,15 +2507,11 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
             vkCmdFillBuffer(cmd, work_d_buf->dev_buf, work_d_buf->view_offset + row_bytes, d_bytes - row_bytes, 0u);
             did_zc_fill = true;
         }
-        free(is_staged);
+        if (is_staged != stack_staged)
+            free(is_staged);
         if (did_zc_fill) {
-            VkMemoryBarrier fill_mb = {
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            };
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fill_mb, 0, NULL, 0,
-                                 NULL);
+            vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
     }
 
@@ -2200,7 +2523,8 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
             *out_ext_acquired = true;
     }
 
-    VkBufferCopy *vc = (VkBufferCopy *)malloc((size_t)K * sizeof(*vc));
+    VkBufferCopy stack_vc[256];
+    VkBufferCopy *vc = (K <= 256u) ? stack_vc : (VkBufferCopy *)malloc((size_t)K * sizeof(*vc));
     if (!vc)
         return false;
     uint32_t n_vc = 0u;
@@ -2223,7 +2547,7 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
             if (run_end_b > off) {
                 vc[n_vc++] = (VkBufferCopy){
                     .srcOffset = target_vram->view_offset + target_offset + off,
-                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + run_beg) * dst_stride,
+                    .dstOffset = work_d_buf->view_offset + ((size_t)row_offset + (size_t)run_beg) * dst_stride,
                     .size = run_end_b - off,
                 };
             }
@@ -2233,7 +2557,7 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
             if (clen > 0u) {
                 vc[n_vc++] = (VkBufferCopy){
                     .srcOffset = target_vram->view_offset + target_offset + off,
-                    .dstOffset = work_d_buf->view_offset + (size_t)(row_offset + e) * dst_stride,
+                    .dstOffset = work_d_buf->view_offset + ((size_t)row_offset + (size_t)e) * dst_stride,
                     .size = clen,
                 };
             }
@@ -2242,15 +2566,11 @@ bool vxfec_vk__record_vram_repair_gather_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer 
     }
     if (n_vc > 0u)
         vkCmdCopyBuffer(cmd, target_vram->dev_buf, work_d_buf->dev_buf, n_vc, vc);
-    free(vc);
+    if (vc != stack_vc)
+        free(vc);
 
-    VkMemoryBarrier xfer_to_comp = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_to_comp, 0, NULL, 0,
-                         NULL);
+    vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     return true;
 }
 
@@ -2261,7 +2581,8 @@ bool vxfec_vk__record_vram_repair_scatter_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer
     if (!ctx || !cmd || !out_buf || !target_vram || !missing_esis || num_missing == 0u)
         return false;
 
-    VkBufferCopy *sc = (VkBufferCopy *)malloc((size_t)num_missing * sizeof(*sc));
+    VkBufferCopy stack_sc[256];
+    VkBufferCopy *sc = (num_missing <= 256u) ? stack_sc : (VkBufferCopy *)malloc((size_t)num_missing * sizeof(*sc));
     if (!sc)
         return false;
     uint32_t n_sc = 0u;
@@ -2281,38 +2602,36 @@ bool vxfec_vk__record_vram_repair_scatter_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer
     }
     if (n_sc > 0u)
         vkCmdCopyBuffer(cmd, out_buf->dev_buf, target_vram->dev_buf, n_sc, sc);
-    free(sc);
+    if (sc != stack_sc)
+        free(sc);
 
     if (release_target_ext) {
         vxfec_vk__record_ext_release_cmd(ctx, cmd, target_vram, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     } else {
-        VkMemoryBarrier mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
-                             1, &mb, 0, NULL, 0, NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_HOST_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT,
+                                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                      VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
     }
     return true;
 }
 
 uint32_t vxfec_vk__choose_gf256_tile_e(uint32_t num_out)
 {
-    return (num_out <= 8u) ? 8u : 16u;
+    return (num_out <= 8u) ? 8u : ((num_out <= 16u) ? 16u : 32u);
 }
 
 bool vxfec_vk__emit_direct_gf256_tab(VkDeviceSize max_ssbo_range, const uint8_t *Y, size_t m_stride, uint32_t rows,
                                      uint32_t num_out, uint32_t **out_words, size_t *out_bytes, uint32_t *out_tiles,
                                      uint32_t *out_tile_e)
 {
-    if (!Y || rows == 0 || num_out == 0 || num_out > UINT32_MAX - 16u)
+    if (!Y || rows == 0 || num_out == 0 || num_out > UINT32_MAX - 32u)
         return false;
     uint32_t tile_e = vxfec_vk__choose_gf256_tile_e(num_out);
     uint32_t n_tiles = (num_out + tile_e - 1u) / tile_e;
-    size_t words_per_cmd = (tile_e == 16u) ? 2u : 1u;
+    size_t words_per_cmd = (tile_e == 32u) ? 3u : ((tile_e == 16u) ? 2u : 1u);
 
     size_t per_tile = 0, max_uvec4 = 0, alloc_bytes = 0;
     if (!vxfec_vk__mul3(words_per_cmd, rows, 1u, &per_tile) || per_tile > SIZE_MAX - 1u ||
@@ -2335,41 +2654,53 @@ bool vxfec_vk__emit_direct_gf256_tab(VkDeviceSize max_ssbo_range, const uint8_t 
         uint32_t tile_len = (num_out - out_base > tile_e) ? tile_e : (num_out - out_base);
         for (uint32_t r = 0; r < rows; r++) {
             const uint8_t *yc = Y + (size_t)r * m_stride + out_base;
-            uint32_t lo0_7 = 0u, hi0_7 = 0u;
-            for (uint32_t b = 0; b < 8u && b < tile_len; b++) {
-                uint8_t c = yc[b];
-                if (c != 0u) {
-                    lo0_7 |= ((uint32_t)(c & 0x0fu)) << (4u * b);
-                    hi0_7 |= ((uint32_t)(c >> 4u)) << (4u * b);
+            uint32_t lo0 = 0u, hi0 = 0u;
+            vxfec_vk__pack_nib_octet(yc, tile_len, &lo0, &hi0);
+            if (tile_e == 32u) {
+                uint32_t lo1 = 0u, hi1 = 0u, lo2 = 0u, hi2 = 0u, lo3 = 0u, hi3 = 0u;
+                if (tile_len > 8u)
+                    vxfec_vk__pack_nib_octet(yc + 8u, tile_len - 8u, &lo1, &hi1);
+                if (tile_len > 16u)
+                    vxfec_vk__pack_nib_octet(yc + 16u, tile_len - 16u, &lo2, &hi2);
+                if (tile_len > 24u)
+                    vxfec_vk__pack_nib_octet(yc + 24u, tile_len - 24u, &lo3, &hi3);
+                if ((lo0 | lo1 | lo2 | lo3 | hi0 | hi1 | hi2 | hi3) != 0u) {
+                    size_t base = (size_t)cursor * 4u;
+                    tab[base + 0] = r;
+                    tab[base + 1] = lo0;
+                    tab[base + 2] = lo1;
+                    tab[base + 3] = lo2;
+                    tab[base + 4] = lo3;
+                    tab[base + 5] = hi0;
+                    tab[base + 6] = hi1;
+                    tab[base + 7] = hi2;
+                    tab[base + 8] = hi3;
+                    tab[base + 9] = 0u;
+                    tab[base + 10] = 0u;
+                    tab[base + 11] = 0u;
+                    cursor += 3u;
                 }
-            }
-            if (tile_e == 16u) {
-                uint32_t lo8_15 = 0u, hi8_15 = 0u;
-                for (uint32_t b = 8u; b < 16u && b < tile_len; b++) {
-                    uint8_t c = yc[b];
-                    if (c != 0u) {
-                        uint32_t sh = 4u * (b - 8u);
-                        lo8_15 |= ((uint32_t)(c & 0x0fu)) << sh;
-                        hi8_15 |= ((uint32_t)(c >> 4u)) << sh;
-                    }
-                }
-                if ((lo0_7 | lo8_15 | hi0_7 | hi8_15) != 0u) {
+            } else if (tile_e == 16u) {
+                uint32_t lo1 = 0u, hi1 = 0u;
+                if (tile_len > 8u)
+                    vxfec_vk__pack_nib_octet(yc + 8u, tile_len - 8u, &lo1, &hi1);
+                if ((lo0 | lo1 | hi0 | hi1) != 0u) {
                     size_t base = (size_t)cursor * 4u;
                     tab[base + 0] = r;
                     tab[base + 1] = 0u;
-                    tab[base + 2] = lo0_7;
-                    tab[base + 3] = lo8_15;
-                    tab[base + 4] = hi0_7;
-                    tab[base + 5] = hi8_15;
+                    tab[base + 2] = lo0;
+                    tab[base + 3] = lo1;
+                    tab[base + 4] = hi0;
+                    tab[base + 5] = hi1;
                     tab[base + 6] = 0u;
                     tab[base + 7] = 0u;
                     cursor += 2u;
                 }
-            } else if ((lo0_7 | hi0_7) != 0u) {
+            } else if ((lo0 | hi0) != 0u) {
                 size_t base = (size_t)cursor * 4u;
                 tab[base + 0] = r;
-                tab[base + 1] = lo0_7;
-                tab[base + 2] = hi0_7;
+                tab[base + 1] = lo0;
+                tab[base + 2] = hi0;
                 tab[base + 3] = 0u;
                 cursor++;
             }
@@ -2445,8 +2776,8 @@ static bool reap_and_find_async_slot(vxfec_vk_ctx *ctx, uint32_t *out_slot)
             }
         }
     }
-    if (ctx->retired_bufs && !ctx->last_submit_unconfirmed && !any_pending)
-        reap_retired_bufs(ctx);
+    if (ctx->retired_bufs && !ctx->last_submit_unconfirmed)
+        reap_retired_bufs_upto(ctx, done_val, !any_pending);
     for (uint32_t i = 0; i < VXFEC_VK_ASYNC_SLOTS; i++) {
         uint32_t s = (ctx->async_cursor + i) % VXFEC_VK_ASYNC_SLOTS;
         if (ctx->async_slot_tickets[s] == 0) {
@@ -2531,8 +2862,10 @@ uint64_t vxfec_vk__submit_async_slot(vxfec_vk_ctx *ctx, uint32_t slot, VkCommand
 static VkPipeline select_wire_pipe(const vxfec_vk_ctx *ctx, bool pure_gf2, uint32_t tile_e)
 {
     if (pure_gf2)
-        return (tile_e == 16u) ? ctx->pipe_wire_gf2_vec4_16 : ctx->pipe_wire_gf2_vec4_32;
-    return (tile_e == 16u) ? ctx->pipe_wire_gf256_nib_vec4_16 : ctx->pipe_wire_gf256_nib_vec4_8;
+        return ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_WIRE_GF2_VEC4_16 : VXFEC_VK_PIPE_WIRE_GF2_VEC4_32];
+    if (tile_e == 32u)
+        return ctx->pipes[VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_32];
+    return ctx->pipes[(tile_e == 16u) ? VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_16 : VXFEC_VK_PIPE_WIRE_GF256_NIB_VEC4_8];
 }
 
 static void update_wire_ds(VkDevice dev, VkDescriptorSet ds, VkBuffer wire_buf, size_t wire_off, size_t wire_bytes,
@@ -2543,27 +2876,7 @@ static void update_wire_ds(VkDevice dev, VkDescriptorSet ds, VkBuffer wire_buf, 
         {.buffer = tab_buf, .offset = tab_off, .range = tab_bytes},
         {.buffer = wire_buf, .offset = wire_off, .range = wire_bytes},
     };
-    VkWriteDescriptorSet writes[3] = {
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds,
-         .dstBinding = 0,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[0]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds,
-         .dstBinding = 1,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[1]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-         .dstSet = ds,
-         .dstBinding = 2,
-         .descriptorCount = 1,
-         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         .pBufferInfo = &dbi[2]},
-    };
-    vkUpdateDescriptorSets(dev, 3, writes, 0, NULL);
+    vxfec_vk__update_ssbo_ds(dev, ds, dbi, 3u);
 }
 
 static bool record_wire_tab_copy_cmd(VkCommandBuffer cmd, vxfec_vk_buf *tab_buf, size_t tab_bytes, size_t hdr_bytes,
@@ -2622,27 +2935,18 @@ static bool record_wire_single_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDes
     }
 
     if (upload_tab && record_wire_tab_copy_cmd(cmd, tab_buf, tab_bytes, tab_hdr_bytes, tab_cmd_src_off)) {
-        VkMemoryBarrier xfer_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0, NULL, 0,
-                             NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
     uint32_t flags_tiles = hdr_stride_tiles | (uniform_tab ? 0x80000000u : 0u);
     vxfec_vk__record_mix_like_dispatches_cmd(ctx, cmd, ds, Z, stride_vecs, wg_x, flags_tiles, active_tiles, 0u, disp_blocks, pipe);
 
-    VkMemoryBarrier post_mb = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                         &post_mb, 0, NULL, 0, NULL);
+    vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                              VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                  VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
 
     if (record_ts && ctx->has_timestamps)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->query_pool, 1);
@@ -2748,13 +3052,8 @@ static bool record_wire_dual_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescr
     if (record_wire_tab_copy_cmd(cmd, gf256_tab, gf256_bytes, gf256_hdr_bytes, gf256_cmd_off))
         did_xfer = true;
     if (did_xfer) {
-        VkMemoryBarrier xfer_mb = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-        };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &xfer_mb, 0, NULL, 0,
-                             NULL);
+        vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
     vxfec_vk__record_mix_like_dispatches_cmd(ctx, cmd, ds_gf2, Z, stride_vecs, wg_x, gf2_hdr_stride, gf2_active_tiles, 0u,
@@ -2762,15 +3061,11 @@ static bool record_wire_dual_cmd(vxfec_vk_ctx *ctx, VkCommandBuffer cmd, VkDescr
     vxfec_vk__record_mix_like_dispatches_cmd(ctx, cmd, ds_256, Z, stride_vecs, wg_x, gf256_hdr_stride, gf256_active_tiles, 0u,
                                              gf256_blocks, pipe_256);
 
-    VkMemoryBarrier post_mb = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT,
-    };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                         &post_mb, 0, NULL, 0, NULL);
+    vxfec_vk__cmd_mem_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                              VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                  VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
 
     if (record_ts && ctx->has_timestamps)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->query_pool, 1);

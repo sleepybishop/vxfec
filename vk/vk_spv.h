@@ -28,10 +28,14 @@ extern const uint32_t spv_ops_direct_gf256_nib_vec4_8[];
 extern const size_t spv_ops_direct_gf256_nib_vec4_8_bytes;
 extern const uint32_t spv_ops_direct_gf256_nib_vec4_16[];
 extern const size_t spv_ops_direct_gf256_nib_vec4_16_bytes;
+extern const uint32_t spv_ops_direct_gf256_nib_vec4_32[];
+extern const size_t spv_ops_direct_gf256_nib_vec4_32_bytes;
 extern const uint32_t spv_ops_direct_gf256_nib_8[];
 extern const size_t spv_ops_direct_gf256_nib_8_bytes;
 extern const uint32_t spv_ops_direct_gf256_nib_16[];
 extern const size_t spv_ops_direct_gf256_nib_16_bytes;
+extern const uint32_t spv_ops_direct_gf256_nib_32[];
+extern const size_t spv_ops_direct_gf256_nib_32_bytes;
 extern const uint32_t spv_ops_wire_gf2_vec4_16[];
 extern const size_t spv_ops_wire_gf2_vec4_16_bytes;
 extern const uint32_t spv_ops_wire_gf2_vec4_32[];
@@ -40,5 +44,7 @@ extern const uint32_t spv_ops_wire_gf256_nib_vec4_8[];
 extern const size_t spv_ops_wire_gf256_nib_vec4_8_bytes;
 extern const uint32_t spv_ops_wire_gf256_nib_vec4_16[];
 extern const size_t spv_ops_wire_gf256_nib_vec4_16_bytes;
+extern const uint32_t spv_ops_wire_gf256_nib_vec4_32[];
+extern const size_t spv_ops_wire_gf256_nib_vec4_32_bytes;
 
 #endif /* VXFEC_VK_SPV_H */

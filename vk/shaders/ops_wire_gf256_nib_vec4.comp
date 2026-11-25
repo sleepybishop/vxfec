@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -6,7 +7,9 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 #define TILE_E 8
 #endif
 
-#if TILE_E == 16
+#if TILE_E == 32
+#define HDR_WORDS 5u
+#elif TILE_E == 16
 #define HDR_WORDS 3u
 #else
 #define HDR_WORDS 2u
@@ -16,14 +19,6 @@ layout(std430, set = 0, binding = 0) readonly buffer WireInBuf {
   uvec4 d[];
 };
 
-/*
- * Header at hdr_base = hdr_idx * HDR_WORDS:
- *   tab[hdr_base + 0] = uvec4(cmd_beg, cmd_end, tile_len, actual_block_z)
- *   tab[hdr_base + 1..] : packed uint16 output wire slots
- * Commands:
- *   TILE_E == 8 : tab[k] = uvec4(in_slot, lo0_7, hi0_7, 0)
- *   TILE_E == 16: tab[k] = uvec4(in_slot, 0, lo0_7, lo8_15), tab[k+1] = uvec4(hi0_7, hi8_15, 0, 0)
- */
 layout(std430, set = 0, binding = 1) readonly buffer WireTab256Buf {
   uvec4 tab[];
 };
@@ -41,18 +36,19 @@ layout(push_constant) uniform WirePush {
 } pc;
 
 uint xtime4(uint v) {
-  uint hi = (v >> 7u) & 0x01010101u;
-  uint poly = (hi << 4u) | (hi << 3u) | (hi << 2u) | hi;
-  return ((v & 0x7f7f7f7fu) << 1u) ^ poly;
+  uint m = v & 0x80808080u;
+  uint sh = (v << 1u) & 0xfefefefeu;
+  uint poly = m - (m >> 7u);
+  return sh ^ (poly & 0x1d1d1d1du);
 }
 
 uvec4 xtime_vec4(uvec4 v) {
   return uvec4(xtime4(v.x), xtime4(v.y), xtime4(v.z), xtime4(v.w));
 }
 
-#define BUILD_NIB_TAB(t, base_vec) \
+#define BUILD_NIB_TAB(t, base_val) \
   t[0] = uvec4(0u);                \
-  t[1] = base_vec;                 \
+  t[1] = (base_val);               \
   t[2] = xtime_vec4(t[1]);         \
   t[3] = t[2] ^ t[1];              \
   t[4] = xtime_vec4(t[2]);         \
@@ -65,24 +61,52 @@ uvec4 xtime_vec4(uvec4 v) {
   t[11] = t[10] ^ t[1];            \
   t[12] = t[8] ^ t[4];             \
   t[13] = t[12] ^ t[1];            \
-  t[14] = t[12] ^ t[2];            \
+  t[14] = t[12] ^ t[2];             \
   t[15] = t[14] ^ t[1];
 
-#define ACCUM_NIB8(w, b0, b1, b2, b3, b4, b5, b6, b7) \
-  if ((w) != 0u) {                                    \
-    b0 ^= t[(w) & 0xfu];                              \
-    b1 ^= t[((w) >> 4u) & 0xfu];                      \
-    b2 ^= t[((w) >> 8u) & 0xfu];                      \
-    b3 ^= t[((w) >> 12u) & 0xfu];                     \
-    b4 ^= t[((w) >> 16u) & 0xfu];                     \
-    b5 ^= t[((w) >> 20u) & 0xfu];                     \
-    b6 ^= t[((w) >> 24u) & 0xfu];                     \
-    b7 ^= t[(w) >> 28u];                              \
+#define ACCUM_NIB8(word_, b0, b1, b2, b3, b4, b5, b6, b7) \
+  {                                                       \
+    uint w_ = (word_);                                    \
+    if ((w_ & 0xffffu) != 0u) {                           \
+      b0 ^= t[w_ & 0xfu];                                 \
+      b1 ^= t[(w_ >> 4u) & 0xfu];                         \
+      b2 ^= t[(w_ >> 8u) & 0xfu];                         \
+      b3 ^= t[(w_ >> 12u) & 0xfu];                        \
+    }                                                     \
+    if ((w_ >> 16u) != 0u) {                              \
+      b4 ^= t[(w_ >> 16u) & 0xfu];                        \
+      b5 ^= t[(w_ >> 20u) & 0xfu];                        \
+      b6 ^= t[(w_ >> 24u) & 0xfu];                        \
+      b7 ^= t[w_ >> 28u];                                 \
+    }                                                     \
   }
 
-#define WRITE_WIRE_OUT(idx, val, oslot)                                        \
-  if (tile_len > (idx)) {                                                      \
-    out_syms[z_base + (oslot) * slot_stride] = (val);                          \
+#define ACCUM_GF2_8(src, word_, b0, b1, b2, b3, b4, b5, b6, b7) \
+  {                                                             \
+    uint w_ = (word_);                                          \
+    if ((w_ & 0xffffu) != 0u) {                                 \
+      if ((w_ & 0x00000001u) != 0u) b0 ^= (src);                \
+      if ((w_ & 0x00000010u) != 0u) b1 ^= (src);                \
+      if ((w_ & 0x00000100u) != 0u) b2 ^= (src);                \
+      if ((w_ & 0x00001000u) != 0u) b3 ^= (src);                \
+    }                                                           \
+    if ((w_ >> 16u) != 0u) {                                    \
+      if ((w_ & 0x00010000u) != 0u) b4 ^= (src);                \
+      if ((w_ & 0x00100000u) != 0u) b5 ^= (src);                \
+      if ((w_ & 0x01000000u) != 0u) b6 ^= (src);                \
+      if ((w_ & 0x10000000u) != 0u) b7 ^= (src);                \
+    }                                                           \
+  }
+
+uvec4 shift4_vec4(uvec4 v1) {
+  uvec4 v2 = xtime_vec4(v1);
+  uvec4 v4 = xtime_vec4(v2);
+  return xtime_vec4(xtime_vec4(v4));
+}
+
+#define WRITE_WIRE_OUT(idx, val, oslot)               \
+  if (tile_len > (idx)) {                             \
+    out_syms[z_base + (oslot) * slot_stride] = (val); \
   }
 
 void main() {
@@ -110,38 +134,101 @@ void main() {
 
   uvec4 a0 = uvec4(0u), a1 = uvec4(0u), a2 = uvec4(0u), a3 = uvec4(0u);
   uvec4 a4 = uvec4(0u), a5 = uvec4(0u), a6 = uvec4(0u), a7 = uvec4(0u);
-#if TILE_E == 16
+#if TILE_E >= 16
   uvec4 a8 = uvec4(0u), a9 = uvec4(0u), a10 = uvec4(0u), a11 = uvec4(0u);
   uvec4 a12 = uvec4(0u), a13 = uvec4(0u), a14 = uvec4(0u), a15 = uvec4(0u);
+#endif
+#if TILE_E == 32
+  uvec4 a16 = uvec4(0u), a17 = uvec4(0u), a18 = uvec4(0u), a19 = uvec4(0u);
+  uvec4 a20 = uvec4(0u), a21 = uvec4(0u), a22 = uvec4(0u), a23 = uvec4(0u);
+  uvec4 a24 = uvec4(0u), a25 = uvec4(0u), a26 = uvec4(0u), a27 = uvec4(0u);
+  uvec4 a28 = uvec4(0u), a29 = uvec4(0u), a30 = uvec4(0u), a31 = uvec4(0u);
 
+  for (uint k = h0.x; k < h0.y; k += 3u) {
+    uvec4 cmd0 = tab[k];
+    uvec4 cmd1 = tab[k + 1u];
+    uvec4 cmd2 = tab[k + 2u];
+    uvec4 src = d[z_base + cmd0.x * slot_stride];
+    uint lo_or = cmd0.y | cmd0.z | cmd0.w | cmd1.x;
+    uint hi_or = cmd1.y | cmd1.z | cmd1.w | cmd2.x;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd0.y, a0, a1, a2, a3, a4, a5, a6, a7)
+      ACCUM_GF2_8(src, cmd0.z, a8, a9, a10, a11, a12, a13, a14, a15)
+      ACCUM_GF2_8(src, cmd0.w, a16, a17, a18, a19, a20, a21, a22, a23)
+      ACCUM_GF2_8(src, cmd1.x, a24, a25, a26, a27, a28, a29, a30, a31)
+    } else {
+      uvec4 cur_base = src;
+      [[dont_unroll]] for (uint hp = 0u; hp < 2u; hp++) {
+        uint w0 = (hp == 0u) ? cmd0.y : cmd1.y;
+        uint w1 = (hp == 0u) ? cmd0.z : cmd1.z;
+        uint w2 = (hp == 0u) ? cmd0.w : cmd1.w;
+        uint w3 = (hp == 0u) ? cmd1.x : cmd2.x;
+        if ((w0 | w1 | w2 | w3) != 0u) {
+          uvec4 t[16];
+          BUILD_NIB_TAB(t, cur_base)
+          ACCUM_NIB8(w0, a0, a1, a2, a3, a4, a5, a6, a7)
+          ACCUM_NIB8(w1, a8, a9, a10, a11, a12, a13, a14, a15)
+          ACCUM_NIB8(w2, a16, a17, a18, a19, a20, a21, a22, a23)
+          ACCUM_NIB8(w3, a24, a25, a26, a27, a28, a29, a30, a31)
+          if (hp == 0u && hi_or != 0u) {
+            cur_base = xtime_vec4(t[8]);
+          }
+        } else if (hp == 0u) {
+          cur_base = shift4_vec4(cur_base);
+        }
+      }
+    }
+  }
+#elif TILE_E == 16
   for (uint k = h0.x; k < h0.y; k += 2u) {
     uvec4 cmd0 = tab[k];
     uvec4 cmd1 = tab[k + 1u];
     uvec4 src = d[z_base + cmd0.x * slot_stride];
-    uvec4 t[16];
-    BUILD_NIB_TAB(t, src)
-    ACCUM_NIB8(cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
-    ACCUM_NIB8(cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
-
-    if ((cmd1.x | cmd1.y) != 0u) {
-      uvec4 hi_base = xtime_vec4(t[8]);
-      BUILD_NIB_TAB(t, hi_base)
-      ACCUM_NIB8(cmd1.x, a0, a1, a2, a3, a4, a5, a6, a7)
-      ACCUM_NIB8(cmd1.y, a8, a9, a10, a11, a12, a13, a14, a15)
+    uint lo_or = cmd0.z | cmd0.w;
+    uint hi_or = cmd1.x | cmd1.y;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
+      ACCUM_GF2_8(src, cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
+    } else {
+      uvec4 t[16];
+      uvec4 hi_base;
+      if (lo_or != 0u) {
+        BUILD_NIB_TAB(t, src)
+        ACCUM_NIB8(cmd0.z, a0, a1, a2, a3, a4, a5, a6, a7)
+        ACCUM_NIB8(cmd0.w, a8, a9, a10, a11, a12, a13, a14, a15)
+        hi_base = xtime_vec4(t[8]);
+      } else {
+        hi_base = shift4_vec4(src);
+      }
+      if (hi_or != 0u) {
+        BUILD_NIB_TAB(t, hi_base)
+        ACCUM_NIB8(cmd1.x, a0, a1, a2, a3, a4, a5, a6, a7)
+        ACCUM_NIB8(cmd1.y, a8, a9, a10, a11, a12, a13, a14, a15)
+      }
     }
   }
 #else
   for (uint k = h0.x; k < h0.y; k++) {
     uvec4 cmd = tab[k];
     uvec4 src = d[z_base + cmd.x * slot_stride];
-    uvec4 t[16];
-    BUILD_NIB_TAB(t, src)
-    ACCUM_NIB8(cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
-
-    if (cmd.z != 0u) {
-      uvec4 hi_base = xtime_vec4(t[8]);
-      BUILD_NIB_TAB(t, hi_base)
-      ACCUM_NIB8(cmd.z, a0, a1, a2, a3, a4, a5, a6, a7)
+    uint lo_or = cmd.y;
+    uint hi_or = cmd.z;
+    if (((lo_or & 0xeeeeeeeeu) | hi_or) == 0u) {
+      ACCUM_GF2_8(src, cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
+    } else {
+      uvec4 t[16];
+      uvec4 hi_base;
+      if (lo_or != 0u) {
+        BUILD_NIB_TAB(t, src)
+        ACCUM_NIB8(cmd.y, a0, a1, a2, a3, a4, a5, a6, a7)
+        hi_base = xtime_vec4(t[8]);
+      } else {
+        hi_base = shift4_vec4(src);
+      }
+      if (hi_or != 0u) {
+        BUILD_NIB_TAB(t, hi_base)
+        ACCUM_NIB8(cmd.z, a0, a1, a2, a3, a4, a5, a6, a7)
+      }
     }
   }
 #endif
@@ -155,7 +242,7 @@ void main() {
   WRITE_WIRE_OUT(5u, a5, os0.z >> 16u)
   WRITE_WIRE_OUT(6u, a6, os0.w & 0xffffu)
   WRITE_WIRE_OUT(7u, a7, os0.w >> 16u)
-#if TILE_E == 16
+#if TILE_E >= 16
   uvec4 os1 = tab[hdr_base + 2u];
   WRITE_WIRE_OUT(8u, a8, os1.x & 0xffffu)
   WRITE_WIRE_OUT(9u, a9, os1.x >> 16u)
@@ -165,5 +252,25 @@ void main() {
   WRITE_WIRE_OUT(13u, a13, os1.z >> 16u)
   WRITE_WIRE_OUT(14u, a14, os1.w & 0xffffu)
   WRITE_WIRE_OUT(15u, a15, os1.w >> 16u)
+#endif
+#if TILE_E == 32
+  uvec4 os2 = tab[hdr_base + 3u];
+  uvec4 os3 = tab[hdr_base + 4u];
+  WRITE_WIRE_OUT(16u, a16, os2.x & 0xffffu)
+  WRITE_WIRE_OUT(17u, a17, os2.x >> 16u)
+  WRITE_WIRE_OUT(18u, a18, os2.y & 0xffffu)
+  WRITE_WIRE_OUT(19u, a19, os2.y >> 16u)
+  WRITE_WIRE_OUT(20u, a20, os2.z & 0xffffu)
+  WRITE_WIRE_OUT(21u, a21, os2.z >> 16u)
+  WRITE_WIRE_OUT(22u, a22, os2.w & 0xffffu)
+  WRITE_WIRE_OUT(23u, a23, os2.w >> 16u)
+  WRITE_WIRE_OUT(24u, a24, os3.x & 0xffffu)
+  WRITE_WIRE_OUT(25u, a25, os3.x >> 16u)
+  WRITE_WIRE_OUT(26u, a26, os3.y & 0xffffu)
+  WRITE_WIRE_OUT(27u, a27, os3.y >> 16u)
+  WRITE_WIRE_OUT(28u, a28, os3.z & 0xffffu)
+  WRITE_WIRE_OUT(29u, a29, os3.z >> 16u)
+  WRITE_WIRE_OUT(30u, a30, os3.w & 0xffffu)
+  WRITE_WIRE_OUT(31u, a31, os3.w >> 16u)
 #endif
 }

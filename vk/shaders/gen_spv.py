@@ -23,12 +23,15 @@ SHADERS = [
     ("spv_ops_direct_gf2_32", "ops_direct_gf2.comp", ["-DTILE_E=32"]),
     ("spv_ops_direct_gf256_nib_vec4_8", "ops_direct_gf256_nib.comp", ["-DUSE_VEC4=1", "-DTILE_E=8"]),
     ("spv_ops_direct_gf256_nib_vec4_16", "ops_direct_gf256_nib.comp", ["-DUSE_VEC4=1", "-DTILE_E=16"]),
+    ("spv_ops_direct_gf256_nib_vec4_32", "ops_direct_gf256_nib.comp", ["-DUSE_VEC4=1", "-DTILE_E=32"]),
     ("spv_ops_direct_gf256_nib_8", "ops_direct_gf256_nib.comp", ["-DTILE_E=8"]),
     ("spv_ops_direct_gf256_nib_16", "ops_direct_gf256_nib.comp", ["-DTILE_E=16"]),
+    ("spv_ops_direct_gf256_nib_32", "ops_direct_gf256_nib.comp", ["-DTILE_E=32"]),
     ("spv_ops_wire_gf2_vec4_16", "ops_wire_gf2_vec4.comp", ["-DTILE_E=16"]),
     ("spv_ops_wire_gf2_vec4_32", "ops_wire_gf2_vec4.comp", ["-DTILE_E=32"]),
     ("spv_ops_wire_gf256_nib_vec4_8", "ops_wire_gf256_nib_vec4.comp", ["-DTILE_E=8"]),
     ("spv_ops_wire_gf256_nib_vec4_16", "ops_wire_gf256_nib_vec4.comp", ["-DTILE_E=16"]),
+    ("spv_ops_wire_gf256_nib_vec4_32", "ops_wire_gf256_nib_vec4.comp", ["-DTILE_E=32"]),
 ]
 
 
